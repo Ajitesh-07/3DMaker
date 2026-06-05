@@ -1,0 +1,47 @@
+# Build directories
+build/
+bin/
+obj/
+out/
+Release/
+Debug/
+x64/
+*.lib
+*.exp
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.ilk
+*.suo
+*.user
+*.vcxproj.user
+
+# Visual Studio
+.vs/
+
+# Python / Scripts
+__pycache__/
+*.pyc
+venv/
+.env/
+
+# Miscellaneous
+.vscode/
+*.log
+*.tmp
+
+# Data and Assets
+data/
+assets/
+
+# TinyMLP Outputs
+modules/TinyMLP/images/
+modules/TinyMLP/reports/
+modules/TinyMLP/build/
+
+# NeRF Outputs
+modules/NeRF/benchmarks/
+modules/NeRF/results/
+modules/NeRF/build/
