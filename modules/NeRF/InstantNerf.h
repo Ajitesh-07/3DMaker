@@ -29,6 +29,7 @@ struct NerfOptions {
     uint3 gridResolution = make_uint3(128, 128, 128);
     float3  aabbMin         = make_float3(-1.0f, -1.0f, -1.0f);
     float3  aabbMax         = make_float3( 1.0f,  1.0f,  1.0f);
+    int numCascades = 4;
 
     int densityHiddenDim = 64;
     int densityNumLayers = 2;
@@ -275,6 +276,7 @@ public:
         const float* d_rgb_true,
         uint32_t numRays,
         int& trainStepCount,
+        uint32_t* hitCounts,
         float* d_rgb_out = nullptr,
         cudaStream_t stream = 0
     );

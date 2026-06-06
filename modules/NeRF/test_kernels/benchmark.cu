@@ -75,7 +75,9 @@ int main() {
     std::cerr.flush();
     int dummySteps = 0;
     try {
-        nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, 8192, dummySteps);
+        int chunks = (8192 + opts.rayChunkSize - 1) / opts.rayChunkSize;
+        std::vector<uint32_t> dummyHitCounts(chunks, 0);
+        nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, 8192, dummySteps, dummyHitCounts.data());
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA error after warmup trainWithRays: %s\n", cudaGetErrorString(err));
@@ -98,7 +100,9 @@ int main() {
         try {
             CUDA_CHECK(cudaEventRecord(start));
             
-            nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps);
+            int chunks = (numRays + opts.rayChunkSize - 1) / opts.rayChunkSize;
+            std::vector<uint32_t> dummyHitCounts(chunks, 0);
+            nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps, dummyHitCounts.data());
             
             CUDA_CHECK(cudaEventRecord(stop));
             CUDA_CHECK(cudaEventSynchronize(stop));

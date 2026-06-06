@@ -159,12 +159,15 @@ int main(int argc, char** argv) {
                 CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
             }
 
+            std::vector<uint32_t> h_hitCounts(multiplier, 0);
+
             nerf.trainWithRays(
                 dataset.getChunkRaysO(), 
                 dataset.getChunkRaysD(), 
                 dataset.getChunkRgbTrue(), 
                 chunkSize, 
                 trainSteps, 
+                h_hitCounts.data(),
                 should_print ? d_chunk_rgb_out : nullptr
             );
             
@@ -196,6 +199,11 @@ int main(int argc, char** argv) {
                 }
                 std::cout << "] " << int(ep_progress * 100.0f) << "% "
                           << "| Step " << trainSteps << " "
+                          << "| Hits: [";
+                for(int i=0; i<multiplier; ++i) {
+                    std::cout << h_hitCounts[i] << (i == multiplier-1 ? "" : ",");
+                }
+                std::cout << "] "
                           << "| Loss: " << std::fixed << std::setprecision(5) << mse << " "
                           << "(PSNR: " << std::setprecision(1) << psnr << ") "
                           << "| " << std::setprecision(0) << steps_per_sec << " steps/s "
@@ -238,7 +246,7 @@ int main(int argc, char** argv) {
             float_to_byte_kernel<<<blocks, 256>>>(d_render_out, d_render_byte, pixels);
             CUDA_CHECK(cudaMemcpy(h_render_byte.data(), d_render_byte, pixels * 3 * sizeof(uint8_t), cudaMemcpyDeviceToHost));
             
-            std::string filename = "../../benchmarks/epoch_" + std::to_string(epoch) + "_view_" + std::to_string(i) + ".png";
+            std::string filename = "../benchmarks/frames/epoch_" + std::to_string(epoch) + "_view_" + std::to_string(i) + ".png";
             stbi_write_png(filename.c_str(), test_w, test_h, 3, h_render_byte.data(), test_w * 3);
             std::cout << "Saved " << filename << std::endl;
         }
@@ -307,7 +315,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(h_video_byte.data(), d_video_byte, video_pixels * 3 * sizeof(uint8_t), cudaMemcpyDeviceToHost));
         
         char filename[256];
-        sprintf(filename, "../../benchmarks/video_frame_%03d.png", frame);
+        sprintf(filename, "../benchmarks/frames/video_frame_%03d.png", frame);
         stbi_write_png(filename, video_w, video_h, 3, h_video_byte.data(), video_w * 3);
         if (frame % 10 == 0) std::cout << "Rendered " << frame << "/120 frames..." << std::endl;
     }
@@ -318,7 +326,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_video_byte));
 
     std::cout << "Creating MP4 with FFmpeg..." << std::endl;
-    system("ffmpeg -y -framerate 30 -i ../../benchmarks/video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p ../../benchmarks/nerf_360.mp4");
+    system("ffmpeg -y -framerate 30 -i ../benchmarks/frames/video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p ../benchmarks/nerf_360.mp4");
 
     CUDA_CHECK(cudaFree(d_loss));
     CUDA_CHECK(cudaFree(d_chunk_rgb_out));

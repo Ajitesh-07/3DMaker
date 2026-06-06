@@ -274,6 +274,7 @@ void InstantNerf::trainWithRays(
     const float* d_rgb_true,
     uint32_t numRays,
     int& trainStepCount,
+    uint32_t* hitCounts,
     float* d_rgb_out,
     cudaStream_t stream
 ) { 
@@ -332,6 +333,8 @@ void InstantNerf::trainWithRays(
             totalHits += h_num_steps[i];
             if(h_num_steps[i] > highestHits) highestHits = h_num_steps[i];
         }
+
+        hitCounts[offset / m_opts.rayChunkSize] = totalHits;
 
         std::vector<uint32_t> boundaries = get_chunk_boundaries_cpu(m_render_buffers.h_ray_offsets, m_render_buffers.d_ray_offsets.data(), currentChunkRays, totalHits, m_opts.batchSize, stream);
 
@@ -393,10 +396,16 @@ void InstantNerf::trainWithRays(
             cudaMemcpyAsync(d_rgb_out + offset * 3, m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
         }
 
-        
+        // if (m_trainSteps % 16 == 0) {
+        //     if (m_trainSteps < 256) {
+        //         earlyOccupancyGridUpdate(stream);
+        //     } else {
+        //         lateOccupancyGridUpdate(stream);
+        //     }
+        // }
         if (m_trainSteps < 256) {
             earlyOccupancyGridUpdate(stream);
-        } else {
+        } else if (m_trainSteps % 16 == 0) {
             lateOccupancyGridUpdate(stream);
         }
         

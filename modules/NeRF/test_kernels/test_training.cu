@@ -68,9 +68,12 @@ int main() {
     for (int epoch = 1; epoch <= 3; ++epoch) {
         int trainSteps = 0;
         
+        int chunks = (numRays + opts.rayChunkSize - 1) / opts.rayChunkSize;
+        std::vector<uint32_t> dummyHitCounts(chunks, 0);
+        
         CUDA_CHECK(cudaEventRecord(start));
         // Train and capture the network's volume rendering output
-        nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps, d_rgb_out, 0);
+        nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps, dummyHitCounts.data(), d_rgb_out, 0);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
 
