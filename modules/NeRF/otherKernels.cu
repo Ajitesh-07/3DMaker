@@ -143,6 +143,7 @@ __global__ void compute_SH_gather(
     const uint32_t* __restrict__ d_ray_indices,
     const int offset,
     const int batchSize,
+    const float densityBias,
     float* __restrict__ d_density_out,
     half* __restrict__ d_color_in,
     float* __restrict__ d_density_sigma
@@ -190,7 +191,7 @@ __global__ void compute_SH_gather(
     float4 d811  = densityOut_vec[2];
     float4 d1215 = densityOut_vec[3];
 
-    d_density_sigma[idx] = expf(fminf(d03.x - 1.0f, 8.0f));
+    d_density_sigma[idx] = expf(fminf(d03.x - densityBias, 8.0f));
 
     // Pack 16 floats into 4 float4s (8 halfs per float4)
     __half2 h01 = __floats2half2_rn(d03.x, d03.y);
@@ -284,7 +285,8 @@ __global__ void compute_color_grad(
     const float* __restrict__ final_rgb,
     half* __restrict__ custom_color_grad,
     float* __restrict__ tmp_dsigma,
-    float loss_scale
+    float loss_scale,
+    const float densityBias
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numRays) return;
@@ -322,7 +324,7 @@ __global__ void compute_color_grad(
         }
 
 
-        float sigma = expf(fminf(density_mlp_out[i*16] - 1.0f, 8.0f));
+        float sigma = expf(fminf(density_mlp_out[i*16] - densityBias, 8.0f));
         float alpha = 1.0f - expf(-sigma*delta_t);
         float weight = currentT * alpha;
 
@@ -381,7 +383,8 @@ __global__ void update_compute_grad(
     float* __restrict__ current_rgb,
     half* __restrict__ custom_color_grad,
     float* __restrict__ tmp_dsigma,
-    float loss_scale
+    float loss_scale,
+    const float densityBias
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= batch_size) return;
@@ -398,7 +401,7 @@ __global__ void update_compute_grad(
         delta_t = 1e-3f;
     }
 
-    float sigma = expf(fminf(density_mlp_out[i*16] - 1.0f, 8.0f));
+    float sigma = expf(fminf(density_mlp_out[i*16] - densityBias, 8.0f));
     float alpha = 1.0f - expf(-sigma*delta_t);
 
     float T = current_T[r];
@@ -548,6 +551,7 @@ __global__ void updateTmpGrid(
     const float* __restrict__ samples,
     const float* __restrict__ density_out,
     float* __restrict__ tmpGrid,
+    float densityBias,
     float3 aabbMin,
     float3 aabbMax,
     uint3 gridResolution,
@@ -571,7 +575,7 @@ __global__ void updateTmpGrid(
     uint32_t gridIdx = ix + iy * gridResolution.x + iz * gridResolution.x * gridResolution.y;
 
     float densityValue = density_out[idx*16];
-    float sigma = expf(fminf(densityValue - 1.0f, 8.0f));
+    float sigma = expf(fminf(densityValue - densityBias, 8.0f));
 
     atomicMaxFloatFast(&tmpGrid[gridIdx], sigma);   
 }

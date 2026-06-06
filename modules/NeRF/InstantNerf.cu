@@ -109,7 +109,7 @@ void InstantNerf::printStats() {
     };
 
     auto printGroup = [&](const char* name, const MetricGroup& g, int indent) {
-        uint64_t count = g.trackers.empty() ? 0 : g.trackers[0]->count;
+        uint64_t count = g.getCount();
         if (count == 0) return;
         for (int i = 0; i < indent; i++) printf("    ");
         printf("%s (Total: %.3f ms, Avg: %.3f ms, Count: %llu)\n", name, g.getTotalMs(), g.getAverage(), (unsigned long long)count);
@@ -350,7 +350,7 @@ void InstantNerf::trainWithRays(
 
                 compute_SH_gather<<<gs, BS, 0, stream>>>(
                     chunk_d, m_render_buffers.d_ray_indices.data(), 
-                    b_offset, b_size, 
+                    b_offset, b_size, m_opts.densityBias,
                     m_render_buffers.d_density_out.data(), 
                     m_render_buffers.d_color_input.data(),
                     m_render_buffers.d_density_sigma.data() + b_offset
@@ -432,7 +432,7 @@ void InstantNerf::trainWithRays(
             measure(stream, m_profile_stats.trainComputeSH, [&](){
             compute_SH_gather<<<gs, BS, 0, stream>>>(
                 chunk_d, m_render_buffers.d_ray_indices.data(),
-                start_hit, chunk_hits, m_render_buffers.d_density_out.data(),
+                start_hit, chunk_hits, m_opts.densityBias, m_render_buffers.d_density_out.data(),
                 m_render_buffers.d_color_input.data(),
                 m_render_buffers.d_density_sigma.data()
             );
@@ -457,7 +457,8 @@ void InstantNerf::trainWithRays(
                 m_render_buffers.d_render_rgb_chunk.data(),
                 m_render_buffers.d_custom_color_grad.data(),
                 m_render_buffers.d_tmpsigma.data(),
-                m_opts.lossScale
+                m_opts.lossScale,
+                m_opts.densityBias
             );
             });
 
@@ -572,7 +573,7 @@ void InstantNerf::renderImage(
 
                 compute_SH_gather<<<gs, BS, 0, stream>>>(
                     chunk_d, m_render_buffers.d_ray_indices.data(), 
-                    b_offset, b_size, 
+                    b_offset, b_size, m_opts.densityBias,
                     m_render_buffers.d_density_out.data(), 
                     m_render_buffers.d_color_input.data(),
                     m_render_buffers.d_density_sigma.data() + b_offset
@@ -656,6 +657,7 @@ void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
         m_render_buffers.d_occupancy_samples.data(),
         m_render_buffers.d_density_out.data(),
         m_render_buffers.d_tmp_grid.data(),
+        m_opts.densityBias,
         m_opts.aabbMin,
         m_opts.aabbMax,
         m_opts.gridResolution,
@@ -705,6 +707,7 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
         m_render_buffers.d_occupancy_samples.data(),
         m_render_buffers.d_density_out.data(),
         m_render_buffers.d_tmp_grid.data(),
+        m_opts.densityBias,
         m_opts.aabbMin,
         m_opts.aabbMax,
         m_opts.gridResolution,

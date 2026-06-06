@@ -20,8 +20,8 @@ def run_standard_sweep():
     print(f"| {'Batch':<7} | {'Hidden':<7} | {'Layers':<6} | {'ms / fwd':<10} | {'TFLOPS':<8} | {'GB/s':<8} |")
     print(hr)
 
-    batches = [65536, 65536*2, 655368*4]
-    hiddens = [32, 64, 128]
+    batches = [65536, 131072, 262144, 524288, 1048576, 2097152]
+    hiddens = [32]
     layers_list = [1, 2, 3]
 
     warmup = 10

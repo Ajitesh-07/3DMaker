@@ -4,7 +4,9 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <string>
-
+#include <random>
+#include <chrono>
+#include <iomanip>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../../third_party/stb_image_write.h"
 
@@ -89,20 +91,24 @@ int main(int argc, char** argv) {
     DataLoader test_dataset(dataset_path, false);
 
     NerfOptions opts;
-    opts.rayChunkSize = 64 * 1024;
+    opts.densityBias = 1.0f;
+    opts.rayChunkSize = 16 * 1024;
     opts.colorHiddenDim = 32;
     opts.colorNumLayers = 3;
     opts.batchSize = 256 * 1024;
     opts.learningRate = 1e-2f;
-    opts.lossScale = 1.0f;
+    opts.lossScale = 128.0f;
+    opts.epsilon = 1e-8f;
     opts.isProfiling = false;
+    opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
+    opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
     
     InstantNerf nerf;
     nerf.init(opts);
 
     printVRAMUsage();
 
-    int totalEpochs = 1; 
+    int totalEpochs = 3; 
     int total_rays = dataset.getTotalRays();
     int trainSteps = 0;
     int multiplier = 1;
@@ -119,15 +125,21 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
     float* d_loss;
     CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
     float* d_chunk_rgb_out;
     CUDA_CHECK(cudaMalloc(&d_chunk_rgb_out, opts.rayChunkSize * 3 * sizeof(float)));
 
+    int print_freq = 50;
+
     for (int epoch = 1; epoch <= totalEpochs; ++epoch) {
         dataset.shuffleRays();
 
         CUDA_CHECK(cudaEventRecord(start));
+        auto start_time = std::chrono::high_resolution_clock::now();
         
         for (int offset = 0; offset < total_rays; offset += opts.rayChunkSize * multiplier) {
             float progress = (float)current_chunk / (float)total_chunks;
@@ -137,10 +149,15 @@ int main(int argc, char** argv) {
 
             int chunkSize = std::min(opts.rayChunkSize * multiplier, total_rays - offset);
             
-            dataset.fetchRayChunk(offset, chunkSize);
+            float3 random_bg = make_float3(dist(rng), dist(rng), dist(rng));
+            nerf.setBgColor(random_bg);
+            dataset.fetchRayChunk(offset, chunkSize, random_bg);
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
+            bool should_print = (current_chunk % print_freq == 0) || (offset + opts.rayChunkSize * multiplier >= total_rays);
+            if (should_print) {
+                CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
+            }
 
             nerf.trainWithRays(
                 dataset.getChunkRaysO(), 
@@ -148,19 +165,46 @@ int main(int argc, char** argv) {
                 dataset.getChunkRgbTrue(), 
                 chunkSize, 
                 trainSteps, 
-                d_chunk_rgb_out
+                should_print ? d_chunk_rgb_out : nullptr
             );
             
-            int threads = 256;
-            int blocks = (chunkSize + threads - 1) / threads;
-            mse_kernel<<<blocks, threads>>>(d_chunk_rgb_out, dataset.getChunkRgbTrue(), d_loss, chunkSize);
-            
-            float h_loss;
-            CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
-            float mse = h_loss / chunkSize;
-            
-            std::cout << "Epoch " << epoch << " | Step: " << trainSteps << " | MSE Loss: " << mse << std::endl;
+            if (should_print) {
+                int threads = 256;
+                int blocks = (chunkSize + threads - 1) / threads;
+                mse_kernel<<<blocks, threads>>>(d_chunk_rgb_out, dataset.getChunkRgbTrue(), d_loss, chunkSize);
+                
+                float h_loss;
+                CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
+                float mse = h_loss / chunkSize;
+                float psnr = -10.0f * log10f(fmaxf(mse, 1e-8f));
+                
+                auto current_time = std::chrono::high_resolution_clock::now();
+                std::chrono::duration<float> elapsed = current_time - start_time;
+                float elapsed_sec = elapsed.count() > 0.0f ? elapsed.count() : 1e-5f;
+                float steps_per_sec = print_freq / elapsed_sec;
+                float ms_per_step = (elapsed_sec * 1000.0f) / print_freq;
+                
+                int barWidth = 20;
+                float ep_progress = (float)(offset + chunkSize) / total_rays;
+                int pos = barWidth * ep_progress;
+                
+                std::cout << "\rEpoch " << epoch << "/" << totalEpochs << " [";
+                for (int i = 0; i < barWidth; ++i) {
+                    if (i < pos) std::cout << "=";
+                    else if (i == pos) std::cout << ">";
+                    else std::cout << " ";
+                }
+                std::cout << "] " << int(ep_progress * 100.0f) << "% "
+                          << "| Step " << trainSteps << " "
+                          << "| Loss: " << std::fixed << std::setprecision(5) << mse << " "
+                          << "(PSNR: " << std::setprecision(1) << psnr << ") "
+                          << "| " << std::setprecision(0) << steps_per_sec << " steps/s "
+                          << "| " << std::setprecision(1) << ms_per_step << " ms/step    " << std::flush;
+                          
+                start_time = std::chrono::high_resolution_clock::now();
+            }
         }
+        std::cout << std::endl;
         
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -182,6 +226,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> h_render_byte(pixels * 3);
 
         int num_test_frames = std::min(3, (int)(test_dataset.getTotalRays() / pixels));
+        nerf.setBgColor(make_float3(1.0f, 1.0f, 1.0f));
         for (int i = 0; i < num_test_frames; ++i) {
             test_dataset.fetchRayChunk(i * pixels, pixels);
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -193,7 +238,7 @@ int main(int argc, char** argv) {
             float_to_byte_kernel<<<blocks, 256>>>(d_render_out, d_render_byte, pixels);
             CUDA_CHECK(cudaMemcpy(h_render_byte.data(), d_render_byte, pixels * 3 * sizeof(uint8_t), cudaMemcpyDeviceToHost));
             
-            std::string filename = "epoch_" + std::to_string(epoch) + "_view_" + std::to_string(i) + ".png";
+            std::string filename = "../../benchmarks/epoch_" + std::to_string(epoch) + "_view_" + std::to_string(i) + ".png";
             stbi_write_png(filename.c_str(), test_w, test_h, 3, h_render_byte.data(), test_w * 3);
             std::cout << "Saved " << filename << std::endl;
         }
@@ -204,7 +249,7 @@ int main(int argc, char** argv) {
 
     // --- 360 Degree Video Render ---
     std::cout << "\nGenerating 360 degree video frames..." << std::endl;
-    int video_w = 800; // standard nerf synthetic resolution
+    int video_w = 800; // UHD 4K resolution
     int video_h = 800;
     int video_pixels = video_w * video_h;
     float camera_angle_x = 0.6911112070083618f;
@@ -220,9 +265,11 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_video_byte, video_pixels * 3 * sizeof(uint8_t)));
     std::vector<uint8_t> h_video_byte(video_pixels * 3);
 
+    nerf.setBgColor(make_float3(1.0f, 1.0f, 1.0f));
     for (int frame = 0; frame < 120; ++frame) {
         float angle = frame * (2.0f * 3.14159265f / 120.0f);
-        float radius = 4.0311f; 
+        float scale = 1.0f;
+        float radius = 4.0311f * scale; 
         float elev = 30.0f * 3.14159265f / 180.0f; // 30 degrees elevation
         
         float pz = radius * sinf(elev);
@@ -260,7 +307,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(h_video_byte.data(), d_video_byte, video_pixels * 3 * sizeof(uint8_t), cudaMemcpyDeviceToHost));
         
         char filename[256];
-        sprintf(filename, "video_frame_%03d.png", frame);
+        sprintf(filename, "../../benchmarks/video_frame_%03d.png", frame);
         stbi_write_png(filename, video_w, video_h, 3, h_video_byte.data(), video_w * 3);
         if (frame % 10 == 0) std::cout << "Rendered " << frame << "/120 frames..." << std::endl;
     }
@@ -271,7 +318,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_video_byte));
 
     std::cout << "Creating MP4 with FFmpeg..." << std::endl;
-    system("ffmpeg -y -framerate 30 -i video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p nerf_360.mp4");
+    system("ffmpeg -y -framerate 30 -i ../../benchmarks/video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p ../../benchmarks/nerf_360.mp4");
 
     CUDA_CHECK(cudaFree(d_loss));
     CUDA_CHECK(cudaFree(d_chunk_rgb_out));

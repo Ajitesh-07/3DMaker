@@ -56,6 +56,7 @@ struct NerfOptions {
     float3 bgColor = make_float3(1.0f, 1.0f, 1.0f); // white for nerf_synthetic
     float minDensityThreshold = 0.01;
     float decayValue = 0.95f;
+    float densityBias = 1.0f;
 
     bool isProfiling = false;
 };
@@ -266,6 +267,7 @@ public:
     void printStats();
     void resetStats();
     void setLearningRate(float lr) { m_opts.learningRate = lr; }
+    void setBgColor(float3 c) { m_opts.bgColor = c; }
 
     void trainWithRays(
         const float3* d_rays_o,

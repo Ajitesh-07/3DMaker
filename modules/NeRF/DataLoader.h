@@ -21,7 +21,7 @@ public:
     void shuffleRays(cudaStream_t stream = 0);
 
     // Dynamically generates a chunk of rays on the GPU
-    void fetchRayChunk(int offset, int size, cudaStream_t stream = 0);
+    void fetchRayChunk(int offset, int size, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0);
 
     // Frees the compact VRAM arrays
     void freeVRAM();

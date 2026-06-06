@@ -22,7 +22,7 @@ def run_performance_sweep():
     print("Dim\tLayers\tBatch Size\tTime/Step (ms)\tThroughput (GB/s)\tThroughput (items/sec)")
     print("-----------------------------------------------------------------------------------------")
 
-    dims = [32, 64, 128]
+    dims = [32]
     batch_sizes = [1 << 15, 1 << 16, 1 << 17, 1 << 18, 1 << 19, 1 << 20]
     num_steps = 50
 
@@ -30,7 +30,7 @@ def run_performance_sweep():
     scaler = torch.cuda.amp.GradScaler()
 
     for dim in dims:
-        for layers in range(2, 11):
+        for layers in range(2, 4):
             for batch_size in batch_sizes:
                 model = MLP(dim, layers).to(device)
                 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)

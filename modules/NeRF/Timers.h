@@ -85,4 +85,13 @@ struct MetricGroup {
         }
         return total;
     }
+
+    int getCount() const {
+        int minCount = INT_MAX;
+        for (const auto* t : trackers) {
+            if (t->count > 0 && minCount > t->count) minCount = t->count;
+        }
+
+        return minCount;
+    }
 };

@@ -118,7 +118,8 @@ __global__ void fetchRayChunkKernel(
     const float* d_transforms, // [num_images, 16]
     const uint8_t* d_images_rgba, // [num_images, height, width, 4]
     const uint32_t* d_shuffled_indices,
-    float3* d_chunk_rays_o, float3* d_chunk_rays_d, float* d_chunk_rgb
+    float3* d_chunk_rays_o, float3* d_chunk_rays_d, float* d_chunk_rgb,
+    float3 bg_color
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -150,10 +151,11 @@ __global__ void fetchRayChunkKernel(
     float world_dir_y = c2w[4]*dir_x + c2w[5]*dir_y + c2w[6]*dir_z;
     float world_dir_z = c2w[8]*dir_x + c2w[9]*dir_y + c2w[10]*dir_z;
 
-    // C2W * origin (0,0,0,1)
-    float world_o_x = c2w[3];
-    float world_o_y = c2w[7];
-    float world_o_z = c2w[11];
+    // C2W * origin (0,0,0,1) scaled to fit in AABB
+    float scale = 1.0f;
+    float world_o_x = c2w[3] * scale;
+    float world_o_y = c2w[7] * scale;
+    float world_o_z = c2w[11] * scale;
 
     d_chunk_rays_o[idx] = make_float3(world_o_x, world_o_y, world_o_z);
     d_chunk_rays_d[idx] = make_float3(world_dir_x, world_dir_y, world_dir_z);
@@ -169,9 +171,9 @@ __global__ void fetchRayChunkKernel(
     float fb = b / 255.0f;
     float fa = a / 255.0f;
 
-    fr = fr * fa + (1.0f - fa);
-    fg = fg * fa + (1.0f - fa);
-    fb = fb * fa + (1.0f - fa);
+    fr = fr * fa + bg_color.x * (1.0f - fa);
+    fg = fg * fa + bg_color.y * (1.0f - fa);
+    fb = fb * fa + bg_color.z * (1.0f - fa);
 
     d_chunk_rgb[idx * 3 + 0] = fr;
     d_chunk_rgb[idx * 3 + 1] = fg;
@@ -260,13 +262,14 @@ void DataLoader::shuffleRays(cudaStream_t stream) {
     );
 }
 
-void DataLoader::fetchRayChunk(int offset, int size, cudaStream_t stream) {
+void DataLoader::fetchRayChunk(int offset, int size, float3 bg_color, cudaStream_t stream) {
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
     fetchRayChunkKernel<<<gridSize, blockSize, 0, stream>>>(
         offset, size, total_rays,
         width, height, focal_length,
         d_transforms, d_images_rgba, d_shuffled_indices,
-        d_chunk_rays_o, d_chunk_rays_d, d_chunk_rgb_true
+        d_chunk_rays_o, d_chunk_rays_d, d_chunk_rgb_true,
+        bg_color
     );
 }

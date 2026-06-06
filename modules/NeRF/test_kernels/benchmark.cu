@@ -58,6 +58,8 @@ int main() {
     NerfOptions opts;
     opts.rayChunkSize = 256 * 1024; // Configurable chunk size
     opts.isProfiling = true;
+    opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
+    opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
     
     InstantNerf nerf;
     std::cout << "Initializing MLPs and Grid..." << std::endl;
