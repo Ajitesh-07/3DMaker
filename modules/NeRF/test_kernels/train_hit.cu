@@ -78,7 +78,7 @@ __global__ void generate_custom_rays_kernel(
 }
 
 int main(int argc, char** argv) {
-    std::cout << "Starting NeRF Training on Real Dataset..." << std::endl;
+    std::cout << "Starting NeRF Hit-Centric Training on Real Dataset..." << std::endl;
 
     std::string dataset_path = "../../data/nerf_synthetic/lego";
     if (argc > 1) {
@@ -93,12 +93,12 @@ int main(int argc, char** argv) {
 
     NerfOptions opts;
     opts.densityBias = 1.0f;
-    opts.rayChunkSize = 16 * 1024;
+    opts.rayChunkSize = 64 * 1024;
     opts.colorHiddenDim = 32;
     opts.colorNumLayers = 3;
     opts.batchSize = 256 * 1024;
     opts.learningRate = 1e-2f;
-    opts.lossScale = 128.0f;
+    opts.lossScale = 1.0f;
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
@@ -141,6 +141,7 @@ int main(int argc, char** argv) {
 
         CUDA_CHECK(cudaEventRecord(start));
         auto start_time = std::chrono::high_resolution_clock::now();
+        int last_trainSteps = trainSteps;
         
         for (int offset = 0; offset < total_rays; offset += opts.rayChunkSize * multiplier) {
             float progress = (float)current_chunk / (float)total_chunks;
@@ -160,16 +161,18 @@ int main(int argc, char** argv) {
                 CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
             }
 
-            std::vector<uint32_t> h_hitCounts(multiplier, 0);
+            // Allocate a large vector for hitCounts since trainWithRaysHit dynamically generates chunks
+            std::vector<uint32_t> h_hitCounts(chunkSize, 0);
 
-            nerf.trainWithRays(
+            nerf.trainWithRaysHit(
                 dataset.getChunkRaysO(), 
                 dataset.getChunkRaysD(), 
                 dataset.getChunkRgbTrue(), 
                 chunkSize, 
                 trainSteps, 
                 h_hitCounts.data(),
-                should_print ? d_chunk_rgb_out : nullptr
+                should_print ? d_chunk_rgb_out : nullptr,
+                0
             );
             
             if (should_print) {
@@ -185,8 +188,10 @@ int main(int argc, char** argv) {
                 auto current_time = std::chrono::high_resolution_clock::now();
                 std::chrono::duration<float> elapsed = current_time - start_time;
                 float elapsed_sec = elapsed.count() > 0.0f ? elapsed.count() : 1e-5f;
-                float steps_per_sec = print_freq / elapsed_sec;
-                float ms_per_step = (elapsed_sec * 1000.0f) / print_freq;
+                int steps_passed = trainSteps - last_trainSteps;
+                if (steps_passed == 0) steps_passed = 1;
+                float steps_per_sec = steps_passed / elapsed_sec;
+                float ms_per_step = (elapsed_sec * 1000.0f) / steps_passed;
                 
                 int barWidth = 20;
                 float ep_progress = (float)(offset + chunkSize) / total_rays;
@@ -200,17 +205,14 @@ int main(int argc, char** argv) {
                 }
                 std::cout << "] " << int(ep_progress * 100.0f) << "% "
                           << "| Step " << trainSteps << " "
-                          << "| Hits: [";
-                for(int i=0; i<multiplier; ++i) {
-                    std::cout << h_hitCounts[i] << (i == multiplier-1 ? "" : ",");
-                }
-                std::cout << "] "
+                          << "| Hits: " << h_hitCounts[0] << " " // Just print the first chunk hits
                           << "| Loss: " << std::fixed << std::setprecision(5) << mse << " "
                           << "(PSNR: " << std::setprecision(1) << psnr << ") "
                           << "| " << std::setprecision(0) << steps_per_sec << " steps/s "
                           << "| " << std::setprecision(1) << ms_per_step << " ms/step    " << std::flush;
                           
                 start_time = std::chrono::high_resolution_clock::now();
+                last_trainSteps = trainSteps;
             }
         }
         std::cout << std::endl;

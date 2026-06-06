@@ -15,7 +15,8 @@
         if (_e != cudaSuccess) {                                                \
             fprintf(stderr, "CUDA error at %s:%d — %s\n",                       \
                     __FILE__, __LINE__, cudaGetErrorString(_e));                \
-            std::abort();                                                       \
+            fflush(stderr);                                                     \
+            throw std::runtime_error(cudaGetErrorString(_e));                   \
         }                                                                       \
     } while (0)
 
@@ -101,6 +102,7 @@ struct RenderingBuffers {
 
     DeviceBuffer<int> d_activeCellIndices{0};
     DeviceBuffer<int> d_numActiveCells{0};
+    DeviceBuffer<uint32_t> d_active_rays_count{0};
 
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
@@ -285,6 +287,17 @@ public:
         cudaStream_t stream = 0
     );
 
+    void trainWithRaysHit(
+        const float3* d_rays_o,
+        const float3* d_rays_d,
+        const float* d_rgb_true,
+        uint32_t numRays,
+        int& trainStepCount,
+        uint32_t* hitCounts,
+        float* d_rgb_out,
+        cudaStream_t stream
+    );
+
     void renderImage(
         const float3* d_rays_o,
         const float3* d_rays_d,
@@ -407,6 +420,31 @@ extern "C" void processRaysChunkLinear(
     uint32_t* d_ray_offsets,
     uint32_t* d_dense_sparse_indices,
 
+    float* d_mlp_positions_batch,
+    uint32_t* d_ray_indices,
+    float* d_t_sorted,
+    cudaStream_t stream
+);
+
+extern "C" int processRaysHitLinear(
+    const uint32_t num_rays,
+    const float3* rays_o,
+    const float3* rays_d,
+    const float3* rays_d_inv,
+    const float* nears,
+    const float* fars,
+    const uint8_t* occupancy_grid,
+    const uint3 grid_resolution,
+    const float3 aabb_min,
+    const float3 aabb_max,
+    const int mipmapLevels,
+    const int batchSize,
+    uint32_t* totalHits,
+    uint32_t* d_active_rays_count,
+
+    uint32_t* d_num_steps,
+    uint32_t* d_ray_offsets,
+    
     float* d_mlp_positions_batch,
     uint32_t* d_ray_indices,
     float* d_t_sorted,

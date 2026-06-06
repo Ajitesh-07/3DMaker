@@ -161,4 +161,25 @@ if(NERF_BUILD_TESTS)
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
     )
     target_link_libraries(render PRIVATE NeRFModule)
+    add_executable(compare_hit test_kernels/compare_hit.cu)
+    if(MSVC)
+        target_compile_options(compare_hit PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
+        )
+        target_compile_definitions(compare_hit PRIVATE
+            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+        )
+    endif()
+    target_link_libraries(compare_hit PRIVATE NeRFModule)
+
+    add_executable(train_hit test_kernels/train_hit.cu)
+    if(MSVC)
+        target_compile_options(train_hit PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
+        )
+        target_compile_definitions(train_hit PRIVATE
+            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+        )
+    endif()
+    target_link_libraries(train_hit PRIVATE NeRFModule)
 endif()
