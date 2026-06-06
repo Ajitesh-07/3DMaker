@@ -42,19 +42,183 @@ __device__ __forceinline__ uint32_t morton3d(uint32_t x, uint32_t y, uint32_t z)
     return expand_bits_3d(x) | (expand_bits_3d(y) << 1) | (expand_bits_3d(z) << 2);
 }
 
+__device__ inline uint32_t get_mipmap_offset(uint3 base_res, int target_level) {
+    uint32_t offset = 0;
+    uint3 res = base_res;
+    for (int l = 0; l < target_level; ++l) {
+        offset += res.x * res.y * res.z;
+        res.x >>= 1; // Divide by 2
+        res.y >>= 1;
+        res.z >>= 1;
+    }
+    return offset;
+}
+
+// template<bool COMPUTE_MORTON>
+// __global__ void march_rays_dda_kernel(
+//     const uint32_t num_rays,
+//     const float3* __restrict__ rays_o,
+//     const float3* __restrict__ rays_d,
+//     const float3* __restrict__ rays_d_inv,
+//     const float*  __restrict__ nears,
+//     const float*  __restrict__ fars,
+//     const uint8_t* __restrict__ occupancy_grid,
+//     const uint3    grid_resolution,
+//     const float3   aabb_min,
+//     const float3   aabb_max,
+//     uint32_t* __restrict__ packed_coords_out,  // can be nullptr when !COMPUTE_MORTON
+//     float* __restrict__ t_hits_out,
+//     uint32_t* __restrict__ num_steps_per_ray
+// ) {
+//     int i = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (i >= num_rays) return;
+
+//     float3 o = rays_o[i];
+//     float3 d = rays_d[i];
+//     float t_min = nears[i];
+//     float t_max_ray = fars[i];
+//     float3 d_inv = rays_d_inv[i];
+
+//     float3 p_entry;
+//     p_entry.x = o.x + t_min * d.x;
+//     p_entry.y = o.y + t_min * d.y;
+//     p_entry.z = o.z + t_min * d.z;
+
+//     float3 rel_pos;
+//     rel_pos.x = (p_entry.x - aabb_min.x) / (aabb_max.x - aabb_min.x);
+//     rel_pos.y = (p_entry.y - aabb_min.y) / (aabb_max.y - aabb_min.y);
+//     rel_pos.z = (p_entry.z - aabb_min.z) / (aabb_max.z - aabb_min.z);
+
+//     float3 voxel_size;
+//     voxel_size.x = (aabb_max.x - aabb_min.x) / grid_resolution.x;
+//     voxel_size.y = (aabb_max.y - aabb_min.y) / grid_resolution.y;
+//     voxel_size.z = (aabb_max.z - aabb_min.z) / grid_resolution.z;
+
+//     float3 grid_pos;
+//     grid_pos.x = rel_pos.x * grid_resolution.x;
+//     grid_pos.y = rel_pos.y * grid_resolution.y;
+//     grid_pos.z = rel_pos.z * grid_resolution.z;
+
+//     int3 voxel_index;
+//     voxel_index.x = max(0, min((int)floorf(grid_pos.x), (int)grid_resolution.x - 1));
+//     voxel_index.y = max(0, min((int)floorf(grid_pos.y), (int)grid_resolution.y - 1));
+//     voxel_index.z = max(0, min((int)floorf(grid_pos.z), (int)grid_resolution.z - 1));
+
+//     int3 step;
+//     step.x = (d.x >= 0.0f) ? 1 : -1;
+//     step.y = (d.y >= 0.0f) ? 1 : -1;
+//     step.z = (d.z >= 0.0f) ? 1 : -1;
+
+//     float3 t_delta;
+//     t_delta.x = fabsf(voxel_size.x * d_inv.x);
+//     t_delta.y = fabsf(voxel_size.y * d_inv.y);
+//     t_delta.z = fabsf(voxel_size.z * d_inv.z);
+
+//     float3 next_boundary;
+//     next_boundary.x = aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size.x;
+//     next_boundary.y = aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size.y;
+//     next_boundary.z = aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size.z;
+
+//     float3 t_max_axis;
+//     t_max_axis.x = (next_boundary.x - o.x) * d_inv.x;
+//     t_max_axis.y = (next_boundary.y - o.y) * d_inv.y;
+//     t_max_axis.z = (next_boundary.z - o.z) * d_inv.z;
+
+//     float current_t = t_min;
+    
+//     uint32_t hit_count = 0; 
+//     uint32_t out_base_idx = i * MAX_HITS;
+
+//     uint32_t local_coords[4];
+//     float    local_ts[4];
+//     uint32_t local_idx = 0;
+
+//     while (current_t < t_max_ray && (hit_count + local_idx) < MAX_HITS) {
+//         if (voxel_index.x < 0 || voxel_index.x >= grid_resolution.x ||
+//             voxel_index.y < 0 || voxel_index.y >= grid_resolution.y ||
+//             voxel_index.z < 0 || voxel_index.z >= grid_resolution.z) {
+//             break; 
+//         }
+
+//         uint32_t flat_idx = voxel_index.z * (grid_resolution.x * grid_resolution.y) + 
+//                             voxel_index.y * grid_resolution.x + 
+//                             voxel_index.x;
+
+//         uint32_t byte_idx = flat_idx >> 3;
+//         uint32_t bit_idx  = flat_idx & 7;
+//         bool is_occupied  = (occupancy_grid[byte_idx] >> bit_idx) & 1;
+
+//         if (is_occupied) {
+//             if constexpr (COMPUTE_MORTON) {
+//                 local_coords[local_idx] = morton3d((uint32_t)voxel_index.x,
+//                                                    (uint32_t)voxel_index.y,
+//                                                    (uint32_t)voxel_index.z);
+//             }
+//             local_ts[local_idx] = current_t;
+//             local_idx++;
+
+//             if (local_idx == 4) {
+//                 if constexpr (COMPUTE_MORTON) {
+//                     uint4* out_coords_vec = reinterpret_cast<uint4*>(&packed_coords_out[out_base_idx + hit_count]);
+//                     store_uint4(out_coords_vec, local_coords[0], local_coords[1], local_coords[2], local_coords[3]);
+//                 }
+//                 float4* out_ts_vec = reinterpret_cast<float4*>(&t_hits_out[out_base_idx + hit_count]);
+//                 store_float4(out_ts_vec, local_ts[0], local_ts[1], local_ts[2], local_ts[3]);
+
+//                 hit_count += 4;
+//                 local_idx = 0;
+//             }
+//         }
+
+//         if (t_max_axis.x < t_max_axis.y) {
+//             if (t_max_axis.x < t_max_axis.z) {
+//                 current_t = t_max_axis.x;
+//                 voxel_index.x += step.x;
+//                 t_max_axis.x += t_delta.x;
+//             } else {
+//                 current_t = t_max_axis.z;
+//                 voxel_index.z += step.z;
+//                 t_max_axis.z += t_delta.z;
+//             }
+//         } else {
+//             if (t_max_axis.y < t_max_axis.z) {
+//                 current_t = t_max_axis.y;
+//                 voxel_index.y += step.y;
+//                 t_max_axis.y += t_delta.y;
+//             } else {
+//                 current_t = t_max_axis.z;
+//                 voxel_index.z += step.z;
+//                 t_max_axis.z += t_delta.z;
+//             }
+//         }
+//     }
+
+//     for (uint32_t j = 0; j < local_idx; ++j) {
+//         if constexpr (COMPUTE_MORTON) {
+//             packed_coords_out[out_base_idx + hit_count + j] = local_coords[j];
+//         }
+//         t_hits_out[out_base_idx + hit_count + j] = local_ts[j];
+//     }
+    
+//     hit_count += local_idx;
+
+//     num_steps_per_ray[i] = hit_count;
+// }
+
 template<bool COMPUTE_MORTON>
 __global__ void march_rays_dda_kernel(
     const uint32_t num_rays,
     const float3* __restrict__ rays_o,
     const float3* __restrict__ rays_d,
     const float3* __restrict__ rays_d_inv,
-    const float*  __restrict__ nears,
-    const float*  __restrict__ fars,
+    const float* __restrict__ nears,
+    const float* __restrict__ fars,
     const uint8_t* __restrict__ occupancy_grid,
-    const uint3    grid_resolution,
+    const uint3    grid_resolution, // This is the base Level 0 resolution (e.g. 128x128x128)
     const float3   aabb_min,
     const float3   aabb_max,
-    uint32_t* __restrict__ packed_coords_out,  // can be nullptr when !COMPUTE_MORTON
+    const int      levelsMipmap,    // NEW PARAMETER
+    uint32_t* __restrict__ packed_coords_out, 
     float* __restrict__ t_hits_out,
     uint32_t* __restrict__ num_steps_per_ray
 ) {
@@ -67,69 +231,54 @@ __global__ void march_rays_dda_kernel(
     float t_max_ray = fars[i];
     float3 d_inv = rays_d_inv[i];
 
-    float3 p_entry;
-    p_entry.x = o.x + t_min * d.x;
-    p_entry.y = o.y + t_min * d.y;
-    p_entry.z = o.z + t_min * d.z;
+    float3 aabb_extent = make_float3(aabb_max.x - aabb_min.x, aabb_max.y - aabb_min.y, aabb_max.z - aabb_min.z);
 
-    float3 rel_pos;
-    rel_pos.x = (p_entry.x - aabb_min.x) / (aabb_max.x - aabb_min.x);
-    rel_pos.y = (p_entry.y - aabb_min.y) / (aabb_max.y - aabb_min.y);
-    rel_pos.z = (p_entry.z - aabb_min.z) / (aabb_max.z - aabb_min.z);
+    int3 step = make_int3((d.x >= 0.0f) ? 1 : -1, (d.y >= 0.0f) ? 1 : -1, (d.z >= 0.0f) ? 1 : -1);
 
-    float3 voxel_size;
-    voxel_size.x = (aabb_max.x - aabb_min.x) / grid_resolution.x;
-    voxel_size.y = (aabb_max.y - aabb_min.y) / grid_resolution.y;
-    voxel_size.z = (aabb_max.z - aabb_min.z) / grid_resolution.z;
-
-    float3 grid_pos;
-    grid_pos.x = rel_pos.x * grid_resolution.x;
-    grid_pos.y = rel_pos.y * grid_resolution.y;
-    grid_pos.z = rel_pos.z * grid_resolution.z;
-
-    int3 voxel_index;
-    voxel_index.x = max(0, min((int)floorf(grid_pos.x), (int)grid_resolution.x - 1));
-    voxel_index.y = max(0, min((int)floorf(grid_pos.y), (int)grid_resolution.y - 1));
-    voxel_index.z = max(0, min((int)floorf(grid_pos.z), (int)grid_resolution.z - 1));
-
-    int3 step;
-    step.x = (d.x >= 0.0f) ? 1 : -1;
-    step.y = (d.y >= 0.0f) ? 1 : -1;
-    step.z = (d.z >= 0.0f) ? 1 : -1;
-
-    float3 t_delta;
-    t_delta.x = fabsf(voxel_size.x * d_inv.x);
-    t_delta.y = fabsf(voxel_size.y * d_inv.y);
-    t_delta.z = fabsf(voxel_size.z * d_inv.z);
-
-    float3 next_boundary;
-    next_boundary.x = aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size.x;
-    next_boundary.y = aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size.y;
-    next_boundary.z = aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size.z;
-
-    float3 t_max_axis;
-    t_max_axis.x = (next_boundary.x - o.x) * d_inv.x;
-    t_max_axis.y = (next_boundary.y - o.y) * d_inv.y;
-    t_max_axis.z = (next_boundary.z - o.z) * d_inv.z;
-
-    float current_t = t_min;
-    
     uint32_t hit_count = 0; 
     uint32_t out_base_idx = i * MAX_HITS;
-
     uint32_t local_coords[4];
     float    local_ts[4];
     uint32_t local_idx = 0;
 
-    while (current_t < t_max_ray && (hit_count + local_idx) < MAX_HITS) {
-        if (voxel_index.x < 0 || voxel_index.x >= grid_resolution.x ||
-            voxel_index.y < 0 || voxel_index.y >= grid_resolution.y ||
-            voxel_index.z < 0 || voxel_index.z >= grid_resolution.z) {
-            break; 
-        }
+    float current_t = t_min;
+    
+    int current_level = levelsMipmap - 1;
 
-        uint32_t flat_idx = voxel_index.z * (grid_resolution.x * grid_resolution.y) + 
-                            voxel_index.y * grid_resolution.x + 
+    while (current_t < t_max_ray && (hit_count + local_idx) < MAX_HITS) {
+        
+        uint3 res_l = make_uint3(
+            grid_resolution.x >> current_level,
+            grid_resolution.y >> current_level,
+            grid_resolution.z >> current_level
+        );
+
+        float3 voxel_size_l = make_float3(
+            aabb_extent.x / res_l.x,
+            aabb_extent.y / res_l.y,
+            aabb_extent.z / res_l.z
+        );
+
+        // 2. Where are we in space right now?
+        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
+        
+        float3 rel_pos = make_float3(
+            (current_pos.x - aabb_min.x) / aabb_extent.x,
+            (current_pos.y - aabb_min.y) / aabb_extent.y,
+            (current_pos.z - aabb_min.z) / aabb_extent.z
+        );
+
+        int3 voxel_index = make_int3(
+            max(0, min((int)floorf(rel_pos.x * res_l.x), (int)res_l.x - 1)),
+            max(0, min((int)floorf(rel_pos.y * res_l.y), (int)res_l.y - 1)),
+            max(0, min((int)floorf(rel_pos.z * res_l.z), (int)res_l.z - 1))
+        );
+
+        // 3. Read the bit from the specific mipmap level
+        uint32_t level_offset = get_mipmap_offset(grid_resolution, current_level);
+        uint32_t flat_idx = level_offset + 
+                            voxel_index.z * (res_l.x * res_l.y) + 
+                            voxel_index.y * res_l.x + 
                             voxel_index.x;
 
         uint32_t byte_idx = flat_idx >> 3;
@@ -137,50 +286,50 @@ __global__ void march_rays_dda_kernel(
         bool is_occupied  = (occupancy_grid[byte_idx] >> bit_idx) & 1;
 
         if (is_occupied) {
-            if constexpr (COMPUTE_MORTON) {
-                local_coords[local_idx] = morton3d((uint32_t)voxel_index.x,
-                                                   (uint32_t)voxel_index.y,
-                                                   (uint32_t)voxel_index.z);
-            }
-            local_ts[local_idx] = current_t;
-            local_idx++;
-
-            if (local_idx == 4) {
+            if (current_level > 0) {
+                current_level--;
+                continue; 
+            } else {
                 if constexpr (COMPUTE_MORTON) {
-                    uint4* out_coords_vec = reinterpret_cast<uint4*>(&packed_coords_out[out_base_idx + hit_count]);
-                    store_uint4(out_coords_vec, local_coords[0], local_coords[1], local_coords[2], local_coords[3]);
+                    local_coords[local_idx] = morton3d((uint32_t)voxel_index.x, (uint32_t)voxel_index.y, (uint32_t)voxel_index.z);
                 }
-                float4* out_ts_vec = reinterpret_cast<float4*>(&t_hits_out[out_base_idx + hit_count]);
-                store_float4(out_ts_vec, local_ts[0], local_ts[1], local_ts[2], local_ts[3]);
+                local_ts[local_idx] = current_t;
+                local_idx++;
 
-                hit_count += 4;
-                local_idx = 0;
+                if (local_idx == 4) {
+                    if constexpr (COMPUTE_MORTON) {
+                        uint4* out_coords_vec = reinterpret_cast<uint4*>(&packed_coords_out[out_base_idx + hit_count]);
+                        store_uint4(out_coords_vec, local_coords[0], local_coords[1], local_coords[2], local_coords[3]);
+                    }
+                    float4* out_ts_vec = reinterpret_cast<float4*>(&t_hits_out[out_base_idx + hit_count]);
+                    store_float4(out_ts_vec, local_ts[0], local_ts[1], local_ts[2], local_ts[3]);
+
+                    hit_count += 4;
+                    local_idx = 0;
+                }
             }
         }
 
-        if (t_max_axis.x < t_max_axis.y) {
-            if (t_max_axis.x < t_max_axis.z) {
-                current_t = t_max_axis.x;
-                voxel_index.x += step.x;
-                t_max_axis.x += t_delta.x;
-            } else {
-                current_t = t_max_axis.z;
-                voxel_index.z += step.z;
-                t_max_axis.z += t_delta.z;
-            }
-        } else {
-            if (t_max_axis.y < t_max_axis.z) {
-                current_t = t_max_axis.y;
-                voxel_index.y += step.y;
-                t_max_axis.y += t_delta.y;
-            } else {
-                current_t = t_max_axis.z;
-                voxel_index.z += step.z;
-                t_max_axis.z += t_delta.z;
-            }
-        }
+        float3 next_boundary = make_float3(
+            aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
+            aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
+            aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
+        );
+
+        float3 t_max_axis = make_float3(
+            (next_boundary.x - o.x) * d_inv.x,
+            (next_boundary.y - o.y) * d_inv.y,
+            (next_boundary.z - o.z) * d_inv.z
+        );
+
+        float next_t = fminf(fminf(t_max_axis.x, t_max_axis.y), t_max_axis.z);
+        
+        current_t = fmaxf(current_t + 1e-5f, next_t + 1e-6f); 
+
+        current_level = levelsMipmap - 1;
     }
 
+    // Flush remaining hits
     for (uint32_t j = 0; j < local_idx; ++j) {
         if constexpr (COMPUTE_MORTON) {
             packed_coords_out[out_base_idx + hit_count + j] = local_coords[j];
@@ -189,7 +338,6 @@ __global__ void march_rays_dda_kernel(
     }
     
     hit_count += local_idx;
-
     num_steps_per_ray[i] = hit_count;
 }
 
@@ -204,6 +352,7 @@ void launchMarchRaysDDA(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int mipmapLevels,
     uint32_t* packed_coords_out,
     float* t_hits_out,
     uint32_t* num_steps_per_ray,
@@ -225,6 +374,7 @@ void launchMarchRaysDDA(
         grid_resolution,
         aabb_min,
         aabb_max,
+        mipmapLevels,
         packed_coords_out,
         t_hits_out,
         num_steps_per_ray
@@ -311,6 +461,7 @@ void processRaysChunk(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int mipmapLevels,
 
     uint32_t* d_sparse_morton,   
     float* d_sparse_ts,          
@@ -341,6 +492,7 @@ void processRaysChunk(
         grid_resolution,
         aabb_min,
         aabb_max,
+        mipmapLevels,
         d_sparse_morton,
         d_sparse_ts,
         d_num_steps
@@ -493,6 +645,7 @@ void processRaysChunkLinear(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int mipmapLevels,
 
     float* d_sparse_ts,
     uint32_t* d_num_steps,
@@ -515,6 +668,7 @@ void processRaysChunkLinear(
         nears, fars,
         occupancy_grid,
         grid_resolution, aabb_min, aabb_max,
+        mipmapLevels,
         nullptr, d_sparse_ts, d_num_steps
     );
 

@@ -439,7 +439,7 @@ void testProcessRaysCorrectness() {
 
     launchMarchRaysDDA(
         NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv, d_nears, d_fars,
-        d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+        d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
         d_sparse_morton, d_sparse_ts, d_num_steps, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -508,7 +508,7 @@ void testProcessRaysCorrectness() {
     processRaysChunk(
         NUM_RAYS,
         d_rays_o, d_rays_d, d_rays_d_inv, d_nears, d_fars,
-        d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+        d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
         d_sparse_morton, d_sparse_ts, d_num_steps,
         d_ray_offsets,
         d_dense_morton_in, d_dense_sparse_idx_in,
@@ -691,7 +691,7 @@ void testProcessRaysPerformance() {
         for (int i = 0; i < WARMUP_RUNS; ++i) {
             launchMarchRaysDDA(NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv,
                                d_nears, d_fars, d_occ,
-                               scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+                               scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
                                d_sparse_morton, d_sparse_ts, d_num_steps, 0);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -701,7 +701,7 @@ void testProcessRaysPerformance() {
         for (int i = 0; i < BENCHMARK_RUNS; ++i) {
             launchMarchRaysDDA(NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv,
                                d_nears, d_fars, d_occ,
-                               scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+                               scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
                                d_sparse_morton, d_sparse_ts, d_num_steps, 0);
         }
         CUDA_CHECK(cudaEventRecord(stop, 0));
@@ -730,7 +730,7 @@ void testProcessRaysPerformance() {
         for (int i = 0; i < WARMUP_RUNS; ++i) {
             processRaysChunk(
                 NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv, d_nears, d_fars,
-                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
                 d_sparse_morton, d_sparse_ts, d_num_steps,
                 d_ray_offsets,
                 d_dense_morton_in, d_dense_sparse_idx_in,
@@ -744,7 +744,7 @@ void testProcessRaysPerformance() {
         for (int i = 0; i < BENCHMARK_RUNS; ++i) {
             processRaysChunk(
                 NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv, d_nears, d_fars,
-                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
                 d_sparse_morton, d_sparse_ts, d_num_steps,
                 d_ray_offsets,
                 d_dense_morton_in, d_dense_sparse_idx_in,
@@ -789,7 +789,7 @@ void testProcessRaysPerformance() {
         for (int i = 0; i < WARMUP_RUNS; ++i) {
             processRaysChunkLinear(
                 NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv, d_nears, d_fars,
-                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
                 d_sparse_ts, d_num_steps,
                 d_ray_offsets,
                 d_dense_sparse_idx_linear,
@@ -802,7 +802,7 @@ void testProcessRaysPerformance() {
         for (int i = 0; i < BENCHMARK_RUNS; ++i) {
             processRaysChunkLinear(
                 NUM_RAYS, d_rays_o, d_rays_d, d_rays_d_inv, d_nears, d_fars,
-                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max,
+                d_occ, scene.grid_resolution, scene.aabb_min, scene.aabb_max, 1,
                 d_sparse_ts, d_num_steps,
                 d_ray_offsets,
                 d_dense_sparse_idx_linear,

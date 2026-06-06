@@ -310,11 +310,22 @@ void TinyMLPHashGrid::step(float lr, float beta1, float beta2, float epsilon, fl
 void TinyMLPHashGrid::loadWeights(const std::string& filename){
     std::ifstream in(filename, std::ios::binary);
     if(!in.is_open()) throw std::runtime_error("Cannot open: "+filename);
-    MLPOption fopt;
-    in.read(reinterpret_cast<char*>(&fopt),sizeof(MLPOption));
-    if(fopt.inputDim!=mlp_opt.inputDim||fopt.hiddenDim!=mlp_opt.hiddenDim||
-       fopt.outputDim!=mlp_opt.outputDim||fopt.numLayers!=mlp_opt.numLayers)
+    
+    MLPGridOptions fopt;
+    in.read(reinterpret_cast<char*>(&fopt),sizeof(MLPGridOptions));
+    
+    if (fopt.numLevels != hw_opt.numLevels || fopt.tableSize != hw_opt.tableSize || fopt.featuresLevel != hw_opt.featuresLevel ||
+        fopt.hiddenDim != hw_opt.hiddenDim || fopt.outputDim != hw_opt.outputDim || fopt.numLayers != hw_opt.numLayers) {
         throw std::runtime_error("Weight file dimension mismatch");
+    }
+
+    std::vector<float> h_hash(m_totalHashElements);
+    in.read(reinterpret_cast<char*>(h_hash.data()), m_totalHashElements * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(d_master_hashtable, h_hash.data(), m_totalHashElements * sizeof(float), cudaMemcpyHostToDevice));
+    
+    int hblocks = (m_totalHashElements + 255) / 256;
+    hg_f2h<<<hblocks, 256>>>(d_master_hashtable, d_fwd_hashtable, m_totalHashElements);
+
     std::vector<float*> hmw(mlp_opt.numLayers),hmb(mlp_opt.numLayers);
     std::vector<half*>  hfw(mlp_opt.numLayers);
     cudaMemcpy(hmw.data(),d_master_weights,mlp_opt.numLayers*sizeof(float*),cudaMemcpyDeviceToHost);
@@ -337,7 +348,13 @@ void TinyMLPHashGrid::loadWeights(const std::string& filename){
 void TinyMLPHashGrid::saveWeights(const std::string& filename){
     std::ofstream out(filename,std::ios::binary);
     if(!out.is_open()) throw std::runtime_error("Cannot open: "+filename);
-    out.write(reinterpret_cast<const char*>(&mlp_opt),sizeof(MLPOption));
+    
+    out.write(reinterpret_cast<const char*>(&hw_opt),sizeof(MLPGridOptions));
+
+    std::vector<float> h_hash(m_totalHashElements);
+    cudaMemcpy(h_hash.data(), d_master_hashtable, m_totalHashElements * sizeof(float), cudaMemcpyDeviceToHost);
+    out.write(reinterpret_cast<const char*>(h_hash.data()), m_totalHashElements * sizeof(float));
+
     std::vector<float*> hmw(mlp_opt.numLayers),hmb(mlp_opt.numLayers);
     cudaMemcpy(hmw.data(),d_master_weights,mlp_opt.numLayers*sizeof(float*),cudaMemcpyDeviceToHost);
     cudaMemcpy(hmb.data(),d_master_biases, mlp_opt.numLayers*sizeof(float*),cudaMemcpyDeviceToHost);
@@ -385,6 +402,18 @@ void TinyMLPHashGrid::saveWeights(float* hw, float* hb){
         CUDA_CHECK(cudaMemcpy(hb+bo,hmb[l],out_d*sizeof(float),cudaMemcpyDeviceToHost));
         wo+=we; bo+=out_d;
     }
+}
+
+
+void TinyMLPHashGrid::loadHashgrid(const float* host_hashgrid){
+    CUDA_CHECK(cudaMemcpy(d_master_hashtable, host_hashgrid, m_totalHashElements * sizeof(float), cudaMemcpyHostToDevice));
+    int hblocks = (m_totalHashElements + 255) / 256;
+    hg_f2h<<<hblocks, 256>>>(d_master_hashtable, d_fwd_hashtable, m_totalHashElements);
+    cudaDeviceSynchronize();
+}
+
+void TinyMLPHashGrid::saveHashgrid(float* host_hashgrid){
+    CUDA_CHECK(cudaMemcpy(host_hashgrid, d_master_hashtable, m_totalHashElements * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 void TinyMLPHashGrid::free_pointer_array(float** d_arr,int count){

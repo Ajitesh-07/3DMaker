@@ -7,6 +7,7 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <filesystem>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../../third_party/stb_image_write.h"
 
@@ -327,6 +328,11 @@ int main(int argc, char** argv) {
 
     std::cout << "Creating MP4 with FFmpeg..." << std::endl;
     system("ffmpeg -y -framerate 30 -i ../benchmarks/frames/video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p ../benchmarks/nerf_360.mp4");
+
+    std::cout << "\nSaving trained NeRF to ../benchmarks/saved/model.inerf..." << std::endl;
+    std::filesystem::create_directories("../benchmarks/saved");
+    nerf.save("../benchmarks/saved/model.inerf");
+    std::cout << "Save complete!" << std::endl;
 
     CUDA_CHECK(cudaFree(d_loss));
     CUDA_CHECK(cudaFree(d_chunk_rgb_out));

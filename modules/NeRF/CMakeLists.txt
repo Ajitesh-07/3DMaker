@@ -133,4 +133,32 @@ if(NERF_BUILD_TESTS)
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
     )
     target_link_libraries(train PRIVATE NeRFModule)
+
+    add_executable(test_loading test_kernels/test_loading.cu)
+    if(MSVC)
+        target_compile_options(test_loading PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
+        )
+        target_compile_definitions(test_loading PRIVATE
+            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+        )
+    endif()
+    target_compile_options(test_loading PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
+    )
+    target_link_libraries(test_loading PRIVATE NeRFModule)
+
+    add_executable(render test_kernels/render.cu)
+    if(MSVC)
+        target_compile_options(render PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
+        )
+        target_compile_definitions(render PRIVATE
+            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+        )
+    endif()
+    target_compile_options(render PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
+    )
+    target_link_libraries(render PRIVATE NeRFModule)
 endif()

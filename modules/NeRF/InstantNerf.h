@@ -29,7 +29,7 @@ struct NerfOptions {
     uint3 gridResolution = make_uint3(128, 128, 128);
     float3  aabbMin         = make_float3(-1.0f, -1.0f, -1.0f);
     float3  aabbMax         = make_float3( 1.0f,  1.0f,  1.0f);
-    int numCascades = 4;
+    int levelsMipmap = 4;
 
     int densityHiddenDim = 64;
     int densityNumLayers = 2;
@@ -134,6 +134,7 @@ public:
     MetricTracker earlyOccupancyUpdateMasterGrid;
     MetricTracker earlyOccupancyComputeSum;
     MetricTracker earlyOccupancyUpdateBitgrid;
+    MetricTracker earlyOccupancyUpdateMipmap;
 
     MetricTracker lateOccupancySampleNonUniformTime;
     MetricTracker lateOccupancySampleUniformTime;
@@ -142,6 +143,7 @@ public:
     MetricTracker lateOccupancyUpdateMasterGrid;
     MetricTracker lateOccupancyComputeSum;
     MetricTracker lateOccupancyUpdateBitgrid;
+    MetricTracker lateOccupancyUpdateMipmap;
 
     
     MetricGroup inferenceTime;
@@ -168,7 +170,7 @@ public:
         earlyOccupancyUpdateTime.add(earlyOccupancyUpdateMasterGrid);
         earlyOccupancyUpdateTime.add(earlyOccupancyComputeSum);
         earlyOccupancyUpdateTime.add(earlyOccupancyUpdateBitgrid);
-
+        earlyOccupancyUpdateTime.add(earlyOccupancyUpdateMipmap);
         
         lateOccupancyInferenceTime.add(lateOccupancyDensityFwd);
         lateOccupancyInferenceTime.add(lateOccupancyUpdateTmpGrid);
@@ -179,6 +181,7 @@ public:
         lateOccupancyUpdateTime.add(lateOccupancyUpdateMasterGrid);
         lateOccupancyUpdateTime.add(lateOccupancyComputeSum);
         lateOccupancyUpdateTime.add(lateOccupancyUpdateBitgrid);
+        lateOccupancyUpdateTime.add(lateOccupancyUpdateMipmap);
 
         trainTime.add(trainGatherTime);
         trainTime.add(trainDensityFwd);
@@ -269,6 +272,7 @@ public:
     void resetStats();
     void setLearningRate(float lr) { m_opts.learningRate = lr; }
     void setBgColor(float3 c) { m_opts.bgColor = c; }
+    void setProfiling(bool p) { m_opts.isProfiling = p; }
 
     void trainWithRays(
         const float3* d_rays_o,
@@ -289,10 +293,15 @@ public:
         cudaStream_t stream = 0
     );
 
+    void save(const std::string& filename);
+    void load(const std::string& filename);
+
 private:
     void initRenderBuffers();
+    void freeBuffers();
     void earlyOccupancyGridUpdate(cudaStream_t stream = 0);
     void lateOccupancyGridUpdate(cudaStream_t stream = 0);
+    void buildMipmaps(cudaStream_t stream, int level0_cells);
 
     NerfOptions m_opts;
     RenderingBuffers m_render_buffers;
@@ -303,7 +312,8 @@ private:
     DeviceBuffer<uint8_t> d_occupancyGrid{0};
     DeviceBuffer<float> d_masterOccupancyGrid{0}; 
 
-    bool m_initialized = false;
+    bool m_traininit = false;
+    bool m_renderinit = false;
     int m_trainSteps = 0;
 
     template <typename F>
@@ -342,6 +352,7 @@ extern "C" void launchMarchRaysDDA(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int mipmapLevels,
     uint32_t* packed_coords_out,
     float* t_hits_out,
     uint32_t* num_steps_per_ray,
@@ -359,6 +370,7 @@ extern "C" void processRaysChunk(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int mipmapLevels,
 
     uint32_t* d_sparse_morton,   
     float* d_sparse_ts,          
@@ -387,6 +399,7 @@ extern "C" void processRaysChunkLinear(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int mipmapLevels,
 
     float* d_sparse_ts,
     uint32_t* d_num_steps,

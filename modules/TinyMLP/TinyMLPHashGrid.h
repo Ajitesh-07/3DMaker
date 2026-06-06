@@ -72,6 +72,8 @@ public:
     // In-memory overloads for testing infrastructure
     void loadWeights(const float* host_weights, const float* host_biases);
     void saveWeights(float* host_weights, float* host_biases);
+    void loadHashgrid(const float* host_hashgrid);
+    void saveHashgrid(float* host_hashgrid);
 
 private:
     MLPGridOptions user_opt;    // The raw user-supplied options

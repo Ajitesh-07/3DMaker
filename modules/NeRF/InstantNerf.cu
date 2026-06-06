@@ -2,6 +2,7 @@
 #include "otherKernels.cu"
 #include "../TinyMLP/TinyMLPHashGrid.h"
 #include <algorithm>
+#include <fstream>
 
 void sampleNonUniform(
     float* d_samples,
@@ -135,6 +136,7 @@ void InstantNerf::printStats() {
     printTracker("earlyOccupancyUpdateMasterGrid", m_profile_stats.earlyOccupancyUpdateMasterGrid, 2);
     printTracker("earlyOccupancyComputeSum", m_profile_stats.earlyOccupancyComputeSum, 2);
     printTracker("earlyOccupancyUpdateBitgrid", m_profile_stats.earlyOccupancyUpdateBitgrid, 2);
+    printTracker("earlyOccupancyUpdateMipmap", m_profile_stats.earlyOccupancyUpdateMipmap, 2);
 
     printGroup("lateOccupancyGridUpdate", m_profile_stats.lateOccupancyUpdateTime, 1);
     printTracker("lateOccupancySampleUniformTime", m_profile_stats.lateOccupancySampleUniformTime, 2);
@@ -145,6 +147,7 @@ void InstantNerf::printStats() {
     printTracker("lateOccupancyUpdateMasterGrid", m_profile_stats.lateOccupancyUpdateMasterGrid, 2);
     printTracker("lateOccupancyComputeSum", m_profile_stats.lateOccupancyComputeSum, 2);
     printTracker("lateOccupancyUpdateBitgrid", m_profile_stats.lateOccupancyUpdateBitgrid, 2);
+    printTracker("lateOccupancyUpdateMipmap", m_profile_stats.lateOccupancyUpdateMipmap, 2);
 
     printGroup("trainTime", m_profile_stats.trainTime, 1);
     printTracker("trainGatherTime", m_profile_stats.trainGatherTime, 2);
@@ -162,7 +165,7 @@ void InstantNerf::printStats() {
 
 void InstantNerf::initRenderBuffers()
 {
-    if (!m_initialized) {
+    if (!m_renderinit) {
         fprintf(stderr, "[InstantNerf] Error: init() must be called before initRenderBuffers()\n");
         return;
     }
@@ -218,22 +221,76 @@ void InstantNerf::initRenderBuffers()
     cudaMalloc(&m_render_buffers.d_temp_storage, m_render_buffers.temp_storage_bytes);
 
     m_render_buffers.h_ray_offsets.reserve(m_opts.rayChunkSize);
+    
+    m_traininit = true;
+}
+
+void InstantNerf::freeBuffers() {
+    m_render_buffers.d_rays_d_inv_chunk = DeviceBuffer<float3>(0);
+    m_render_buffers.d_nears_chunk = DeviceBuffer<float>(0);
+    m_render_buffers.d_fars_chunk = DeviceBuffer<float>(0);
+    m_render_buffers.d_sparse_ts = DeviceBuffer<float>(0);
+    m_render_buffers.d_num_steps = DeviceBuffer<uint32_t>(0);
+    m_render_buffers.d_ray_offsets = DeviceBuffer<uint32_t>(0);
+    m_render_buffers.d_dense_sparse_indices = DeviceBuffer<uint32_t>(0);
+    m_render_buffers.d_mlp_positions = DeviceBuffer<float>(0);
+    m_render_buffers.d_ray_indices = DeviceBuffer<uint32_t>(0);
+    m_render_buffers.d_t_sorted = DeviceBuffer<float>(0);
+    m_render_buffers.d_density_out = DeviceBuffer<float>(0);
+    m_render_buffers.d_color_input = DeviceBuffer<half>(0);
+    m_render_buffers.d_color_output = DeviceBuffer<float>(0);
+    m_render_buffers.d_density_sigma = DeviceBuffer<float>(0);
+    m_render_buffers.d_rgb_output = DeviceBuffer<float>(0);
+    m_render_buffers.d_render_rgb_chunk = DeviceBuffer<float>(0);
+    m_render_buffers.d_render_depth_chunk = DeviceBuffer<float>(0);
+    m_render_buffers.d_phi_chunk = DeviceBuffer<float>(0);
+    m_render_buffers.d_out_count = DeviceBuffer<uint32_t>(0);
+    m_render_buffers.d_active_ray_indices = DeviceBuffer<uint32_t>(0);
+    m_render_buffers.d_batch_position = DeviceBuffer<float>(0);
+    m_render_buffers.d_batch_direction = DeviceBuffer<float3>(0);
+    m_render_buffers.d_current_t = DeviceBuffer<float>(0);
+    m_render_buffers.d_current_rgb = DeviceBuffer<float>(0);
+    m_render_buffers.d_custom_color_grad = DeviceBuffer<half>(0);
+    m_render_buffers.d_custom_density_grad = DeviceBuffer<half>(0);
+    m_render_buffers.d_tmpsigma = DeviceBuffer<float>(0);
+    m_render_buffers.d_color_dx_out = DeviceBuffer<half>(0);
+    m_render_buffers.d_occupancy_samples = DeviceBuffer<float>(0);
+    m_render_buffers.d_tmp_grid = DeviceBuffer<float>(0);
+    m_render_buffers.d_sum = DeviceBuffer<float>(0);
+    m_render_buffers.d_numActiveCells = DeviceBuffer<int>(0);
+    m_render_buffers.d_activeCellIndices = DeviceBuffer<int>(0);
+
+    if (m_render_buffers.d_temp_storage) {
+        cudaFree(m_render_buffers.d_temp_storage);
+        m_render_buffers.d_temp_storage = nullptr;
+    }
+    m_render_buffers.h_ray_offsets.clear();
+    m_render_buffers.h_ray_offsets.shrink_to_fit();
+
+    m_traininit = false;
 }
 
 void InstantNerf::init(const NerfOptions& opts) {
     m_opts = opts;
     
-    int occupancyGridCells = opts.gridResolution.x * opts.gridResolution.y * opts.gridResolution.z;
+    uint3 res = make_uint3(opts.gridResolution.x, opts.gridResolution.y, opts.gridResolution.z);
+    int occupancyGridCells = 0;
+    for (int i = 0; i < opts.levelsMipmap; i++) {
+        occupancyGridCells += res.x * res.y * res.z;
+        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    }
+    
     int occupancyGridBytes = (occupancyGridCells + 7)/ 8;
+    int masterGridCells = opts.gridResolution.x * opts.gridResolution.y * opts.gridResolution.z;
 
     d_occupancyGrid = DeviceBuffer<uint8_t>(occupancyGridBytes);
     d_occupancyGrid.fill(0);
-    d_masterOccupancyGrid = DeviceBuffer<float>(occupancyGridCells);
+    d_masterOccupancyGrid = DeviceBuffer<float>(masterGridCells);
 
     {
         constexpr int BS = 256;
-        int gs = (occupancyGridCells + BS - 1) / BS;
-        fill_float_kernel<<<gs, BS>>>(d_masterOccupancyGrid.data(), 0.0f, occupancyGridCells);
+        int gs = (masterGridCells + BS - 1) / BS;
+        fill_float_kernel<<<gs, BS>>>(d_masterOccupancyGrid.data(), 0.0f, masterGridCells);
     }
 
     MLPGridOptions densityOpts;
@@ -262,7 +319,7 @@ void InstantNerf::init(const NerfOptions& opts) {
 
     m_profile_stats.init();
     m_profile_stats.pendingTimers.reserve(100000);
-    m_initialized = true;
+    m_renderinit = true;
 
     initRenderBuffers();
     earlyOccupancyGridUpdate();
@@ -278,8 +335,8 @@ void InstantNerf::trainWithRays(
     float* d_rgb_out,
     cudaStream_t stream
 ) { 
-    if(!m_initialized) {
-        fprintf(stderr, "[InstantNerf] Error: init() must be called before trainWithRays()\n");
+    if(!m_traininit) {
+        fprintf(stderr, "[InstantNerf] Error: initRenderBuffers() must be called before trainWithRays()\n");
         return;
     }
 
@@ -310,7 +367,7 @@ void InstantNerf::trainWithRays(
                 m_render_buffers.d_fars_chunk.data(),
                 d_occupancyGrid.data(),
                 m_opts.gridResolution,
-                m_opts.aabbMin, m_opts.aabbMax,
+                m_opts.aabbMin, m_opts.aabbMax, m_opts.levelsMipmap,
                 m_render_buffers.d_sparse_ts.data(), 
                 m_render_buffers.d_num_steps.data(),
                 m_render_buffers.d_ray_offsets.data(),
@@ -516,8 +573,8 @@ void InstantNerf::renderImage(
     float* d_rgb_out,
     cudaStream_t stream
 ) {
-    if(!m_initialized) {
-        fprintf(stderr, "[InstantNerf] Error: init() must be called before trainWithRays()\n");
+    if(!m_renderinit) {
+        fprintf(stderr, "[InstantNerf] Error: init() must be called before renderImage()\n");
         return;
     }
 
@@ -526,7 +583,7 @@ void InstantNerf::renderImage(
         const float3* chunk_o = d_rays_o + offset;
         const float3* chunk_d = d_rays_d + offset;
 
-        {
+        measure(stream, m_profile_stats.processRaysTime, [&](){
             constexpr int BS = 256;
             int gs = (currentChunkRays + BS - 1) / BS;
 
@@ -547,7 +604,7 @@ void InstantNerf::renderImage(
                 m_render_buffers.d_fars_chunk.data(),
                 d_occupancyGrid.data(),
                 m_opts.gridResolution,
-                m_opts.aabbMin, m_opts.aabbMax,
+                m_opts.aabbMin, m_opts.aabbMax, m_opts.levelsMipmap,
                 m_render_buffers.d_sparse_ts.data(), 
                 m_render_buffers.d_num_steps.data(),
                 m_render_buffers.d_ray_offsets.data(),
@@ -557,7 +614,7 @@ void InstantNerf::renderImage(
                 m_render_buffers.d_t_sorted.data(),
                 stream
             );
-        }
+        });
         
         uint32_t totalHits = 0;
         uint32_t highestHits = 0;
@@ -574,9 +631,11 @@ void InstantNerf::renderImage(
             uint32_t b_size = std::min(static_cast<uint32_t>(m_opts.batchSize), totalHits - b_offset);
             uint32_t padded_b_size = (b_size + 15) & ~15;
 
+            measure(stream, m_profile_stats.inferenceDensityFwd, [&](){
             m_densityMLP->inference(m_render_buffers.d_mlp_positions.data() + b_offset * 4, m_render_buffers.d_density_out.data(), padded_b_size, stream);
+            });
 
-            {
+            measure(stream, m_profile_stats.inferenceGatherSH, [&](){
                 constexpr int BS = 256;
                 int gs = (b_size + BS - 1) / BS;
 
@@ -587,16 +646,19 @@ void InstantNerf::renderImage(
                     m_render_buffers.d_color_input.data(),
                     m_render_buffers.d_density_sigma.data() + b_offset
                 );
-            }
+            });
 
+            measure(stream, m_profile_stats.inferenceColorFwd, [&](){
             m_colorMLP->inference(
                 m_render_buffers.d_color_input.data(),
                 m_render_buffers.d_rgb_output.data() + b_offset * 3,
                 padded_b_size,
                 stream
             );
+            });
         }
 
+        measure(stream, m_profile_stats.volumeRendering, [&](){
         launchVolumeRendering(
             currentChunkRays,
             m_render_buffers.d_ray_offsets.data(),
@@ -611,10 +673,15 @@ void InstantNerf::renderImage(
             m_opts.bgColor,
             stream
         );
+        });
 
         if (d_rgb_out != nullptr) {
             cudaMemcpyAsync(d_rgb_out + offset * 3, m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
         }
+    }
+
+    if (m_opts.isProfiling) {
+        m_profile_stats.resolvePendingTimers();
     }
 }
 
@@ -692,6 +759,11 @@ void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
         N
     );
     });
+
+    measure(stream, m_profile_stats.lateOccupancyUpdateMipmap, [&](){
+        buildMipmaps(stream, N);
+    });
+
 }
 
 void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
@@ -742,4 +814,181 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
         N
     );
     });
+
+    measure(stream, m_profile_stats.earlyOccupancyUpdateMipmap, [&](){
+        buildMipmaps(stream, N);
+    });
+}
+
+void InstantNerf::buildMipmaps(cudaStream_t stream, int level0_cells) {
+    uint32_t level0_bytes = level0_cells / 8;
+    uint32_t total_bytes = d_occupancyGrid.size();
+    
+    if (total_bytes > level0_bytes) {
+        cudaMemsetAsync(d_occupancyGrid.data() + level0_bytes, 0, total_bytes - level0_bytes, stream);
+    }
+
+    uint8_t* current_level_ptr = d_occupancyGrid.data();
+    uint3 current_res = m_opts.gridResolution;
+
+    for (int l = 0; l < m_opts.levelsMipmap - 1; ++l) {
+        
+        uint3 next_res = make_uint3(current_res.x / 2, current_res.y / 2, current_res.z / 2);
+        int next_cells = next_res.x * next_res.y * next_res.z;
+        uint32_t current_level_bytes = (current_res.x * current_res.y * current_res.z) / 8;
+        uint8_t* next_level_ptr = current_level_ptr + current_level_bytes;
+
+        int threads = 256;
+        int blocks = (next_cells + threads - 1) / threads;
+
+        bitfield_max_pool<<<blocks, threads, 0, stream>>>(
+            current_level_ptr, 
+            reinterpret_cast<uint32_t*>(next_level_ptr),
+            next_res
+        );
+
+        current_level_ptr = next_level_ptr;
+        current_res = next_res;
+    }
+}
+
+void InstantNerf::save(const std::string& filename) {
+    if(!m_renderinit) throw std::runtime_error("InstantNerf not initialized, cannot save.");
+    std::ofstream out(filename, std::ios::binary);
+    if (!out.is_open()) throw std::runtime_error("Cannot open file for saving: " + filename);
+
+    const char magic[6] = {'I','N','E','R','F','1'};
+    out.write(magic, 6);
+
+    out.write(reinterpret_cast<const char*>(&m_opts), sizeof(NerfOptions));
+
+    int hashGridElements = m_opts.numLevels * m_opts.hashTableSize * m_opts.featuresPerLevel;
+    std::vector<float> h_hash(hashGridElements);
+    m_densityMLP->saveHashgrid(h_hash.data());
+    out.write(reinterpret_cast<const char*>(h_hash.data()), hashGridElements * sizeof(float));
+
+    int d_in = m_opts.numLevels * m_opts.featuresPerLevel;
+    int d_out = 16;
+    int d_hid = m_opts.densityHiddenDim;
+    int numLayers = m_opts.densityNumLayers;
+    int d_total_weights = 0;
+    int d_total_biases = 0;
+    for(int l=0; l<numLayers; l++) {
+        int in_d = (l == 0) ? d_in : d_hid;
+        int out_d = (l == numLayers - 1) ? d_out : d_hid;
+        d_total_weights += in_d * out_d;
+        d_total_biases += out_d;
+    }
+    std::vector<float> h_density_w(d_total_weights);
+    std::vector<float> h_density_b(d_total_biases);
+    m_densityMLP->saveWeights(h_density_w.data(), h_density_b.data());
+    out.write(reinterpret_cast<const char*>(h_density_w.data()), d_total_weights * sizeof(float));
+    out.write(reinterpret_cast<const char*>(h_density_b.data()), d_total_biases * sizeof(float));
+
+    int c_in = 32;
+    int c_out = 16;
+    int c_hid = m_opts.colorHiddenDim;
+    int c_numLayers = m_opts.colorNumLayers;
+    int c_total_weights = 0;
+    int c_total_biases = 0;
+    for(int l=0; l<c_numLayers; l++) {
+        int in_d = (l == 0) ? c_in : c_hid;
+        int out_d = (l == c_numLayers - 1) ? c_out : c_hid;
+        c_total_weights += in_d * out_d;
+        c_total_biases += out_d;
+    }
+    std::vector<float> h_color_w(c_total_weights);
+    std::vector<float> h_color_b(c_total_biases);
+    m_colorMLP->saveWeights(h_color_w.data(), h_color_b.data());
+    out.write(reinterpret_cast<const char*>(h_color_w.data()), c_total_weights * sizeof(float));
+    out.write(reinterpret_cast<const char*>(h_color_b.data()), c_total_biases * sizeof(float));
+
+    uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
+    int occupancyGridCells = 0;
+    for (int i = 0; i < m_opts.levelsMipmap; i++) {
+        occupancyGridCells += res.x * res.y * res.z;
+        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    }
+    int occupancyGridBytes = (occupancyGridCells + 7)/ 8;
+    int masterGridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+
+    std::vector<float> h_masterOccupancyGrid(masterGridCells);
+    d_masterOccupancyGrid.copyHost(h_masterOccupancyGrid.data(), masterGridCells);
+    out.write(reinterpret_cast<const char*>(h_masterOccupancyGrid.data()), masterGridCells * sizeof(float));
+
+    std::vector<uint8_t> h_occupancyGrid(occupancyGridBytes);
+    d_occupancyGrid.copyHost(h_occupancyGrid.data(), occupancyGridBytes);
+    out.write(reinterpret_cast<const char*>(h_occupancyGrid.data()), occupancyGridBytes * sizeof(uint8_t));
+}
+
+void InstantNerf::load(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) throw std::runtime_error("Cannot open file for loading: " + filename);
+
+    char magic[6];
+    in.read(magic, 6);
+    if (std::string(magic, 6) != "INERF1") throw std::runtime_error("Invalid INERF file format");
+
+    NerfOptions loadedOpts;
+    in.read(reinterpret_cast<char*>(&loadedOpts), sizeof(NerfOptions));
+    
+    init(loadedOpts);
+    
+    int hashGridElements = m_opts.numLevels * m_opts.hashTableSize * m_opts.featuresPerLevel;
+    std::vector<float> h_hash(hashGridElements);
+    in.read(reinterpret_cast<char*>(h_hash.data()), hashGridElements * sizeof(float));
+    m_densityMLP->loadHashgrid(h_hash.data());
+
+    int d_in = m_opts.numLevels * m_opts.featuresPerLevel;
+    int d_out = 16;
+    int d_hid = m_opts.densityHiddenDim;
+    int numLayers = m_opts.densityNumLayers;
+    int d_total_weights = 0;
+    int d_total_biases = 0;
+    for(int l=0; l<numLayers; l++) {
+        int in_d = (l == 0) ? d_in : d_hid;
+        int out_d = (l == numLayers - 1) ? d_out : d_hid;
+        d_total_weights += in_d * out_d;
+        d_total_biases += out_d;
+    }
+    std::vector<float> h_density_w(d_total_weights);
+    std::vector<float> h_density_b(d_total_biases);
+    in.read(reinterpret_cast<char*>(h_density_w.data()), d_total_weights * sizeof(float));
+    in.read(reinterpret_cast<char*>(h_density_b.data()), d_total_biases * sizeof(float));
+    m_densityMLP->loadWeights(h_density_w.data(), h_density_b.data());
+
+    int c_in = 32;
+    int c_out = 16;
+    int c_hid = m_opts.colorHiddenDim;
+    int c_numLayers = m_opts.colorNumLayers;
+    int c_total_weights = 0;
+    int c_total_biases = 0;
+    for(int l=0; l<c_numLayers; l++) {
+        int in_d = (l == 0) ? c_in : c_hid;
+        int out_d = (l == c_numLayers - 1) ? c_out : c_hid;
+        c_total_weights += in_d * out_d;
+        c_total_biases += out_d;
+    }
+    std::vector<float> h_color_w(c_total_weights);
+    std::vector<float> h_color_b(c_total_biases);
+    in.read(reinterpret_cast<char*>(h_color_w.data()), c_total_weights * sizeof(float));
+    in.read(reinterpret_cast<char*>(h_color_b.data()), c_total_biases * sizeof(float));
+    m_colorMLP->loadWeights(h_color_w.data(), h_color_b.data());
+
+    uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
+    int occupancyGridCells = 0;
+    for (int i = 0; i < m_opts.levelsMipmap; i++) {
+        occupancyGridCells += res.x * res.y * res.z;
+        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    }
+    int occupancyGridBytes = (occupancyGridCells + 7)/ 8;
+    int masterGridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+
+    std::vector<float> h_masterOccupancyGrid(masterGridCells);
+    in.read(reinterpret_cast<char*>(h_masterOccupancyGrid.data()), masterGridCells * sizeof(float));
+    cudaMemcpy(d_masterOccupancyGrid.data(), h_masterOccupancyGrid.data(), masterGridCells * sizeof(float), cudaMemcpyHostToDevice);
+
+    std::vector<uint8_t> h_occupancyGrid(occupancyGridBytes);
+    in.read(reinterpret_cast<char*>(h_occupancyGrid.data()), occupancyGridBytes * sizeof(uint8_t));
+    cudaMemcpy(d_occupancyGrid.data(), h_occupancyGrid.data(), occupancyGridBytes * sizeof(uint8_t), cudaMemcpyHostToDevice);
 }

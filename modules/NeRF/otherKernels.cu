@@ -624,6 +624,55 @@ __global__ void updateOccupancyGrid(
     }
 }
 
+__global__ void bitfield_max_pool(
+    const uint8_t* __restrict__ level_in,
+    uint32_t* __restrict__ level_out_32,
+    uint3 res_out
+) {
+    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_out_cells = res_out.x * res_out.y * res_out.z;
+    
+    bool is_occupied = false;
+
+    if (out_idx < total_out_cells) {
+        int out_x = out_idx % res_out.x;
+        int out_y = (out_idx / res_out.x) % res_out.y;
+        int out_z = out_idx / (res_out.x * res_out.y);
+
+        int in_x = out_x * 2;
+        int in_y = out_y * 2;
+        int in_z = out_z * 2;
+        
+        int res_in_x = res_out.x * 2;
+        int res_in_y = res_out.y * 2;
+
+        #pragma unroll
+        for (int dz = 0; dz < 2; ++dz) {
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    int in_idx = (in_z + dz) * (res_in_x * res_in_y) + 
+                                 (in_y + dy) * res_in_x + 
+                                 (in_x + dx);
+
+                    int byte_idx = in_idx >> 3;
+                    int bit_idx  = in_idx & 7;
+                    
+                    bool bit = (level_in[byte_idx] >> bit_idx) & 1;
+                    is_occupied = is_occupied || bit; 
+                }
+            }
+        }
+    }
+
+    unsigned int warp_mask = __ballot_sync(0xFFFFFFFF, is_occupied);
+
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0 && out_idx < total_out_cells) {
+        int word_idx = out_idx / 32;
+        level_out_32[word_idx] = warp_mask;
+    }
+}
+
 __global__ void extractActiveCells(
     const uint8_t* __restrict__ occupancyGrid,
     int* __restrict__ activeCellIndices,
