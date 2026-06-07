@@ -307,6 +307,14 @@ public:
         cudaStream_t stream = 0
     );
 
+    void renderImageHit(
+        const float3* d_rays_o,
+        const float3* d_rays_d,
+        uint32_t numRays,
+        float* d_rgb_out,
+        cudaStream_t stream
+    );
+
     void save(const std::string& filename);
     void load(const std::string& filename);
 

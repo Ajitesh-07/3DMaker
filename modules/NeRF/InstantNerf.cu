@@ -583,7 +583,7 @@ void InstantNerf::trainWithRaysHit(
     float* d_rgb_out,
     cudaStream_t stream
 ) {
-    if(!m_renderinit) {
+    if(!m_traininit) {
         fprintf(stderr, "[InstantNerf] Error: init() must be called before trainWithRaysHit()\n");
         return;
     }
@@ -900,6 +900,125 @@ void InstantNerf::renderImage(
         if (d_rgb_out != nullptr) {
             cudaMemcpyAsync(d_rgb_out + offset * 3, m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
         }
+    }
+
+    if (m_opts.isProfiling) {
+        m_profile_stats.resolvePendingTimers();
+    }
+}
+
+void InstantNerf::renderImageHit(
+    const float3* d_rays_o,
+    const float3* d_rays_d,
+    uint32_t numRays,
+    float* d_rgb_out,
+    cudaStream_t stream
+) {
+    if(!m_traininit) {
+        fprintf(stderr, "[InstantNerf] Error: init() must be called before trainWithRaysHit()\n");
+        return;
+    }
+
+    uint32_t raysDone = 0;
+    int i = 0;
+
+    while (raysDone < numRays) {
+        uint32_t currentChunkRaysUpperBound = min(m_opts.rayChunkSize, numRays - raysDone);
+        const float3* chunk_o = d_rays_o + raysDone;
+        const float3* chunk_d = d_rays_d + raysDone;
+
+        int currentChunkRays;
+        uint32_t totalHits;
+        measure(stream, m_profile_stats.processRaysTime, [&]() {
+        constexpr int BS = 256;
+        int gs = (currentChunkRaysUpperBound + BS - 1) / BS;
+        compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
+            currentChunkRaysUpperBound,
+            chunk_o, chunk_d, m_opts.aabbMin, m_opts.aabbMax,
+            m_render_buffers.d_rays_d_inv_chunk.data(),
+            m_render_buffers.d_nears_chunk.data(),
+            m_render_buffers.d_fars_chunk.data()
+        );
+
+        currentChunkRays = processRaysHitLinear(
+            currentChunkRaysUpperBound,
+            chunk_o, chunk_d,
+            m_render_buffers.d_rays_d_inv_chunk.data(),
+            m_render_buffers.d_nears_chunk.data(),
+            m_render_buffers.d_fars_chunk.data(),
+            d_occupancyGrid.data(),
+            m_opts.gridResolution,
+            m_opts.aabbMin, m_opts.aabbMax,
+            m_opts.levelsMipmap,
+            m_opts.batchSize,
+            &totalHits,
+            m_render_buffers.d_active_rays_count.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_mlp_positions.data(),
+            m_render_buffers.d_ray_indices.data(),
+            m_render_buffers.d_t_sorted.data(),
+            m_render_buffers.d_block_sums.data(),
+            stream
+        );
+        });
+
+        if (currentChunkRays == 0) {
+            fprintf(stderr, "Error: Batch size is too small to fit even a single ray! Increase batchSize.\n");
+            return; // Or throw an exception to escape the infinite loop
+        }
+
+        uint32_t padded_b_size = (totalHits + 15) & ~15;
+
+        measure(stream, m_profile_stats.inferenceDensityFwd, [&](){
+        m_densityMLP->inference(m_render_buffers.d_mlp_positions.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
+        });
+
+        measure(stream, m_profile_stats.inferenceGatherSH, [&]()
+        {
+            constexpr int BS = 256;
+            int gs = (totalHits + BS - 1) / BS;
+
+            compute_SH_gather<<<gs, BS, 0, stream>>>(
+                chunk_d, m_render_buffers.d_ray_indices.data(), 
+                0, totalHits, m_opts.densityBias,
+                m_render_buffers.d_density_out.data(), 
+                m_render_buffers.d_color_input.data(),
+                m_render_buffers.d_density_sigma.data()
+            );
+        });
+
+        measure(stream, m_profile_stats.inferenceColorFwd, [&](){
+        m_colorMLP->inference(
+            m_render_buffers.d_color_input.data(),
+            m_render_buffers.d_rgb_output.data(),
+            padded_b_size,
+            stream
+        );
+        });
+
+        measure(stream, m_profile_stats.volumeRendering, [&](){
+        launchVolumeRendering(
+            currentChunkRays,
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_t_sorted.data(),
+            m_render_buffers.d_density_sigma.data(),
+            m_render_buffers.d_rgb_output.data(),
+            nullptr,
+            m_render_buffers.d_render_rgb_chunk.data(),
+            m_render_buffers.d_render_depth_chunk.data(),
+            m_render_buffers.d_phi_chunk.data(),
+            m_opts.bgColor,
+            stream
+        );
+        });
+
+        if (d_rgb_out != nullptr) {
+            cudaMemcpyAsync(d_rgb_out + raysDone * 3, m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
+
+        raysDone += currentChunkRays;
     }
 
     if (m_opts.isProfiling) {

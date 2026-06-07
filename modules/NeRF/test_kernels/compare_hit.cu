@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <cuda_runtime.h>
+#include <cmath>
 
 struct Resolution {
     std::string name;
@@ -13,7 +14,9 @@ struct Resolution {
 __global__ void initRaysKernel(float3* o, float3* d, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        o[i] = make_float3(0.0f, 0.0f, -2.0f);
+        float u = (float)(i % 1920) / 1920.0f;
+        float v = (float)(i / 1920) / 1080.0f;
+        o[i] = make_float3((u - 0.5f) * 2.0f, (v - 0.5f) * 2.0f, -2.0f);
         d[i] = make_float3(0.0f, 0.0f, 1.0f);
     }
 }
@@ -27,7 +30,7 @@ void printVRAMUsage() {
 }
 
 int main() {
-    std::cout << "Comparing Ray-Centric vs Hit-Centric Training Pipeline...\n" << std::endl;
+    std::cout << "Comparing Ray-Centric vs Hit-Centric Rendering Pipeline...\n" << std::endl;
 
     int numRays = 1920 * 1080; // 1080p
     std::cout << "Target Resolution: 1920x1080 (1080p)" << std::endl;
@@ -35,15 +38,18 @@ int main() {
 
     float3* d_rays_o;
     float3* d_rays_d;
-    float* d_rgb_true;
+    float* d_rgb_out1;
+    float* d_rgb_out2;
 
     CUDA_CHECK(cudaMalloc(&d_rays_o, numRays * sizeof(float3)));
     CUDA_CHECK(cudaMalloc(&d_rays_d, numRays * sizeof(float3)));
-    CUDA_CHECK(cudaMalloc(&d_rgb_true, numRays * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rgb_out1, numRays * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rgb_out2, numRays * 3 * sizeof(float)));
 
     int blocks = (numRays + 255) / 256;
     initRaysKernel<<<blocks, 256>>>(d_rays_o, d_rays_d, numRays);
-    CUDA_CHECK(cudaMemset(d_rgb_true, 0, numRays * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_rgb_out1, 0, numRays * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_rgb_out2, 0, numRays * 3 * sizeof(float)));
 
     NerfOptions opts;
     opts.rayChunkSize = 256 * 1024;
@@ -60,10 +66,7 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
 
     // Warmup
-    int dummySteps = 0;
-    int chunks = (numRays + opts.rayChunkSize - 1) / opts.rayChunkSize;
-    std::vector<uint32_t> dummyHitCounts(chunks, 0);
-    nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, 8192, dummySteps, dummyHitCounts.data());
+    nerf.renderImage(d_rays_o, d_rays_d, numRays, d_rgb_out1);
     cudaDeviceSynchronize();
     nerf.resetStats();
 
@@ -71,12 +74,11 @@ int main() {
     // 1. Ray-Centric (Original)
     // ==========================================
     std::cout << "======================================" << std::endl;
-    std::cout << " 1. Original (trainWithRays)          " << std::endl;
+    std::cout << " 1. Original (renderImage)            " << std::endl;
     std::cout << "======================================" << std::endl;
     
-    int trainSteps1 = 0;
     CUDA_CHECK(cudaEventRecord(start));
-    nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps1, dummyHitCounts.data());
+    nerf.renderImage(d_rays_o, d_rays_d, numRays, d_rgb_out1);
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
@@ -91,13 +93,12 @@ int main() {
     // 2. Hit-Centric (New)
     // ==========================================
     std::cout << "\n======================================" << std::endl;
-    std::cout << " 2. Hit-Centric (trainWithRaysHit)    " << std::endl;
+    std::cout << " 2. Hit-Centric (renderImageHit)      " << std::endl;
     std::cout << "======================================" << std::endl;
     
-    int trainSteps2 = 0;
     try {
         CUDA_CHECK(cudaEventRecord(start));
-        nerf.trainWithRaysHit(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps2, dummyHitCounts.data(), nullptr, 0);
+        nerf.renderImageHit(d_rays_o, d_rays_d, numRays, d_rgb_out2, 0);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
     } catch (const std::exception& e) {
@@ -116,9 +117,33 @@ int main() {
     std::cout << " SPEEDUP: " << ms1 / ms2 << "x faster!" << std::endl;
     std::cout << "======================================" << std::endl;
 
+    // Verify output
+    std::vector<float> h_out1(numRays * 3);
+    std::vector<float> h_out2(numRays * 3);
+    CUDA_CHECK(cudaMemcpy(h_out1.data(), d_rgb_out1, numRays * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_out2.data(), d_rgb_out2, numRays * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < numRays * 3; i++) {
+        float diff = std::abs(h_out1[i] - h_out2[i]);
+        if (diff > max_diff) {
+            max_diff = diff;
+        }
+    }
+
+    std::cout << "\n======================================" << std::endl;
+    std::cout << " Max Diff Between Methods: " << max_diff << std::endl;
+    if (max_diff < 1e-4) {
+        std::cout << " [SUCCESS] Both rendering methods output the same image." << std::endl;
+    } else {
+        std::cout << " [FAILURE] Outputs differ!" << std::endl;
+    }
+    std::cout << "======================================" << std::endl;
+
     CUDA_CHECK(cudaFree(d_rays_o));
     CUDA_CHECK(cudaFree(d_rays_d));
-    CUDA_CHECK(cudaFree(d_rgb_true));
+    CUDA_CHECK(cudaFree(d_rgb_out1));
+    CUDA_CHECK(cudaFree(d_rgb_out2));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 

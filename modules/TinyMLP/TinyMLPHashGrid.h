@@ -32,12 +32,16 @@ inline int inputDim(MLPGridOptions& opt) {
 
 class TinyMLPHashGrid {
 public:
-    explicit TinyMLPHashGrid(const MLPGridOptions& options, int maxBatchSize, int inferBatchSize = 0, unsigned int seed = 42);
+    explicit TinyMLPHashGrid(const MLPGridOptions& options, int maxBatchSize, int inferBatchSize = 0, unsigned int seed = 42, bool isTraining = true);
     ~TinyMLPHashGrid();
 
     // Delete copy constructors to prevent accidental double-freeing of VRAM
     TinyMLPHashGrid(const TinyMLPHashGrid&) = delete;
     TinyMLPHashGrid& operator=(const TinyMLPHashGrid&) = delete;
+
+    // Switch between training and inference modes
+    void switchToInferenceMode();
+    void switchToTrainingMode();
 
     // 1. Clears gradients (MLP weights/biases AND hash grid)
     void zero_grad(cudaStream_t stream = 0);
@@ -82,32 +86,33 @@ private:
     int m_maxBatchSize;
     int m_inferBatchSize;
     int current_step;
+    bool m_isTraining;
 
     // ==========================================
     // DATA BUFFERS
     // ==========================================
 
-    float* d_padded_inputs;             // [maxBatch x 4] float inputs padded from 3->4
-    const float* d_current_inputs_backward; // Pointer to inputs used in the last forward pass
-    half* d_padded_targets;             // Padded ground truth for MSE
-    float* d_padded_outputs_float;      // Padded raw network output
+    float* d_padded_inputs = nullptr;             // [maxBatch x 4] float inputs padded from 3->4
+    const float* d_current_inputs_backward = nullptr; // Pointer to inputs used in the last forward pass
+    half* d_padded_targets = nullptr;             // Padded ground truth for MSE
+    float* d_padded_outputs_float = nullptr;      // Padded raw network output
 
     // ==========================================
     // LOSS STATE
     // ==========================================
 
-    half* d_dLoss_internal;             // FP16 gradients w.r.t network outputs
-    float* d_total_loss;                // Device scalar to safely accumulate MSE loss
+    half* d_dLoss_internal = nullptr;             // FP16 gradients w.r.t network outputs
+    float* d_total_loss = nullptr;                // Device scalar to safely accumulate MSE loss
 
     // ==========================================
     // HASH GRID STATE
     // ==========================================
 
-    float* d_master_hashtable;          // FP32 master hash table (for Adam)
-    half* d_fwd_hashtable;              // FP16 hash table (used during forward)
-    float* d_hashtable_grads;           // FP32 hash table gradients
-    float* d_hash_m;                    // Adam 1st moment (hash grid)
-    float* d_hash_v;                    // Adam 2nd moment (hash grid)
+    float* d_master_hashtable = nullptr;          // FP32 master hash table (for Adam)
+    half* d_fwd_hashtable = nullptr;              // FP16 hash table (used during forward)
+    float* d_hashtable_grads = nullptr;           // FP32 hash table gradients
+    float* d_hash_m = nullptr;                    // Adam 1st moment (hash grid)
+    float* d_hash_v = nullptr;                    // Adam 2nd moment (hash grid)
 
     int m_totalHashElements;            // numLevels * tableSize * featuresLevel
 
@@ -115,23 +120,23 @@ private:
     // NETWORK STATE (Device Pointers)
     // ==========================================
 
-    float** d_master_weights;
-    float** d_master_biases;
-    half** d_fwd_weights;
+    float** d_master_weights = nullptr;
+    float** d_master_biases = nullptr;
+    half** d_fwd_weights = nullptr;
 
-    half** d_activations;               // Array of pointers for intermediate outputs
-    half* d_dx_out;                     // Gradients w.r.t inputs (required by backward)
+    half** d_activations = nullptr;               // Array of pointers for intermediate outputs
+    half* d_dx_out = nullptr;                     // Gradients w.r.t inputs (required by backward)
 
     // ==========================================
     // OPTIMIZER STATE (Device Pointers)
     // ==========================================
 
-    float** d_w_grad;
-    float** d_b_grad;
-    float** d_w_m;
-    float** d_w_v;
-    float** d_b_m;
-    float** d_b_v;
+    float** d_w_grad = nullptr;
+    float** d_b_grad = nullptr;
+    float** d_w_m = nullptr;
+    float** d_w_v = nullptr;
+    float** d_b_m = nullptr;
+    float** d_b_v = nullptr;
 
     // ==========================================
     // PRIVATE HELPERS

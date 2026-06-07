@@ -34,12 +34,16 @@ struct MLPOption {
 class TinyMLP {
 public:
     // Pass maxBatchSize here since we cannot modify MLPOption
-    explicit TinyMLP(const MLPOption& options, int maxBatchSize, int inferBatchSize = 0, unsigned int seed = 42);
+    explicit TinyMLP(const MLPOption& options, int maxBatchSize, int inferBatchSize = 0, unsigned int seed = 42, bool isTraining = true);
     ~TinyMLP();
 
     // Delete copy constructors to prevent accidental double-freeing of VRAM
     TinyMLP(const TinyMLP&) = delete;
     TinyMLP& operator=(const TinyMLP&) = delete;
+    
+    // Switch between training and inference modes
+    void switchToInferenceMode();
+    void switchToTrainingMode();
     
     // 1. Clears gradients (mimics PyTorch zero_grad)
     void zero_grad(cudaStream_t stream = 0);
@@ -84,6 +88,7 @@ private:
     int m_maxBatchSize;     // Maximum batch size for buffer pre-allocation
     int m_inferBatchSize;   // Batch size for inference
     int current_step;       // Tracks Adam optimizer steps for bias correction
+    bool m_isTraining;      // Tracks if we are in training mode
 
     cudaStream_t m_stream = nullptr; // Optional default stream
 
@@ -91,40 +96,40 @@ private:
     // DATA BUFFERS (Padding & Formatting)
     // ==========================================
     
-    half* d_padded_inputs;          // Padded network input
-    half* d_padded_targets;         // Padded ground truth for MSE
-    float* d_padded_outputs_float;  // Padded raw network output
+    half* d_padded_inputs = nullptr;          // Padded network input
+    half* d_padded_targets = nullptr;         // Padded ground truth for MSE
+    float* d_padded_outputs_float = nullptr;  // Padded raw network output
 
     // ==========================================
     // LOSS STATE
     // ==========================================
     
-    half* d_dLoss_internal;         // FP16 gradients w.r.t network outputs
-    float* d_total_loss;            // Device scalar to safely accumulate MSE loss
+    half* d_dLoss_internal = nullptr;         // FP16 gradients w.r.t network outputs
+    float* d_total_loss = nullptr;            // Device scalar to safely accumulate MSE loss
 
     // ==========================================
     // NETWORK STATE (Device Pointers)
     // ==========================================
     
-    float** d_master_weights;       // FP32 Master Weights (for precision Adam updates)
-    float** d_master_biases;        // FP32 Master Biases
-    half** d_fwd_weights;           // FP16 Casted Weights (used during forward pass)
+    float** d_master_weights = nullptr;       // FP32 Master Weights (for precision Adam updates)
+    float** d_master_biases = nullptr;        // FP32 Master Biases
+    half** d_fwd_weights = nullptr;           // FP16 Casted Weights (used during forward pass)
     
-    half** d_activations;           // Array of pointers pointing to intermediate outputs
+    half** d_activations = nullptr;           // Array of pointers pointing to intermediate outputs
 
     // Optimizer State (Adam)
-    half* d_dx_out;                 // Gradients w.r.t inputs (required by backward kernel)
+    half* d_dx_out = nullptr;                 // Gradients w.r.t inputs (required by backward kernel)
     
     // ==========================================
     // OPTIMIZER STATE (Device Pointers)
     // ==========================================
     
-    float** d_w_grad;               // FP32 Weight Gradients
-    float** d_b_grad;               // FP32 Bias Gradients
-    float** d_w_m;                  // Adam 1st Moment (Weights)
-    float** d_w_v;                  // Adam 2nd Moment (Weights)
-    float** d_b_m;                  // Adam 1st Moment (Biases)
-    float** d_b_v;                  // Adam 2nd Moment (Biases)
+    float** d_w_grad = nullptr;               // FP32 Weight Gradients
+    float** d_b_grad = nullptr;               // FP32 Bias Gradients
+    float** d_w_m = nullptr;                  // Adam 1st Moment (Weights)
+    float** d_w_v = nullptr;                  // Adam 2nd Moment (Weights)
+    float** d_b_m = nullptr;                  // Adam 1st Moment (Biases)
+    float** d_b_v = nullptr;                  // Adam 2nd Moment (Biases)
 
     // ==========================================
     // PRIVATE HELPERS

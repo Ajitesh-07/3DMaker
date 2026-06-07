@@ -72,8 +72,8 @@ __global__ void floatToHalfKernel(const float* __restrict__ f, half* __restrict_
 // CLASS IMPLEMENTATION
 // ============================================================================
 
-TinyMLP::TinyMLP(const MLPOption& options, int maxBatchSize, int inferBatchSize, unsigned int seed) 
-    : user_opt(options), m_maxBatchSize(maxBatchSize), m_inferBatchSize(inferBatchSize <= 0 ? maxBatchSize : inferBatchSize), current_step(0) {
+TinyMLP::TinyMLP(const MLPOption& options, int maxBatchSize, int inferBatchSize, unsigned int seed, bool isTraining) 
+    : user_opt(options), m_maxBatchSize(maxBatchSize), m_inferBatchSize(inferBatchSize <= 0 ? maxBatchSize : inferBatchSize), current_step(0), m_isTraining(isTraining) {
     
     // Calculate Hardware Configuration (Power of 2 padding)
     hw_opt = options;
@@ -156,13 +156,24 @@ TinyMLP::~TinyMLP() {
 
 void TinyMLP::allocate_memory() {
     int max_pad = std::max(m_maxBatchSize, m_inferBatchSize);
-    CUDA_CHECK(cudaMalloc(&d_padded_inputs, max_pad * hw_opt.inputDim * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_padded_targets, m_maxBatchSize * hw_opt.outputDim * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_padded_outputs_float, max_pad * hw_opt.outputDim * sizeof(float)));
+    bool needs_in_pad = (user_opt.inputDim != hw_opt.inputDim);
+    bool needs_out_pad = (user_opt.outputDim != hw_opt.outputDim);
+
+    if (m_isTraining || needs_in_pad) {
+        if (!d_padded_inputs) CUDA_CHECK(cudaMalloc(&d_padded_inputs, max_pad * hw_opt.inputDim * sizeof(half)));
+    }
+    if (m_isTraining) {
+        if (!d_padded_targets) CUDA_CHECK(cudaMalloc(&d_padded_targets, m_maxBatchSize * hw_opt.outputDim * sizeof(half)));
+    }
+    if (m_isTraining || needs_out_pad) {
+        if (!d_padded_outputs_float) CUDA_CHECK(cudaMalloc(&d_padded_outputs_float, max_pad * hw_opt.outputDim * sizeof(float)));
+    }
     
-    CUDA_CHECK(cudaMalloc(&d_dLoss_internal, m_maxBatchSize * hw_opt.outputDim * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_total_loss, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dx_out, m_maxBatchSize * hw_opt.inputDim * sizeof(half)));
+    if (m_isTraining) {
+        if (!d_dLoss_internal) CUDA_CHECK(cudaMalloc(&d_dLoss_internal, m_maxBatchSize * hw_opt.outputDim * sizeof(half)));
+        if (!d_total_loss) CUDA_CHECK(cudaMalloc(&d_total_loss, sizeof(float)));
+        if (!d_dx_out) CUDA_CHECK(cudaMalloc(&d_dx_out, m_maxBatchSize * hw_opt.inputDim * sizeof(half)));
+    }
 
     // Helper lambda to create zeroed out state arrays
     auto createZeroStateArray = [&](bool isWeight) {
@@ -184,31 +195,71 @@ void TinyMLP::allocate_memory() {
     };
 
     // Allocate Array Pointers
-    CUDA_CHECK(cudaMalloc(&d_master_weights, hw_opt.numLayers * sizeof(float*)));
-    CUDA_CHECK(cudaMalloc(&d_master_biases, hw_opt.numLayers * sizeof(float*)));
-    CUDA_CHECK(cudaMalloc(&d_fwd_weights, hw_opt.numLayers * sizeof(half*)));
+    if (!d_master_weights) CUDA_CHECK(cudaMalloc(&d_master_weights, hw_opt.numLayers * sizeof(float*)));
+    if (!d_master_biases) CUDA_CHECK(cudaMalloc(&d_master_biases, hw_opt.numLayers * sizeof(float*)));
+    if (!d_fwd_weights) CUDA_CHECK(cudaMalloc(&d_fwd_weights, hw_opt.numLayers * sizeof(half*)));
 
-    d_w_grad = createZeroStateArray(true);  d_b_grad = createZeroStateArray(false);
-    d_w_m    = createZeroStateArray(true);  d_b_m    = createZeroStateArray(false);
-    d_w_v    = createZeroStateArray(true);  d_b_v    = createZeroStateArray(false);
+    if (m_isTraining) {
+        if (!d_w_grad) d_w_grad = createZeroStateArray(true);
+        if (!d_b_grad) d_b_grad = createZeroStateArray(false);
+        if (!d_w_m)    d_w_m    = createZeroStateArray(true);
+        if (!d_b_m)    d_b_m    = createZeroStateArray(false);
+        if (!d_w_v)    d_w_v    = createZeroStateArray(true);
+        if (!d_b_v)    d_b_v    = createZeroStateArray(false);
 
-    // Allocate Activations
-    std::vector<half*> host_acts(hw_opt.numLayers);
-    host_acts[0] = d_padded_inputs; // Index 0 strictly maps to padded inputs
-    for (int l = 1; l < hw_opt.numLayers; l++) {
-        half* d_arr;
-        CUDA_CHECK(cudaMalloc(&d_arr, m_maxBatchSize * hw_opt.hiddenDim * sizeof(half)));
-        host_acts[l] = d_arr;
+        if (!d_activations) {
+            std::vector<half*> host_acts(hw_opt.numLayers);
+            host_acts[0] = d_padded_inputs; // Index 0 strictly maps to padded inputs
+            for (int l = 1; l < hw_opt.numLayers; l++) {
+                half* d_arr;
+                CUDA_CHECK(cudaMalloc(&d_arr, m_maxBatchSize * hw_opt.hiddenDim * sizeof(half)));
+                host_acts[l] = d_arr;
+            }
+            CUDA_CHECK(cudaMalloc(&d_activations, hw_opt.numLayers * sizeof(half*)));
+            CUDA_CHECK(cudaMemcpy(d_activations, host_acts.data(), hw_opt.numLayers * sizeof(half*), cudaMemcpyHostToDevice));
+        }
     }
-    CUDA_CHECK(cudaMalloc(&d_activations, hw_opt.numLayers * sizeof(half*)));
-    CUDA_CHECK(cudaMemcpy(d_activations, host_acts.data(), hw_opt.numLayers * sizeof(half*), cudaMemcpyHostToDevice));
+}
+
+void TinyMLP::switchToInferenceMode() {
+    if (!m_isTraining) return;
+
+    if (user_opt.inputDim == hw_opt.inputDim && d_padded_inputs) {
+        cudaFree(d_padded_inputs); d_padded_inputs = nullptr;
+    }
+    if (d_padded_targets) { cudaFree(d_padded_targets); d_padded_targets = nullptr; }
+    if (user_opt.outputDim == hw_opt.outputDim && d_padded_outputs_float) {
+        cudaFree(d_padded_outputs_float); d_padded_outputs_float = nullptr;
+    }
+    if (d_dLoss_internal) { cudaFree(d_dLoss_internal); d_dLoss_internal = nullptr; }
+    if (d_total_loss) { cudaFree(d_total_loss); d_total_loss = nullptr; }
+    if (d_dx_out) { cudaFree(d_dx_out); d_dx_out = nullptr; }
+
+    free_pointer_array(d_w_grad, hw_opt.numLayers); d_w_grad = nullptr;
+    free_pointer_array(d_b_grad, hw_opt.numLayers); d_b_grad = nullptr;
+    free_pointer_array(d_w_m, hw_opt.numLayers); d_w_m = nullptr;
+    free_pointer_array(d_w_v, hw_opt.numLayers); d_w_v = nullptr;
+    free_pointer_array(d_b_m, hw_opt.numLayers); d_b_m = nullptr;
+    free_pointer_array(d_b_v, hw_opt.numLayers); d_b_v = nullptr;
+
+    free_pointer_array(d_activations, hw_opt.numLayers, true); d_activations = nullptr;
+
+    m_isTraining = false;
+}
+
+void TinyMLP::switchToTrainingMode() {
+    if (m_isTraining) return;
+    m_isTraining = true;
+    allocate_memory();
 }
 
 void TinyMLP::zero_grad(cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("zero_grad called while in inference mode!");
     launchZeroGradients(&hw_opt, d_w_grad, d_b_grad, stream);
 }
 
 void TinyMLP::forward(const half* d_unpadded_inputs, float* d_outputs, int batchSize, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("forward called while in inference mode!");
     if (batchSize > m_maxBatchSize) throw std::runtime_error("Batch size exceeds maxBatchSize");
 
     if (user_opt.inputDim != hw_opt.inputDim) {
@@ -267,6 +318,7 @@ void TinyMLP::inference(const half* d_unpadded_inputs, float* d_outputs, int bat
 
 // Update your TinyMLP.h definition to include: bool fetch_loss = false
 float TinyMLP::calculate_loss_and_grad(const half* d_unpadded_targets, int batchSize, float loss_scale, bool fetch_loss, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("calculate_loss_and_grad called while in inference mode!");
     // 1. Zero Loss Scalar
     CUDA_CHECK(cudaMemsetAsync(d_total_loss, 0, sizeof(float), stream));
 
@@ -300,10 +352,12 @@ float TinyMLP::calculate_loss_and_grad(const half* d_unpadded_targets, int batch
 }
 
 void TinyMLP::backward(int batchSize, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
     launchNetworkFusionBackwardKernel(&hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases, d_activations, d_w_grad, d_b_grad, nullptr, batchSize, stream);
 }
 
 void TinyMLP::backward(const half* custom_loss_grad, int batchSize, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
     if (user_opt.outputDim != hw_opt.outputDim) {
         dim3 block(16, 16);
         dim3 grid((batchSize + 15) / 16, (hw_opt.outputDim + 15) / 16);
@@ -315,10 +369,12 @@ void TinyMLP::backward(const half* custom_loss_grad, int batchSize, cudaStream_t
 }
 
 void TinyMLP::backward(half* user_d_dx_out, int batchSize, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
     launchNetworkFusionBackwardKernel(&hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases, d_activations, d_w_grad, d_b_grad, user_d_dx_out, batchSize, stream);
 }
 
 void TinyMLP::backward(const half* custom_loss_grad, half* user_d_dx_out, int batchSize, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
     if (user_opt.outputDim != hw_opt.outputDim) {
         dim3 block(16, 16);
         dim3 grid((batchSize + 15) / 16, (hw_opt.outputDim + 15) / 16);
@@ -334,6 +390,7 @@ void TinyMLP::reset_step() {
 }
 
 void TinyMLP::step(float lr, float beta1, float beta2, float epsilon, float loss_scale, cudaStream_t stream) {
+    if (!m_isTraining) throw std::runtime_error("step called while in inference mode!");
     if (current_step < 50000) {
         current_step++;
     }

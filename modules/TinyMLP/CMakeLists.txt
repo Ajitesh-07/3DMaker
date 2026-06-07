@@ -118,6 +118,13 @@ if(TINYMLP_BUILD_TESTS)
     )
     target_link_libraries(test_backward PRIVATE TinyMLP)
 
+    add_executable(test_modes tests_kernels/testModes.cu)
+    set_target_properties(test_modes PROPERTIES CUDA_ARCHITECTURES "80;89")
+    target_compile_options(test_modes PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
+    )
+    target_link_libraries(test_modes PRIVATE TinyMLP)
+
     add_executable(demo demoHashGrid.cpp)
     set_target_properties(demo PROPERTIES CUDA_ARCHITECTURES "80;89")
     target_compile_options(demo PRIVATE

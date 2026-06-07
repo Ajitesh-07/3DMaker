@@ -32,8 +32,8 @@ __global__ void hg_f2h(const float* __restrict__ f,half* __restrict__ h,int n){
     if(i<n) h[i]=__float2half(f[i]);
 }
 
-TinyMLPHashGrid::TinyMLPHashGrid(const MLPGridOptions& options, int maxBatchSize, int inferBatchSize, unsigned int seed)
-    : user_opt(options), m_maxBatchSize(maxBatchSize), m_inferBatchSize(inferBatchSize <= 0 ? maxBatchSize : inferBatchSize), current_step(0) {
+TinyMLPHashGrid::TinyMLPHashGrid(const MLPGridOptions& options, int maxBatchSize, int inferBatchSize, unsigned int seed, bool isTraining)
+    : user_opt(options), m_maxBatchSize(maxBatchSize), m_inferBatchSize(inferBatchSize <= 0 ? maxBatchSize : inferBatchSize), current_step(0), m_isTraining(isTraining) {
     if(options.vectorDim != 3 && options.vectorDim != 4) throw std::runtime_error("TinyMLPHashGrid: vectorDim must be 3 or 4");
     if(options.featuresLevel != 2) throw std::runtime_error("TinyMLPHashGrid: featuresLevel must be 2");
 
@@ -113,23 +113,44 @@ void TinyMLPHashGrid::allocate_memory(){
     int nLayers = mlp_opt.numLayers;
 
     int max_pad = std::max(m_maxBatchSize, m_inferBatchSize);
-    CUDA_CHECK(cudaMalloc(&d_padded_inputs,        (size_t)max_pad*4*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_padded_targets,       (size_t)m_maxBatchSize*outDim*sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_padded_outputs_float, (size_t)max_pad*outDim*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dLoss_internal,       (size_t)m_maxBatchSize*outDim*sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_total_loss,           sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dx_out,               (size_t)m_maxBatchSize*inDim*sizeof(half)));
+    bool needs_in_pad = (user_opt.vectorDim != 4);
+    bool needs_out_pad = (user_opt.outputDim != hw_opt.outputDim);
 
-    CUDA_CHECK(cudaMalloc(&d_master_hashtable, (size_t)m_totalHashElements*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_fwd_hashtable,    (size_t)m_totalHashElements*sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_hashtable_grads,  (size_t)m_totalHashElements*sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_hashtable_grads, 0, (size_t)m_totalHashElements*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_hash_m, (size_t)m_totalHashElements*sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_hash_m, 0, (size_t)m_totalHashElements*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_hash_v, (size_t)m_totalHashElements*sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_hash_v, 0, (size_t)m_totalHashElements*sizeof(float)));
+    if (m_isTraining || needs_in_pad) {
+        if (!d_padded_inputs) CUDA_CHECK(cudaMalloc(&d_padded_inputs, (size_t)max_pad*4*sizeof(float)));
+    }
+    if (m_isTraining) {
+        if (!d_padded_targets) CUDA_CHECK(cudaMalloc(&d_padded_targets, (size_t)m_maxBatchSize*outDim*sizeof(half)));
+    }
+    if (m_isTraining || needs_out_pad) {
+        if (!d_padded_outputs_float) CUDA_CHECK(cudaMalloc(&d_padded_outputs_float, (size_t)max_pad*outDim*sizeof(float)));
+    }
+    if (m_isTraining) {
+        if (!d_dLoss_internal) CUDA_CHECK(cudaMalloc(&d_dLoss_internal, (size_t)m_maxBatchSize*outDim*sizeof(half)));
+        if (!d_total_loss) CUDA_CHECK(cudaMalloc(&d_total_loss, sizeof(float)));
+        if (!d_dx_out) CUDA_CHECK(cudaMalloc(&d_dx_out, (size_t)m_maxBatchSize*inDim*sizeof(half)));
+    }
 
-    auto makeZeroF = [&](bool isWeight){
+    if (!d_master_hashtable) CUDA_CHECK(cudaMalloc(&d_master_hashtable, (size_t)m_totalHashElements*sizeof(float)));
+    if (!d_fwd_hashtable) CUDA_CHECK(cudaMalloc(&d_fwd_hashtable,    (size_t)m_totalHashElements*sizeof(half)));
+
+    if (m_isTraining) {
+        if (!d_hashtable_grads) {
+            CUDA_CHECK(cudaMalloc(&d_hashtable_grads,  (size_t)m_totalHashElements*sizeof(float)));
+            CUDA_CHECK(cudaMemset(d_hashtable_grads, 0, (size_t)m_totalHashElements*sizeof(float)));
+        }
+        if (!d_hash_m) {
+            CUDA_CHECK(cudaMalloc(&d_hash_m, (size_t)m_totalHashElements*sizeof(float)));
+            CUDA_CHECK(cudaMemset(d_hash_m, 0, (size_t)m_totalHashElements*sizeof(float)));
+        }
+        if (!d_hash_v) {
+            CUDA_CHECK(cudaMalloc(&d_hash_v, (size_t)m_totalHashElements*sizeof(float)));
+            CUDA_CHECK(cudaMemset(d_hash_v, 0, (size_t)m_totalHashElements*sizeof(float)));
+        }
+    }
+
+    auto makeZeroF = [&](bool isWeight, float**& ptr){
+        if (ptr) return;
         std::vector<float*> h(nLayers);
         for(int l=0;l<nLayers;l++){
             int in_d=(l==0)?inDim:hidDim;
@@ -140,14 +161,14 @@ void TinyMLPHashGrid::allocate_memory(){
         }
         float** d; CUDA_CHECK(cudaMalloc(&d, nLayers*sizeof(float*)));
         CUDA_CHECK(cudaMemcpy(d, h.data(), nLayers*sizeof(float*), cudaMemcpyHostToDevice));
-        return d;
+        ptr = d;
     };
 
-    CUDA_CHECK(cudaMalloc(&d_master_weights, nLayers*sizeof(float*)));
-    CUDA_CHECK(cudaMalloc(&d_master_biases,  nLayers*sizeof(float*)));
-    CUDA_CHECK(cudaMalloc(&d_fwd_weights,    nLayers*sizeof(half*)));
+    if (!d_master_weights) {
+        CUDA_CHECK(cudaMalloc(&d_master_weights, nLayers*sizeof(float*)));
+        CUDA_CHECK(cudaMalloc(&d_master_biases,  nLayers*sizeof(float*)));
+        CUDA_CHECK(cudaMalloc(&d_fwd_weights,    nLayers*sizeof(half*)));
 
-    {
         std::vector<float*> hw(nLayers), hb(nLayers);
         std::vector<half*>  hfw(nLayers);
         for(int l=0;l<nLayers;l++){
@@ -162,27 +183,67 @@ void TinyMLPHashGrid::allocate_memory(){
         CUDA_CHECK(cudaMemcpy(d_fwd_weights,    hfw.data(), nLayers*sizeof(half*),  cudaMemcpyHostToDevice));
     }
 
-    d_w_grad = makeZeroF(true);  d_b_grad = makeZeroF(false);
-    d_w_m    = makeZeroF(true);  d_b_m    = makeZeroF(false);
-    d_w_v    = makeZeroF(true);  d_b_v    = makeZeroF(false);
+    if (m_isTraining) {
+        makeZeroF(true, d_w_grad);  makeZeroF(false, d_b_grad);
+        makeZeroF(true, d_w_m);     makeZeroF(false, d_b_m);
+        makeZeroF(true, d_w_v);     makeZeroF(false, d_b_v);
 
-    {
-        std::vector<half*> ha(nLayers);
-        CUDA_CHECK(cudaMalloc(&ha[0], (size_t)m_maxBatchSize*inDim*sizeof(half)));
-        for(int l=1;l<nLayers;l++){
-            CUDA_CHECK(cudaMalloc(&ha[l], (size_t)m_maxBatchSize*hidDim*sizeof(half)));
+        if (!d_activations) {
+            std::vector<half*> ha(nLayers);
+            CUDA_CHECK(cudaMalloc(&ha[0], (size_t)m_maxBatchSize*inDim*sizeof(half)));
+            for(int l=1;l<nLayers;l++){
+                CUDA_CHECK(cudaMalloc(&ha[l], (size_t)m_maxBatchSize*hidDim*sizeof(half)));
+            }
+            CUDA_CHECK(cudaMalloc(&d_activations, nLayers*sizeof(half*)));
+            CUDA_CHECK(cudaMemcpy(d_activations, ha.data(), nLayers*sizeof(half*), cudaMemcpyHostToDevice));
         }
-        CUDA_CHECK(cudaMalloc(&d_activations, nLayers*sizeof(half*)));
-        CUDA_CHECK(cudaMemcpy(d_activations, ha.data(), nLayers*sizeof(half*), cudaMemcpyHostToDevice));
     }
 }
 
+void TinyMLPHashGrid::switchToInferenceMode() {
+    if (!m_isTraining) return;
+
+    if (user_opt.vectorDim == 4 && d_padded_inputs) {
+        cudaFree(d_padded_inputs); d_padded_inputs = nullptr;
+    }
+    if (d_padded_targets) { cudaFree(d_padded_targets); d_padded_targets = nullptr; }
+    if (user_opt.outputDim == hw_opt.outputDim && d_padded_outputs_float) {
+        cudaFree(d_padded_outputs_float); d_padded_outputs_float = nullptr;
+    }
+    if (d_dLoss_internal) { cudaFree(d_dLoss_internal); d_dLoss_internal = nullptr; }
+    if (d_total_loss) { cudaFree(d_total_loss); d_total_loss = nullptr; }
+    if (d_dx_out) { cudaFree(d_dx_out); d_dx_out = nullptr; }
+
+    if (d_hashtable_grads) { cudaFree(d_hashtable_grads); d_hashtable_grads = nullptr; }
+    if (d_hash_m) { cudaFree(d_hash_m); d_hash_m = nullptr; }
+    if (d_hash_v) { cudaFree(d_hash_v); d_hash_v = nullptr; }
+
+    free_pointer_array(d_w_grad, mlp_opt.numLayers); d_w_grad = nullptr;
+    free_pointer_array(d_b_grad, mlp_opt.numLayers); d_b_grad = nullptr;
+    free_pointer_array(d_w_m, mlp_opt.numLayers); d_w_m = nullptr;
+    free_pointer_array(d_w_v, mlp_opt.numLayers); d_w_v = nullptr;
+    free_pointer_array(d_b_m, mlp_opt.numLayers); d_b_m = nullptr;
+    free_pointer_array(d_b_v, mlp_opt.numLayers); d_b_v = nullptr;
+
+    free_pointer_array(d_activations, mlp_opt.numLayers, false); d_activations = nullptr;
+
+    m_isTraining = false;
+}
+
+void TinyMLPHashGrid::switchToTrainingMode() {
+    if (m_isTraining) return;
+    m_isTraining = true;
+    allocate_memory();
+}
+
 void TinyMLPHashGrid::zero_grad(cudaStream_t stream){
+    if (!m_isTraining) throw std::runtime_error("zero_grad called while in inference mode!");
     launchZeroGradients(&mlp_opt, d_w_grad, d_b_grad, stream);
     // Hash table gradients are zeroed inside the optimizer kernel after reading (fused zero_grad)
 }
 
 void TinyMLPHashGrid::forward(const float* d_unpadded_inputs, float* d_outputs, int batchSize, cudaStream_t stream){
+    if (!m_isTraining) throw std::runtime_error("forward called while in inference mode!");
     if(batchSize>m_maxBatchSize) throw std::runtime_error("batchSize exceeds maxBatchSize");
 
     const float* input_ptr = d_unpadded_inputs;
@@ -246,6 +307,7 @@ void TinyMLPHashGrid::inference(const float* d_unpadded_inputs, float* d_outputs
 }
 
 float TinyMLPHashGrid::calculate_loss_and_grad(const half* d_unpadded_targets, int batchSize, float loss_scale, bool fetch_loss, cudaStream_t stream){
+    if (!m_isTraining) throw std::runtime_error("calculate_loss_and_grad called while in inference mode!");
     CUDA_CHECK(cudaMemsetAsync(d_total_loss, 0, sizeof(float), stream));
 
     dim3 blk(16,16);
@@ -271,6 +333,7 @@ float TinyMLPHashGrid::calculate_loss_and_grad(const half* d_unpadded_targets, i
 }
 
 void TinyMLPHashGrid::backward(int batchSize, cudaStream_t stream){
+    if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
     launchNetworkFusionHashTableBackwardKernel(
         &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
         d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
@@ -278,6 +341,7 @@ void TinyMLPHashGrid::backward(int batchSize, cudaStream_t stream){
 }
 
 void TinyMLPHashGrid::backward(const half* custom_loss_grad, int batchSize, cudaStream_t stream){
+    if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
     if(user_opt.outputDim!=hw_opt.outputDim){
         dim3 blk(16,16);
         dim3 grid((batchSize+15)/16,(hw_opt.outputDim+15)/16);
@@ -294,6 +358,7 @@ void TinyMLPHashGrid::backward(const half* custom_loss_grad, int batchSize, cuda
 void TinyMLPHashGrid::reset_step(){ current_step=0; }
 
 void TinyMLPHashGrid::step(float lr, float beta1, float beta2, float epsilon, float loss_scale, cudaStream_t stream){
+    if (!m_isTraining) throw std::runtime_error("step called while in inference mode!");
     if(current_step<50000) current_step++;
     float bc1=1.0f-std::pow(beta1,(float)current_step);
     float bc2=1.0f-std::pow(beta2,(float)current_step);
