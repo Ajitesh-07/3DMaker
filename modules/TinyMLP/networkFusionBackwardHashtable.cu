@@ -783,13 +783,14 @@ __global__ void networkFusionMMA_Backward(
             int y0 = __float2int_rd(y_l);
             int z0 = __float2int_rd(z_l);
 
+            // FIX: clamp x0, y0, z0 FIRST
+            x0 = max(0, min(x0, N_l - 1));
+            y0 = max(0, min(y0, N_l - 1));
+            z0 = max(0, min(z0, N_l - 1));
+
             int x1 = min(x0 + 1, N_l);
             int y1 = min(y0 + 1, N_l);
             int z1 = min(z0 + 1, N_l);
-            
-            x0 = max(0, min(x0, N_l));
-            y0 = max(0, min(y0, N_l));
-            z0 = max(0, min(z0, N_l));
 
             float wx1 = 1.0f - x_l + floorf(x_l);
             float wy1 = 1.0f - y_l + floorf(y_l);
@@ -898,13 +899,14 @@ __global__ void hashTableGrad_Backward(
     int y0 = __float2int_rd(y_l);
     int z0 = __float2int_rd(z_l);
 
+    // FIX: clamp x0, y0, z0 FIRST to avoid negative indices (e.g. from NaN producing INT_MIN)
+    x0 = max(0, min(x0, N_l - 1));
+    y0 = max(0, min(y0, N_l - 1));
+    z0 = max(0, min(z0, N_l - 1));
+
     int x1 = min(x0 + 1, N_l);
     int y1 = min(y0 + 1, N_l);
     int z1 = min(z0 + 1, N_l);
-
-    x0 = max(0, min(x0, N_l));
-    y0 = max(0, min(y0, N_l));
-    z0 = max(0, min(z0, N_l));
 
     float wx1 = 1.0f - x_l + floorf(x_l);
     float wy1 = 1.0f - y_l + floorf(y_l);

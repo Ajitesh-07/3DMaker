@@ -134,13 +134,13 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMA_2d_vector3(
                     int y0 = __float2int_rd(y_l);
                     int z0 = __float2int_rd(z_l);
 
-                    int x1 = min(x0 + 1, N_l);
-                    int y1 = min(y0 + 1, N_l);
-                    int z1 = min(z0 + 1, N_l);
-                    
                     x0 = max(0, min(x0, N_l));
                     y0 = max(0, min(y0, N_l));
                     z0 = max(0, min(z0, N_l));
+
+                    int x1 = min(x0 + 1, N_l);
+                    int y1 = min(y0 + 1, N_l);
+                    int z1 = min(z0 + 1, N_l);
 
                     float wx1 = 1 - x_l + floorf(x_l);
                     float wy1 = 1 - y_l + floorf(y_l);
@@ -465,13 +465,13 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMAGrad_2d_vecto
                     int y0 = __float2int_rd(y_l);
                     int z0 = __float2int_rd(z_l);
 
-                    int x1 = min(x0 + 1, N_l);
-                    int y1 = min(y0 + 1, N_l);
-                    int z1 = min(z0 + 1, N_l);
-                    
                     x0 = max(0, min(x0, N_l));
                     y0 = max(0, min(y0, N_l));
                     z0 = max(0, min(z0, N_l));
+
+                    int x1 = min(x0 + 1, N_l);
+                    int y1 = min(y0 + 1, N_l);
+                    int z1 = min(z0 + 1, N_l);
 
                     float wx1 = 1 - x_l + floorf(x_l);
                     float wy1 = 1 - y_l + floorf(y_l);

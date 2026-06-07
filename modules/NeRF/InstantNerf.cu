@@ -7,44 +7,6 @@
 #include <fstream>
 #include <chrono>
 
-__device__ int d_nan_flag = 0;
-
-__global__ void check_nan_kernel(const float* data, int size, const char* name, int step_info) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        if (isnan(data[idx]) || isinf(data[idx])) {
-            if (atomicExch(&d_nan_flag, 1) == 0) {
-                printf("\n============================================\n");
-                printf("!!! NaN/Inf DETECTED in %s at index %d (trainStep %d) !!!\n", name, idx, step_info);
-                printf("============================================\n");
-            }
-        }
-    }
-}
-__global__ void check_nan_half_kernel(const half* data, int size, const char* name, int step_info) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        if (__hisnan(data[idx]) || __hisinf(data[idx])) {
-            if (atomicExch(&d_nan_flag, 1) == 0) {
-                printf("\n============================================\n");
-                printf("!!! NaN/Inf DETECTED in %s at index %d (trainStep %d) !!!\n", name, idx, step_info);
-                printf("============================================\n");
-            }
-        }
-    }
-}
-
-void check_nan_float(cudaStream_t stream, const float* data, int size, const char* name, int step_info) {
-    check_nan_kernel<<<(size + 255)/256, 256, 0, stream>>>(data, size, name, step_info);
-}
-void check_nan_half(cudaStream_t stream, const half* data, int size, const char* name, int step_info) {
-    check_nan_half_kernel<<<(size + 255)/256, 256, 0, stream>>>(data, size, name, step_info);
-}
-
-#define CHECK_NAN_F(data, size, name) check_nan_float(stream, data, size, name, m_trainSteps)
-#define CHECK_NAN_H(data, size, name) check_nan_half(stream, data, size, name, m_trainSteps)
-
-
 void sampleNonUniform(
     float* d_samples,
     uint8_t* d_occupancy_grid,
@@ -568,7 +530,8 @@ void InstantNerf::trainWithRays(
                 m_render_buffers.d_custom_color_grad.data(),
                 m_render_buffers.d_tmpsigma.data(),
                 m_opts.lossScale,
-                m_opts.densityBias
+                m_opts.densityBias,
+                numRays
             );
             });
 
@@ -720,7 +683,6 @@ void InstantNerf::trainWithRaysHit(
             stream
         );
         });
-        CHECK_NAN_F(m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3, "d_render_rgb_chunk");
 
         measure(stream, m_profile_stats.fillFloatKernel, [&](){
         fill_float_kernel<<<(currentChunkRays + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_t.data(), 1.0f, currentChunkRays);
@@ -751,7 +713,6 @@ void InstantNerf::trainWithRaysHit(
             measure(stream, m_profile_stats.trainDensityFwd, [&](){
             m_densityMLP->forward(m_render_buffers.d_mlp_positions.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
             });
-            CHECK_NAN_F(m_render_buffers.d_density_out.data(), totalHits * 16, "d_density_out");
 
             constexpr int BS = 256;
             int gs = (totalHits + BS - 1) / BS;
@@ -763,13 +724,10 @@ void InstantNerf::trainWithRaysHit(
                 m_render_buffers.d_density_sigma.data()
             );
             });
-            CHECK_NAN_H(m_render_buffers.d_color_input.data(), totalHits * 32, "d_color_input");
-            CHECK_NAN_F(m_render_buffers.d_density_sigma.data(), totalHits, "d_density_sigma");
 
             measure(stream, m_profile_stats.trainColorFwd, [&](){
             m_colorMLP->forward(m_render_buffers.d_color_input.data(), m_render_buffers.d_color_output.data(), padded_b_size, stream);
             });
-            CHECK_NAN_F(m_render_buffers.d_color_output.data(), totalHits * 3, "d_color_output");
 
             int gs_color = (currentChunkRays + 255) / 256;
             measure(stream, m_profile_stats.trainColorGrad, [&](){
@@ -784,18 +742,16 @@ void InstantNerf::trainWithRaysHit(
                 m_render_buffers.d_phi_chunk.data(),
                 m_render_buffers.d_render_rgb_chunk.data(),
                 m_render_buffers.d_custom_color_grad.data(),
-                m_render_buffers.d_tmpsigma.data(),
-                m_opts.lossScale,
-                m_opts.densityBias
-            );
+                  m_render_buffers.d_tmpsigma.data(),
+                  m_opts.lossScale,
+                  m_opts.densityBias,
+                  numRays
+              );
             });
-            CHECK_NAN_H(m_render_buffers.d_custom_color_grad.data(), totalHits * 3, "d_custom_color_grad");
-            CHECK_NAN_F(m_render_buffers.d_tmpsigma.data(), totalHits, "d_tmpsigma");
 
             measure(stream, m_profile_stats.trainColorBwd, [&](){
             m_colorMLP->backward(m_render_buffers.d_custom_color_grad.data(), m_render_buffers.d_color_dx_out.data(), padded_b_size, stream);
             });
-            CHECK_NAN_H(m_render_buffers.d_color_dx_out.data(), totalHits * 32, "d_color_dx_out");
 
             int gs_density = (totalHits + 255) / 256;
             measure(stream, m_profile_stats.trainDensityGrad, [&](){
@@ -806,7 +762,6 @@ void InstantNerf::trainWithRaysHit(
                 m_render_buffers.d_custom_density_grad.data()
             );
             });
-            CHECK_NAN_H(m_render_buffers.d_custom_density_grad.data(), totalHits * 16, "d_custom_density_grad");
 
             measure(stream, m_profile_stats.trainDensityBwd, [&](){
             m_densityMLP->backward(m_render_buffers.d_custom_density_grad.data(), padded_b_size, stream);
@@ -1259,3 +1214,5 @@ void InstantNerf::load(const std::string& filename) {
     in.read(reinterpret_cast<char*>(h_occupancyGrid.data()), occupancyGridBytes * sizeof(uint8_t));
     cudaMemcpy(d_occupancyGrid.data(), h_occupancyGrid.data(), occupancyGridBytes * sizeof(uint8_t), cudaMemcpyHostToDevice);
 }
+
+

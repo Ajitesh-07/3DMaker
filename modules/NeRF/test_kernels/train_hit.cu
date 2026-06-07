@@ -136,7 +136,22 @@ int main(int argc, char** argv) {
 
     int print_freq = 10;
 
-    for (int epoch = 1; epoch <= totalEpochs; ++epoch) {
+    int start_epoch = 1;
+    if (argc > 2 && std::string(argv[2]) == "--load-epoch-2") {
+        std::cout << "Loading Epoch 2 checkpoint..." << std::endl;
+        nerf.load("../benchmarks/saved/model_epoch_2.inerf");
+        start_epoch = 3;
+        // Fast forward dataset
+        for (int e = 1; e <= 2; e++) {
+            dataset.shuffleRays();
+            for (int offset = 0; offset < total_rays; offset += opts.rayChunkSize * multiplier) {
+                current_chunk++;
+                trainSteps++;
+            }
+        }
+    }
+
+    for (int epoch = start_epoch; epoch <= totalEpochs; ++epoch) {
         dataset.shuffleRays();
 
         CUDA_CHECK(cudaEventRecord(start));
@@ -256,6 +271,12 @@ int main(int argc, char** argv) {
         
         CUDA_CHECK(cudaFree(d_render_out));
         CUDA_CHECK(cudaFree(d_render_byte));
+
+        if (epoch == 2) {
+            std::cout << "Saving Epoch 2 checkpoint..." << std::endl;
+            std::filesystem::create_directories("../benchmarks/saved");
+            nerf.save("../benchmarks/saved/model_epoch_2.inerf");
+        }
     }
 
     // --- 360 Degree Video Render ---

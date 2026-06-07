@@ -286,7 +286,8 @@ __global__ void compute_color_grad(
     half* __restrict__ custom_color_grad,
     float* __restrict__ tmp_dsigma,
     float loss_scale,
-    const float densityBias
+    const float densityBias,
+    const uint32_t totalRaysBatch
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numRays) return;
@@ -320,7 +321,6 @@ __global__ void compute_color_grad(
             delta_t = 1e-3f;
         } else {
             delta_t = fmaxf(t_sorted[global_hit_idx + 1] - t_current, 0.0f);
-            if (delta_t == 0.0f) delta_t = 1e-3f;
         }
 
 
@@ -336,16 +336,18 @@ __global__ void compute_color_grad(
         currentRgb.y += weight * c_g;
         currentRgb.z += weight * c_b;
 
-        float cg_r = phi_r * weight * c_r * (1.0f - c_r) * loss_scale;
-        float cg_g = phi_g * weight * c_g * (1.0f - c_g) * loss_scale;
-        float cg_b = phi_b * weight * c_b * (1.0f - c_b) * loss_scale;
+        float batch_scale = 1.0f / (float)totalRaysBatch;
+
+        float cg_r = phi_r * weight * c_r * (1.0f - c_r) * loss_scale * batch_scale;
+        float cg_g = phi_g * weight * c_g * (1.0f - c_g) * loss_scale * batch_scale;
+        float cg_b = phi_b * weight * c_b * (1.0f - c_b) * loss_scale * batch_scale;
 
         cg_r = fmaxf(-65504.0f, fminf(65504.0f, cg_r));
         cg_g = fmaxf(-65504.0f, fminf(65504.0f, cg_g));
         cg_b = fmaxf(-65504.0f, fminf(65504.0f, cg_b));
-        if (cg_r != cg_r) cg_r = 0.0f;
-        if (cg_g != cg_g) cg_g = 0.0f;
-        if (cg_b != cg_b) cg_b = 0.0f;
+        if (cg_r != cg_r || cg_g != cg_g || cg_b != cg_b) {
+            cg_r = 0.0f; cg_g = 0.0f; cg_b = 0.0f;
+        }
 
         custom_color_grad[i * 3 + 0] = __float2half(cg_r);
         custom_color_grad[i * 3 + 1] = __float2half(cg_g);
@@ -360,9 +362,11 @@ __global__ void compute_color_grad(
         float ds_b = currentT * c_b * (1.0f - alpha) - suff_b;
 
         float d_sigma_i = delta_t * (ds_r * phi_r + ds_g * phi_g + ds_b * phi_b);
-        float ds = d_sigma_i * sigma * loss_scale;
+        float ds = d_sigma_i * sigma * loss_scale * batch_scale;
         ds = fmaxf(-65504.0f, fminf(65504.0f, ds));
-        if (ds != ds) ds = 0.0f;
+        if (ds != ds) {
+            ds = 0.0f;
+        }
         tmp_dsigma[i] = ds;
         currentT = currentT * (1.0f -  alpha);
     }
@@ -611,7 +615,7 @@ __global__ void updateOccupancyGrid(
     
     bool is_active = false;
     if (cell_idx < total_cells) {
-        float threshold = fminf(0.01f, mean_density);
+        float threshold = 0.01f;
         is_active = (d_master_grid[cell_idx] > threshold);
     }
 
@@ -668,8 +672,16 @@ __global__ void bitfield_max_pool(
 
     int lane_id = threadIdx.x % 32;
     if (lane_id == 0 && out_idx < total_out_cells) {
-        int word_idx = out_idx / 32;
-        level_out_32[word_idx] = warp_mask;
+        if (total_out_cells >= 32) {
+            int word_idx = out_idx / 32;
+            level_out_32[word_idx] = warp_mask;
+        } else {
+            uint8_t* level_out_8 = reinterpret_cast<uint8_t*>(level_out_32);
+            int num_bytes = (total_out_cells + 7) / 8;
+            for (int i = 0; i < num_bytes; ++i) {
+                level_out_8[i] = (warp_mask >> (i * 8)) & 0xFF;
+            }
+        }
     }
 }
 
