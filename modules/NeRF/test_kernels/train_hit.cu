@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
     opts.colorNumLayers = 3;
     opts.batchSize = 256 * 1024;
     opts.learningRate = 1e-2f;
-    opts.lossScale = 1.0f;
+    opts.lossScale = 128.0f;
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
     float* d_chunk_rgb_out;
     CUDA_CHECK(cudaMalloc(&d_chunk_rgb_out, opts.rayChunkSize * 3 * sizeof(float)));
 
-    int print_freq = 50;
+    int print_freq = 10;
 
     for (int epoch = 1; epoch <= totalEpochs; ++epoch) {
         dataset.shuffleRays();

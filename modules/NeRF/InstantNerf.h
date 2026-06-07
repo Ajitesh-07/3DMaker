@@ -67,6 +67,8 @@ struct RenderingBuffers {
     DeviceBuffer<float3> d_rays_d_inv_chunk{0};
     DeviceBuffer<float> d_nears_chunk{0};
     DeviceBuffer<float> d_fars_chunk{0};
+    DeviceBuffer<uint32_t> d_block_sums{0};
+    DeviceBuffer<uint32_t> d_active_rays_count{0};
     DeviceBuffer<float> d_sparse_ts{0};
     DeviceBuffer<uint32_t> d_num_steps{0};
     DeviceBuffer<uint32_t> d_ray_offsets{0};
@@ -102,7 +104,6 @@ struct RenderingBuffers {
 
     DeviceBuffer<int> d_activeCellIndices{0};
     DeviceBuffer<int> d_numActiveCells{0};
-    DeviceBuffer<uint32_t> d_active_rays_count{0};
 
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
@@ -448,6 +449,7 @@ extern "C" int processRaysHitLinear(
     float* d_mlp_positions_batch,
     uint32_t* d_ray_indices,
     float* d_t_sorted,
+    uint32_t* d_block_sums,
     cudaStream_t stream
 );
 

@@ -2,7 +2,48 @@
 #include "otherKernels.cu"
 #include "../TinyMLP/TinyMLPHashGrid.h"
 #include <algorithm>
+#include <stdexcept>
+#include <iostream>
 #include <fstream>
+#include <chrono>
+
+__device__ int d_nan_flag = 0;
+
+__global__ void check_nan_kernel(const float* data, int size, const char* name, int step_info) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        if (isnan(data[idx]) || isinf(data[idx])) {
+            if (atomicExch(&d_nan_flag, 1) == 0) {
+                printf("\n============================================\n");
+                printf("!!! NaN/Inf DETECTED in %s at index %d (trainStep %d) !!!\n", name, idx, step_info);
+                printf("============================================\n");
+            }
+        }
+    }
+}
+__global__ void check_nan_half_kernel(const half* data, int size, const char* name, int step_info) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        if (__hisnan(data[idx]) || __hisinf(data[idx])) {
+            if (atomicExch(&d_nan_flag, 1) == 0) {
+                printf("\n============================================\n");
+                printf("!!! NaN/Inf DETECTED in %s at index %d (trainStep %d) !!!\n", name, idx, step_info);
+                printf("============================================\n");
+            }
+        }
+    }
+}
+
+void check_nan_float(cudaStream_t stream, const float* data, int size, const char* name, int step_info) {
+    check_nan_kernel<<<(size + 255)/256, 256, 0, stream>>>(data, size, name, step_info);
+}
+void check_nan_half(cudaStream_t stream, const half* data, int size, const char* name, int step_info) {
+    check_nan_half_kernel<<<(size + 255)/256, 256, 0, stream>>>(data, size, name, step_info);
+}
+
+#define CHECK_NAN_F(data, size, name) check_nan_float(stream, data, size, name, m_trainSteps)
+#define CHECK_NAN_H(data, size, name) check_nan_half(stream, data, size, name, m_trainSteps)
+
 
 void sampleNonUniform(
     float* d_samples,
@@ -172,6 +213,9 @@ void InstantNerf::initRenderBuffers()
     m_render_buffers.d_rays_d_inv_chunk = DeviceBuffer<float3>(m_opts.rayChunkSize);
     m_render_buffers.d_nears_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
     m_render_buffers.d_fars_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
+    m_render_buffers.d_block_sums = DeviceBuffer<uint32_t>((m_opts.rayChunkSize + 1023) / 1024);
+    m_render_buffers.d_active_rays_count = DeviceBuffer<uint32_t>(1);
+
 
     if (m_opts.rayChunkSize % 16 != 0) {
         fprintf(stderr, "[InstantNerf] Error: rayChunkSize must be a multiple of 16");
@@ -559,6 +603,229 @@ void InstantNerf::trainWithRays(
         });
 
 
+    }
+
+    if (m_opts.isProfiling) {
+        m_profile_stats.resolvePendingTimers();
+    }
+}
+
+void InstantNerf::trainWithRaysHit(
+    const float3* d_rays_o,
+    const float3* d_rays_d,
+    const float* d_rgb_true,
+    uint32_t numRays,
+    int& trainStepCount,
+    uint32_t* hitCounts,
+    float* d_rgb_out,
+    cudaStream_t stream
+) {
+    if(!m_renderinit) {
+        fprintf(stderr, "[InstantNerf] Error: init() must be called before trainWithRaysHit()\n");
+        return;
+    }
+
+    uint32_t raysDone = 0;
+    int i = 0;
+
+    while (raysDone < numRays) {
+        uint32_t currentChunkRaysUpperBound = min(m_opts.rayChunkSize, numRays - raysDone);
+        const float3* chunk_o = d_rays_o + raysDone;
+        const float3* chunk_d = d_rays_d + raysDone;
+
+        int currentChunkRays;
+        uint32_t totalHits;
+        measure(stream, m_profile_stats.processRaysTime, [&]() {
+        constexpr int BS = 256;
+        int gs = (currentChunkRaysUpperBound + BS - 1) / BS;
+        compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
+            currentChunkRaysUpperBound,
+            chunk_o, chunk_d, m_opts.aabbMin, m_opts.aabbMax,
+            m_render_buffers.d_rays_d_inv_chunk.data(),
+            m_render_buffers.d_nears_chunk.data(),
+            m_render_buffers.d_fars_chunk.data()
+        );
+
+        currentChunkRays = processRaysHitLinear(
+            currentChunkRaysUpperBound,
+            chunk_o, chunk_d,
+            m_render_buffers.d_rays_d_inv_chunk.data(),
+            m_render_buffers.d_nears_chunk.data(),
+            m_render_buffers.d_fars_chunk.data(),
+            d_occupancyGrid.data(),
+            m_opts.gridResolution,
+            m_opts.aabbMin, m_opts.aabbMax,
+            m_opts.levelsMipmap,
+            m_opts.batchSize,
+            &totalHits,
+            m_render_buffers.d_active_rays_count.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_mlp_positions.data(),
+            m_render_buffers.d_ray_indices.data(),
+            m_render_buffers.d_t_sorted.data(),
+            m_render_buffers.d_block_sums.data(),
+            stream
+        );
+        });
+
+        if (currentChunkRays == 0) {
+            fprintf(stderr, "Error: Batch size is too small to fit even a single ray! Increase batchSize.\n");
+            return; // Or throw an exception to escape the infinite loop
+        }
+
+        hitCounts[i] = totalHits;
+        uint32_t padded_b_size = (totalHits + 15) & ~15;
+
+        measure(stream, m_profile_stats.inferenceDensityFwd, [&](){
+        m_densityMLP->inference(m_render_buffers.d_mlp_positions.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
+        });
+
+        measure(stream, m_profile_stats.inferenceGatherSH, [&]()
+        {
+            constexpr int BS = 256;
+            int gs = (totalHits + BS - 1) / BS;
+
+            compute_SH_gather<<<gs, BS, 0, stream>>>(
+                chunk_d, m_render_buffers.d_ray_indices.data(), 
+                0, totalHits, m_opts.densityBias,
+                m_render_buffers.d_density_out.data(), 
+                m_render_buffers.d_color_input.data(),
+                m_render_buffers.d_density_sigma.data()
+            );
+        });
+
+        measure(stream, m_profile_stats.inferenceColorFwd, [&](){
+        m_colorMLP->inference(
+            m_render_buffers.d_color_input.data(),
+            m_render_buffers.d_rgb_output.data(),
+            padded_b_size,
+            stream
+        );
+        });
+
+        measure(stream, m_profile_stats.volumeRendering, [&](){
+        launchVolumeRendering(
+            currentChunkRays,
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_t_sorted.data(),
+            m_render_buffers.d_density_sigma.data(),
+            m_render_buffers.d_rgb_output.data(),
+            d_rgb_true ? (d_rgb_true + raysDone * 3) : nullptr,
+            m_render_buffers.d_render_rgb_chunk.data(),
+            m_render_buffers.d_render_depth_chunk.data(),
+            m_render_buffers.d_phi_chunk.data(),
+            m_opts.bgColor,
+            stream
+        );
+        });
+        CHECK_NAN_F(m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3, "d_render_rgb_chunk");
+
+        measure(stream, m_profile_stats.fillFloatKernel, [&](){
+        fill_float_kernel<<<(currentChunkRays + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_t.data(), 1.0f, currentChunkRays);
+        fill_float_kernel<<<(currentChunkRays * 3 + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_rgb.data(), 0.0f, currentChunkRays * 3);
+        });
+
+        if (d_rgb_out != nullptr) {
+            cudaMemcpyAsync(d_rgb_out + raysDone * 3, m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
+
+        if (m_trainSteps % 16 == 0) {
+            if (m_trainSteps < 256) {
+                earlyOccupancyGridUpdate(stream);
+            } else {
+                lateOccupancyGridUpdate(stream);
+            }
+        }
+
+        measure(stream, m_profile_stats.trainZeroGrad, [&](){
+            m_densityMLP->zero_grad(stream);
+            m_colorMLP->zero_grad(stream);
+        });
+
+        if (totalHits > 0) {
+            cudaMemsetAsync(m_render_buffers.d_custom_color_grad.data(), 0, padded_b_size * 3 * sizeof(half), stream);
+            cudaMemsetAsync(m_render_buffers.d_custom_density_grad.data(), 0, padded_b_size * 16 * sizeof(half), stream);
+            
+            measure(stream, m_profile_stats.trainDensityFwd, [&](){
+            m_densityMLP->forward(m_render_buffers.d_mlp_positions.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
+            });
+            CHECK_NAN_F(m_render_buffers.d_density_out.data(), totalHits * 16, "d_density_out");
+
+            constexpr int BS = 256;
+            int gs = (totalHits + BS - 1) / BS;
+            measure(stream, m_profile_stats.trainComputeSH, [&](){
+            compute_SH_gather<<<gs, BS, 0, stream>>>(
+                chunk_d, m_render_buffers.d_ray_indices.data(),
+                0, totalHits, m_opts.densityBias, m_render_buffers.d_density_out.data(),
+                m_render_buffers.d_color_input.data(),
+                m_render_buffers.d_density_sigma.data()
+            );
+            });
+            CHECK_NAN_H(m_render_buffers.d_color_input.data(), totalHits * 32, "d_color_input");
+            CHECK_NAN_F(m_render_buffers.d_density_sigma.data(), totalHits, "d_density_sigma");
+
+            measure(stream, m_profile_stats.trainColorFwd, [&](){
+            m_colorMLP->forward(m_render_buffers.d_color_input.data(), m_render_buffers.d_color_output.data(), padded_b_size, stream);
+            });
+            CHECK_NAN_F(m_render_buffers.d_color_output.data(), totalHits * 3, "d_color_output");
+
+            int gs_color = (currentChunkRays + 255) / 256;
+            measure(stream, m_profile_stats.trainColorGrad, [&](){
+            compute_color_grad<<<gs_color, 256, 0, stream>>>(
+                currentChunkRays,
+                0,
+                m_render_buffers.d_num_steps.data(),
+                m_render_buffers.d_ray_offsets.data(),
+                m_render_buffers.d_t_sorted.data(),
+                m_render_buffers.d_density_out.data(),
+                m_render_buffers.d_color_output.data(),
+                m_render_buffers.d_phi_chunk.data(),
+                m_render_buffers.d_render_rgb_chunk.data(),
+                m_render_buffers.d_custom_color_grad.data(),
+                m_render_buffers.d_tmpsigma.data(),
+                m_opts.lossScale,
+                m_opts.densityBias
+            );
+            });
+            CHECK_NAN_H(m_render_buffers.d_custom_color_grad.data(), totalHits * 3, "d_custom_color_grad");
+            CHECK_NAN_F(m_render_buffers.d_tmpsigma.data(), totalHits, "d_tmpsigma");
+
+            measure(stream, m_profile_stats.trainColorBwd, [&](){
+            m_colorMLP->backward(m_render_buffers.d_custom_color_grad.data(), m_render_buffers.d_color_dx_out.data(), padded_b_size, stream);
+            });
+            CHECK_NAN_H(m_render_buffers.d_color_dx_out.data(), totalHits * 32, "d_color_dx_out");
+
+            int gs_density = (totalHits + 255) / 256;
+            measure(stream, m_profile_stats.trainDensityGrad, [&](){
+            compute_density_grad<<<gs_density, 256, 0, stream>>>(
+                totalHits, 
+                m_render_buffers.d_tmpsigma.data(), 
+                m_render_buffers.d_color_dx_out.data(), 
+                m_render_buffers.d_custom_density_grad.data()
+            );
+            });
+            CHECK_NAN_H(m_render_buffers.d_custom_density_grad.data(), totalHits * 16, "d_custom_density_grad");
+
+            measure(stream, m_profile_stats.trainDensityBwd, [&](){
+            m_densityMLP->backward(m_render_buffers.d_custom_density_grad.data(), padded_b_size, stream);
+            });
+        }
+
+        measure(stream, m_profile_stats.trainColorOpt, [&](){
+        m_colorMLP->step(m_opts.learningRate, m_opts.beta1, m_opts.beta2, m_opts.epsilon, m_opts.lossScale, stream);
+        });
+
+        measure(stream, m_profile_stats.trainDensityOpt, [&](){
+        m_densityMLP->step(m_opts.learningRate, m_opts.beta1, m_opts.beta2, m_opts.epsilon, m_opts.lossScale, stream);
+        });
+
+        trainStepCount++;
+        m_trainSteps++;
+
+        raysDone += currentChunkRays;
+        i++;
     }
 
     if (m_opts.isProfiling) {

@@ -477,6 +477,17 @@ void custom_exclusive_sum(const uint32_t* d_in, uint32_t* d_out, int num_items, 
         cudaFreeAsync(d_block_sums, stream);
     }
 }
+void custom_exclusive_sum(const uint32_t* d_in, uint32_t* d_out, uint32_t* d_block_sums, int num_items, cudaStream_t stream) {
+    if (num_items == 0) return;
+    int num_blocks = (num_items + 1023) / 1024;
+    
+    block_prefix_sum_kernel<<<num_blocks, 1024, 0, stream>>>(d_in, d_out, d_block_sums, num_items);
+    
+    if (num_blocks > 1) {
+        block_prefix_sum_kernel<<<1, 1024, 0, stream>>>(d_block_sums, d_block_sums, nullptr, num_blocks);
+        add_block_sums_kernel<<<num_blocks, 1024, 0, stream>>>(d_out, d_block_sums, num_items);
+    }
+}
 
 void processRaysChunkLinear(
     const uint32_t num_rays,
@@ -819,6 +830,7 @@ int processRaysHitLinear(
     float* d_mlp_positions_batch,
     uint32_t* d_ray_indices,
     float* d_t_sorted,
+    uint32_t* d_block_sums,
     cudaStream_t stream
 ) {
     constexpr int BLOCK_SIZE = 256;
@@ -838,7 +850,7 @@ int processRaysHitLinear(
         d_num_steps
     );
 
-    custom_exclusive_sum(d_num_steps, d_ray_offsets, num_rays, stream);
+    custom_exclusive_sum(d_num_steps, d_ray_offsets, d_block_sums, num_rays, stream);
 
     uint32_t last_offset, last_count;
     cudaMemcpyAsync(&last_offset, &d_ray_offsets[num_rays - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
@@ -880,7 +892,7 @@ int processRaysHitLinear(
 
     int gs2 = (h_active_rays_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
     march_rays_dda_offset<<<gs2, BLOCK_SIZE, 0, stream>>>(
-        num_rays,
+        h_active_rays_count,
         rays_o,
         rays_d,
         rays_d_inv,
