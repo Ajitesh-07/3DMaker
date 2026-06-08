@@ -117,22 +117,9 @@ if(NERF_BUILD_TESTS)
     )
     target_link_libraries(test_training PRIVATE NeRFModule)
 
-    add_executable(train test_kernels/train.cu)
     set_target_properties(test_processrays PROPERTIES
         CUDA_ARCHITECTURES "80;89"
     )
-    if(MSVC)
-        target_compile_options(train PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
-        )
-        target_compile_definitions(train PRIVATE
-            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
-        )
-    endif()
-    target_compile_options(train PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
-    )
-    target_link_libraries(train PRIVATE NeRFModule)
 
     add_executable(test_loading test_kernels/test_loading.cu)
     if(MSVC)

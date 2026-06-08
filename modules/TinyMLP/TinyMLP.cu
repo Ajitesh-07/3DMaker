@@ -62,7 +62,7 @@ __global__ void fusedUnpadAndCastKernel(
 }
 
 __global__ void floatToHalfKernel(const float* __restrict__ f, half* __restrict__ h, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         h[idx] = __float2half(f[idx]);
     }

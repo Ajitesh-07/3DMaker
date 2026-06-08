@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
             float current_lr = min_lr + 0.5f * (max_lr - min_lr) * (1.0f + cosf(3.14159265359f * progress));
             nerf.setLearningRate(current_lr);
             current_chunk++;
+            nerf.setMemoryMode(TRAINING);
 
             int chunkSize = std::min(opts.rayChunkSize * multiplier, total_rays - offset);
             
@@ -250,6 +251,8 @@ int main(int argc, char** argv) {
         uint8_t* d_render_byte;
         CUDA_CHECK(cudaMalloc(&d_render_byte, pixels * 3 * sizeof(uint8_t)));
         std::vector<uint8_t> h_render_byte(pixels * 3);
+
+        nerf.setMemoryMode(INFERENCE);
 
         int num_test_frames = std::min(3, (int)(test_dataset.getTotalRays() / pixels));
         nerf.setBgColor(make_float3(1.0f, 1.0f, 1.0f));

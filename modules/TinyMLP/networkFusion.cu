@@ -64,11 +64,11 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMA_2d(
     int outputDim
 ) {
     // 8 Warps per block is guranteed
-    int idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
     
-    int warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
-    int warpN = threadIdx.y;
-    int laneId = threadIdx.x + 1 - 1;
+    uint32_t warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
+    uint32_t warpN = threadIdx.y;
+    uint32_t laneId = threadIdx.x + 1 - 1;
  
     const int WMMA_M = 16;
     const int WMMA_N = 16;
@@ -81,11 +81,11 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMA_2d(
 
     #pragma unroll
     for (int i = 0; i < WARP_FACTOR; i++) {
-        int chunk_row = (idx + i*256) / (TILE_COUNT_X * WMMA_K / 8); // 256 threads per block
-        int chunk_col = (idx + i*256) % (TILE_COUNT_X * WMMA_K / 8) * 8;
+        uint32_t chunk_row = (idx + i*256) / (TILE_COUNT_X * WMMA_K / 8); // 256 threads per block
+        uint32_t chunk_col = (idx + i*256) % (TILE_COUNT_X * WMMA_K / 8) * 8;
 
-        int global_row = (blockIdx.x * TILE_COUNT_Y) * WMMA_M + chunk_row;
-        int global_col = chunk_col;
+        uint32_t global_row = (blockIdx.x * TILE_COUNT_Y) * WMMA_M + chunk_row;
+        uint32_t global_col = chunk_col;
 
         bool a_valid = (global_row < batchSize) && (global_col < inputDim);
 
@@ -104,8 +104,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMA_2d(
         int currentN = (layer == NUM_LAYERS - 1) ? outputDim : hiddenDim;
         bool isLastLayer = layer == NUM_LAYERS - 1;
 
-        int chunk_row_b = idx / (WMMA_K / 8);
-        int chunk_col_b = idx % (WMMA_K / 8) * 8;
+        uint32_t chunk_row_b = idx / (WMMA_K / 8);
+        uint32_t chunk_col_b = idx % (WMMA_K / 8) * 8;
 
         if (chunk_row_b < TILE_COUNT_X * WMMA_N) {
             bool b_valid = (chunk_row_b < currentN) && (chunk_col_b < currentK);
@@ -163,11 +163,11 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMA_2d(
         for(int j = 0; j < WARP_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                 
-                int global_r = (warpM + j*blockDim.z) * WMMA_M + local_row;
-                int global_c = base_col + local_col; 
+                uint32_t global_r = (warpM + j*blockDim.z) * WMMA_M + local_row;
+                uint32_t global_c = base_col + local_col; 
 
                 float val = frag_acc[j].x[i];
 
@@ -206,11 +206,11 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMAGrad_2d(
     int outputDim
 ) {
     // 8 Warps per block is guranteed
-    int idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
     
-    int warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
-    int warpN = threadIdx.y;
-    int laneId = threadIdx.x + 1 - 1;
+    uint32_t warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
+    uint32_t warpN = threadIdx.y;
+    uint32_t laneId = threadIdx.x + 1 - 1;
  
     const int WMMA_M = 16;
     const int WMMA_N = 16;
@@ -223,11 +223,11 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMAGrad_2d(
 
     #pragma unroll
     for (int i = 0; i < WARP_FACTOR; i++) {
-        int chunk_row = (idx + i*256) / (TILE_COUNT_X * WMMA_K / 8); // 256 threads per block
-        int chunk_col = (idx + i*256) % (TILE_COUNT_X * WMMA_K / 8) * 8;
+        uint32_t chunk_row = (idx + i*256) / (TILE_COUNT_X * WMMA_K / 8); // 256 threads per block
+        uint32_t chunk_col = (idx + i*256) % (TILE_COUNT_X * WMMA_K / 8) * 8;
 
-        int global_row = (blockIdx.x * TILE_COUNT_Y) * WMMA_M + chunk_row;
-        int global_col = chunk_col;
+        uint32_t global_row = (blockIdx.x * TILE_COUNT_Y) * WMMA_M + chunk_row;
+        uint32_t global_col = chunk_col;
 
         bool a_valid = (global_row < batchSize) && (global_col < inputDim);
 
@@ -246,8 +246,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMAGrad_2d(
         int currentN = (layer == NUM_LAYERS - 1) ? outputDim : hiddenDim;
         bool isLastLayer = layer == NUM_LAYERS - 1;
 
-        int chunk_row_b = idx / (WMMA_K / 8);
-        int chunk_col_b = idx % (WMMA_K / 8) * 8;
+        uint32_t chunk_row_b = idx / (WMMA_K / 8);
+        uint32_t chunk_col_b = idx % (WMMA_K / 8) * 8;
 
         if (chunk_row_b < TILE_COUNT_X * WMMA_N) {
             bool b_valid = (chunk_row_b < currentN) && (chunk_col_b < currentK);
@@ -305,11 +305,11 @@ __global__ void __launch_bounds__(256, 3) networkFusionMMAGrad_2d(
         for(int j = 0; j < WARP_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                 
-                int global_r = (warpM + j*blockDim.z) * WMMA_M + local_row;
-                int global_c = base_col + local_col; 
+                uint32_t global_r = (warpM + j*blockDim.z) * WMMA_M + local_row;
+                uint32_t global_c = base_col + local_col; 
 
                 float val = frag_acc[j].x[i];
 

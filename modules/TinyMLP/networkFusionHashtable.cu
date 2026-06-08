@@ -87,12 +87,12 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMA_2d_vector3(
     int denseLevelStart
 ) {
     // 8 Warps per block is guranteed
-    int idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
     int inputDim = numLevels * FEATURES_LEVEL;
     
-    int warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
-    int warpN = threadIdx.y;
-    int laneId = threadIdx.x + 1 - 1;
+    uint32_t warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
+    uint32_t warpN = threadIdx.y;
+    uint32_t laneId = threadIdx.x + 1 - 1;
  
     const int WMMA_M = 16;
     const int WMMA_N = 16;
@@ -112,8 +112,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMA_2d_vector3(
         #pragma unroll
         for (int i = 0; i < WARP_FACTOR; i++) {
             int task_idx = idx + i * 256;
-            int chunk_row = task_idx / (TILE_COUNT_X * WMMA_K / 8); 
-            int chunk_col = (task_idx % (TILE_COUNT_X * WMMA_K / 8)) * 8;
+            uint32_t chunk_row = task_idx / (TILE_COUNT_X * WMMA_K / 8); 
+            uint32_t chunk_col = (task_idx % (TILE_COUNT_X * WMMA_K / 8)) * 8;
 
             int global_row = blockIdx.x * (TILE_COUNT_Y * WMMA_M) + chunk_row;
 
@@ -227,8 +227,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMA_2d_vector3(
         int currentN = (layer == NUM_LAYERS - 1) ? outputDim : hiddenDim;
         bool isLastLayer = layer == NUM_LAYERS - 1;
 
-        int chunk_row_b = idx / (WMMA_K / 8);
-        int chunk_col_b = idx % (WMMA_K / 8) * 8;
+        uint32_t chunk_row_b = idx / (WMMA_K / 8);
+        uint32_t chunk_col_b = idx % (WMMA_K / 8) * 8;
 
         if (chunk_row_b < TILE_COUNT_X * WMMA_N) {
             bool b_valid = (chunk_row_b < currentN) && (chunk_col_b < currentK);
@@ -286,8 +286,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMA_2d_vector3(
         for(int j = 0; j < WARP_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                 
                 int global_r = (warpM + j*blockDim.z) * WMMA_M + local_row;
                 int global_c = base_col + local_col; 
@@ -421,12 +421,12 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMAGrad_2d_vecto
     int lowestSize,
     int denseLevelStart
 ) {
-    int idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
     int inputDim = numLevels * FEATURES_LEVEL;
     
-    int warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
-    int warpN = threadIdx.y;
-    int laneId = threadIdx.x + 1 - 1;
+    uint32_t warpM = blockIdx.x * TILE_COUNT_Y + threadIdx.z;
+    uint32_t warpN = threadIdx.y;
+    uint32_t laneId = threadIdx.x + 1 - 1;
  
     const int WMMA_M = 16;
     const int WMMA_N = 16;
@@ -443,8 +443,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMAGrad_2d_vecto
         #pragma unroll
         for (int i = 0; i < WARP_FACTOR; i++) {
             int task_idx = idx + i * 256;
-            int chunk_row = task_idx / (TILE_COUNT_X * WMMA_K / 8); 
-            int chunk_col = (task_idx % (TILE_COUNT_X * WMMA_K / 8)) * 8;
+            uint32_t chunk_row = task_idx / (TILE_COUNT_X * WMMA_K / 8); 
+            uint32_t chunk_col = (task_idx % (TILE_COUNT_X * WMMA_K / 8)) * 8;
 
             int global_row = blockIdx.x * (TILE_COUNT_Y * WMMA_M) + chunk_row;
 
@@ -574,8 +574,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMAGrad_2d_vecto
         int currentN = (layer == NUM_LAYERS - 1) ? outputDim : hiddenDim;
         bool isLastLayer = layer == NUM_LAYERS - 1;
 
-        int chunk_row_b = idx / (WMMA_K / 8);
-        int chunk_col_b = idx % (WMMA_K / 8) * 8;
+        uint32_t chunk_row_b = idx / (WMMA_K / 8);
+        uint32_t chunk_col_b = idx % (WMMA_K / 8) * 8;
 
         if (chunk_row_b < TILE_COUNT_X * WMMA_N) {
             bool b_valid = (chunk_row_b < currentN) && (chunk_col_b < currentK);
@@ -633,8 +633,8 @@ __global__ void __launch_bounds__(256, 3) networkFusionHashTableMMAGrad_2d_vecto
         for(int j = 0; j < WARP_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                 
                 int global_r = (warpM + j*blockDim.z) * WMMA_M + local_row;
                 int global_c = base_col + local_col; 

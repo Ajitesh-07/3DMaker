@@ -166,56 +166,40 @@ void InstantNerf::printStats() {
     printTracker("trainDensityOpt", m_profile_stats.trainDensityOpt, 1);
 }
 
-void InstantNerf::initRenderBuffers()
+void InstantNerf::initRenderBuffers() 
 {
     if (!m_renderinit) {
         fprintf(stderr, "[InstantNerf] Error: init() must be called before initRenderBuffers()\n");
         return;
-    }
-    m_render_buffers.d_rays_d_inv_chunk = DeviceBuffer<float3>(m_opts.rayChunkSize);
-    m_render_buffers.d_nears_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
-    m_render_buffers.d_fars_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
-    m_render_buffers.d_block_sums = DeviceBuffer<uint32_t>((m_opts.rayChunkSize + 1023) / 1024);
-    m_render_buffers.d_active_rays_count = DeviceBuffer<uint32_t>(1);
 
+    }
 
     if (m_opts.rayChunkSize % 16 != 0) {
         fprintf(stderr, "[InstantNerf] Error: rayChunkSize must be a multiple of 16");
         return;
     }
 
-    uint32_t totalHits = m_opts.rayChunkSize * MAX_HITS;
-
-    m_render_buffers.d_sparse_ts = DeviceBuffer<float>(totalHits);
+    m_render_buffers.d_rays_d_inv_chunk = DeviceBuffer<float3>(m_opts.rayChunkSize);
+    m_render_buffers.d_nears_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
+    m_render_buffers.d_fars_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
+    m_render_buffers.d_block_sums = DeviceBuffer<uint32_t>((m_opts.rayChunkSize + 1023) / 1024);
+    m_render_buffers.d_active_rays_count = DeviceBuffer<uint32_t>(1);
     m_render_buffers.d_num_steps = DeviceBuffer<uint32_t>(m_opts.rayChunkSize);
     m_render_buffers.d_ray_offsets = DeviceBuffer<uint32_t>(m_opts.rayChunkSize);
-    m_render_buffers.d_dense_sparse_indices = DeviceBuffer<uint32_t>(totalHits);
-    m_render_buffers.d_mlp_positions = DeviceBuffer<float>(totalHits * 4);
-    m_render_buffers.d_ray_indices = DeviceBuffer<uint32_t>(totalHits);
-    m_render_buffers.d_t_sorted = DeviceBuffer<float>(totalHits);
     uint32_t occupancyGridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
     uint32_t max_density_out = std::max((uint32_t)(16 * m_opts.batchSize), (uint32_t)(16 * occupancyGridCells));
     m_render_buffers.d_density_out = DeviceBuffer<float>(max_density_out);
     m_render_buffers.d_color_input = DeviceBuffer<half>(32 * m_opts.batchSize);
     m_render_buffers.d_color_output = DeviceBuffer<float>(3 * m_opts.batchSize);
-    m_render_buffers.d_density_sigma = DeviceBuffer<float>(totalHits);
-    m_render_buffers.d_rgb_output = DeviceBuffer<float>(totalHits * 3);
-
     m_render_buffers.d_render_rgb_chunk = DeviceBuffer<float>(3 * m_opts.rayChunkSize);
     m_render_buffers.d_render_depth_chunk = DeviceBuffer<float>(m_opts.rayChunkSize);
     m_render_buffers.d_phi_chunk = DeviceBuffer<float>(3 * m_opts.rayChunkSize);
     m_render_buffers.d_out_count = DeviceBuffer<uint32_t>(1);
-    m_render_buffers.d_active_ray_indices = DeviceBuffer<uint32_t>(m_opts.batchSize);
-    m_render_buffers.d_batch_position = DeviceBuffer<float>(3 * m_opts.batchSize);
-    m_render_buffers.d_batch_direction = DeviceBuffer<float3>(m_opts.batchSize);
-
-    m_render_buffers.d_current_t = DeviceBuffer<float>(m_opts.rayChunkSize);
-    m_render_buffers.d_current_rgb = DeviceBuffer<float>(3 * m_opts.rayChunkSize);
     m_render_buffers.d_custom_color_grad = DeviceBuffer<half>(3 * m_opts.batchSize);
     m_render_buffers.d_custom_density_grad = DeviceBuffer<half>(16 * m_opts.batchSize);
     m_render_buffers.d_tmpsigma = DeviceBuffer<float>(m_opts.batchSize);
     m_render_buffers.d_color_dx_out = DeviceBuffer<half>(32 * m_opts.batchSize);
-    
+
     m_render_buffers.d_occupancy_samples = DeviceBuffer<float>(4 * m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
     m_render_buffers.d_tmp_grid = DeviceBuffer<float>(m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
     m_render_buffers.d_sum = DeviceBuffer<float>(1);
@@ -227,9 +211,36 @@ void InstantNerf::initRenderBuffers()
     cudaMalloc(&m_render_buffers.d_temp_storage, m_render_buffers.temp_storage_bytes);
 
     m_render_buffers.h_ray_offsets.reserve(m_opts.rayChunkSize);
-    
+
+
+    if (m_memMode == TRAINING) {
+        m_render_buffers.d_mlp_positions = DeviceBuffer<float>(m_opts.batchSize * 4);
+        m_render_buffers.d_ray_indices = DeviceBuffer<uint32_t>(m_opts.batchSize);
+        m_render_buffers.d_t_sorted = DeviceBuffer<float>(m_opts.batchSize);
+        m_render_buffers.d_density_sigma = DeviceBuffer<float>(m_opts.batchSize);
+        m_render_buffers.d_rgb_output = DeviceBuffer<float>(m_opts.batchSize * 3);
+        uint32_t totalHits = m_opts.rayChunkSize * MAX_HITS;
+        m_colorMLP->switchToTrainingMode();
+        m_densityMLP->switchToTrainingMode();
+    } else if (m_memMode == INFERENCE) {
+        uint32_t totalHits = m_opts.rayChunkSize * MAX_HITS;
+
+        m_render_buffers.d_mlp_positions = DeviceBuffer<float>(totalHits * 4);
+        m_render_buffers.d_ray_indices = DeviceBuffer<uint32_t>(totalHits);
+        m_render_buffers.d_t_sorted = DeviceBuffer<float>(totalHits);
+        m_render_buffers.d_density_sigma = DeviceBuffer<float>(totalHits);
+        m_render_buffers.d_rgb_output = DeviceBuffer<float>(totalHits * 3);
+        m_render_buffers.d_sparse_ts = DeviceBuffer<float>(totalHits);
+        m_render_buffers.d_dense_sparse_indices = DeviceBuffer<uint32_t>(totalHits);
+        
+        m_colorMLP->switchToInferenceMode();
+        m_densityMLP->switchToInferenceMode();
+    } 
+
     m_traininit = true;
-}
+} 
+
+
 
 void InstantNerf::freeBuffers() {
     m_render_buffers.d_rays_d_inv_chunk = DeviceBuffer<float3>(0);
@@ -276,8 +287,9 @@ void InstantNerf::freeBuffers() {
     m_traininit = false;
 }
 
-void InstantNerf::init(const NerfOptions& opts) {
+void InstantNerf::init(const NerfOptions& opts, MemoryMode memMode) {
     m_opts = opts;
+    m_memMode = memMode;
     
     uint3 res = make_uint3(opts.gridResolution.x, opts.gridResolution.y, opts.gridResolution.z);
     int occupancyGridCells = 0;
@@ -331,245 +343,20 @@ void InstantNerf::init(const NerfOptions& opts) {
     earlyOccupancyGridUpdate();
 }
 
-void InstantNerf::trainWithRays(
-    const float3* d_rays_o,
-    const float3* d_rays_d,
-    const float* d_rgb_true,
-    uint32_t numRays,
-    int& trainStepCount,
-    uint32_t* hitCounts,
-    float* d_rgb_out,
-    cudaStream_t stream
-) { 
-    if(!m_traininit) {
-        fprintf(stderr, "[InstantNerf] Error: initRenderBuffers() must be called before trainWithRays()\n");
-        return;
-    }
+void InstantNerf::setMemoryMode(MemoryMode mode) {
+    if (!m_traininit) return;
+    if (m_memMode == mode) return;
 
-    for (int offset = 0; offset < numRays; offset += m_opts.rayChunkSize) {
-        int currentChunkRays = std::min(m_opts.rayChunkSize, (int)numRays - offset);
-        const float3* chunk_o = d_rays_o + offset;
-        const float3* chunk_d = d_rays_d + offset;
+    m_memMode = mode;
 
-        {
-            constexpr int BS = 256;
-            int gs = (currentChunkRays + BS - 1) / BS;
-
-            measure(stream, m_profile_stats.processRaysTime, [&]() {
-            compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
-                currentChunkRays,
-                chunk_o,
-                chunk_d,
-                m_opts.aabbMin, m_opts.aabbMax,
-                m_render_buffers.d_rays_d_inv_chunk.data(),
-                m_render_buffers.d_nears_chunk.data(),
-                m_render_buffers.d_fars_chunk.data()
-            );
-
-            processRaysChunkLinear(
-                currentChunkRays,
-                chunk_o, chunk_d, m_render_buffers.d_rays_d_inv_chunk.data(),
-                m_render_buffers.d_nears_chunk.data(),
-                m_render_buffers.d_fars_chunk.data(),
-                d_occupancyGrid.data(),
-                m_opts.gridResolution,
-                m_opts.aabbMin, m_opts.aabbMax, m_opts.levelsMipmap,
-                m_render_buffers.d_sparse_ts.data(), 
-                m_render_buffers.d_num_steps.data(),
-                m_render_buffers.d_ray_offsets.data(),
-                m_render_buffers.d_dense_sparse_indices.data(),
-                m_render_buffers.d_mlp_positions.data(), 
-                m_render_buffers.d_ray_indices.data(), 
-                m_render_buffers.d_t_sorted.data(),
-                stream
-            );
-            });
-        }
-        
-        uint32_t totalHits = 0;
-        uint32_t highestHits = 0;
-        
-        std::vector<uint32_t> h_num_steps(currentChunkRays);
-        m_render_buffers.d_num_steps.copyHost(h_num_steps.data(), currentChunkRays);
-
-        for (uint32_t i = 0; i < currentChunkRays; ++i) {
-            totalHits += h_num_steps[i];
-            if(h_num_steps[i] > highestHits) highestHits = h_num_steps[i];
-        }
-
-        hitCounts[offset / m_opts.rayChunkSize] = totalHits;
-
-        std::vector<uint32_t> boundaries = get_chunk_boundaries_cpu(m_render_buffers.h_ray_offsets, m_render_buffers.d_ray_offsets.data(), currentChunkRays, totalHits, m_opts.batchSize, stream);
-
-        for (uint32_t b_offset = 0; b_offset < totalHits; b_offset += m_opts.batchSize) {
-            uint32_t b_size = std::min(static_cast<uint32_t>(m_opts.batchSize), totalHits - b_offset);
-            uint32_t padded_b_size = (b_size + 15) & ~15;
-
-            measure(stream, m_profile_stats.inferenceDensityFwd, [&](){
-            m_densityMLP->inference(m_render_buffers.d_mlp_positions.data() + b_offset * 4, m_render_buffers.d_density_out.data(), padded_b_size, stream);
-            });
-
-            measure(stream, m_profile_stats.inferenceGatherSH, [&]()
-            {
-                constexpr int BS = 256;
-                int gs = (b_size + BS - 1) / BS;
-
-                compute_SH_gather<<<gs, BS, 0, stream>>>(
-                    chunk_d, m_render_buffers.d_ray_indices.data(), 
-                    b_offset, b_size, m_opts.densityBias,
-                    m_render_buffers.d_density_out.data(), 
-                    m_render_buffers.d_color_input.data(),
-                    m_render_buffers.d_density_sigma.data() + b_offset
-                );
-            });
-
-            measure(stream, m_profile_stats.inferenceColorFwd, [&](){
-            m_colorMLP->inference(
-                m_render_buffers.d_color_input.data(),
-                m_render_buffers.d_rgb_output.data() + b_offset * 3,
-                padded_b_size,
-                stream
-            );
-            });
-        }
-
-        measure(stream, m_profile_stats.volumeRendering, [&](){
-        launchVolumeRendering(
-            currentChunkRays,
-            m_render_buffers.d_ray_offsets.data(),
-            m_render_buffers.d_num_steps.data(),
-            m_render_buffers.d_t_sorted.data(),
-            m_render_buffers.d_density_sigma.data(),
-            m_render_buffers.d_rgb_output.data(),
-            d_rgb_true ? (d_rgb_true + offset * 3) : nullptr,
-            m_render_buffers.d_render_rgb_chunk.data(),
-            m_render_buffers.d_render_depth_chunk.data(),
-            m_render_buffers.d_phi_chunk.data(),
-            m_opts.bgColor,
-            stream
-        );
-        });
-
-        measure(stream, m_profile_stats.fillFloatKernel, [&](){
-        fill_float_kernel<<<(currentChunkRays + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_t.data(), 1.0f, currentChunkRays);
-        fill_float_kernel<<<(currentChunkRays * 3 + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_rgb.data(), 0.0f, currentChunkRays * 3);
-        });
-
-        if (d_rgb_out != nullptr) {
-            cudaMemcpyAsync(d_rgb_out + offset * 3, m_render_buffers.d_render_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-        }
-
-        // if (m_trainSteps % 16 == 0) {
-        //     if (m_trainSteps < 256) {
-        //         earlyOccupancyGridUpdate(stream);
-        //     } else {
-        //         lateOccupancyGridUpdate(stream);
-        //     }
-        // }
-        if (m_trainSteps < 256) {
-            earlyOccupancyGridUpdate(stream);
-        } else if (m_trainSteps % 16 == 0) {
-            lateOccupancyGridUpdate(stream);
-        }
-        
-        measure(stream, m_profile_stats.trainZeroGrad, [&](){
-            m_densityMLP->zero_grad(stream);
-            m_colorMLP->zero_grad(stream);
-        });
-        
-        for (int step = 0; step < boundaries.size(); step++) {
-            uint32_t start_ray = (step == 0) ? 0 : boundaries[step - 1];
-            uint32_t end_ray   = boundaries[step];
-            uint32_t start_hit = m_render_buffers.h_ray_offsets[start_ray];
-            uint32_t end_hit;
-            if (end_ray == currentChunkRays) {
-                end_hit = totalHits;
-            } else {
-                end_hit = m_render_buffers.h_ray_offsets[end_ray];
-            }
-
-            uint32_t chunk_hits = end_hit - start_hit;
-            uint32_t padded_batch_size = (chunk_hits + 15) & ~15;
-            float* chunk_mlp_positions = m_render_buffers.d_mlp_positions.data() + (start_hit * 4);
-
-            cudaMemsetAsync(m_render_buffers.d_custom_color_grad.data(), 0, padded_batch_size * 3 * sizeof(half), stream);
-            cudaMemsetAsync(m_render_buffers.d_custom_density_grad.data(), 0, padded_batch_size * 16 * sizeof(half), stream);
-
-            measure(stream, m_profile_stats.trainDensityFwd, [&](){
-            m_densityMLP->forward(chunk_mlp_positions, m_render_buffers.d_density_out.data(), padded_batch_size, stream);
-            });
-
-            constexpr int BS = 256;
-            int gs = (chunk_hits + BS - 1) / BS;
-            measure(stream, m_profile_stats.trainComputeSH, [&](){
-            compute_SH_gather<<<gs, BS, 0, stream>>>(
-                chunk_d, m_render_buffers.d_ray_indices.data(),
-                start_hit, chunk_hits, m_opts.densityBias, m_render_buffers.d_density_out.data(),
-                m_render_buffers.d_color_input.data(),
-                m_render_buffers.d_density_sigma.data()
-            );
-            });
-
-            measure(stream, m_profile_stats.trainColorFwd, [&](){
-            m_colorMLP->forward(m_render_buffers.d_color_input.data(), m_render_buffers.d_color_output.data(), padded_batch_size, stream);
-            });
-
-            int ray_count = end_ray - start_ray;
-            int gs_color = (ray_count + 255) / 256;
-            measure(stream, m_profile_stats.trainColorGrad, [&](){
-            compute_color_grad<<<gs_color, 256, 0, stream>>>(
-                end_ray - start_ray,
-                start_ray,
-                m_render_buffers.d_num_steps.data(),
-                m_render_buffers.d_ray_offsets.data(),
-                m_render_buffers.d_t_sorted.data(),
-                m_render_buffers.d_density_out.data(),
-                m_render_buffers.d_color_output.data(),
-                m_render_buffers.d_phi_chunk.data(),
-                m_render_buffers.d_render_rgb_chunk.data(),
-                m_render_buffers.d_custom_color_grad.data(),
-                m_render_buffers.d_tmpsigma.data(),
-                m_opts.lossScale,
-                m_opts.densityBias,
-                numRays
-            );
-            });
-
-            measure(stream, m_profile_stats.trainColorBwd, [&](){
-            m_colorMLP->backward(m_render_buffers.d_custom_color_grad.data(), m_render_buffers.d_color_dx_out.data(), padded_batch_size, stream);
-            });
-
-            int gs_density = (chunk_hits + 255) / 256;
-            measure(stream, m_profile_stats.trainDensityGrad, [&](){
-            compute_density_grad<<<gs_density, 256, 0, stream>>>(
-                chunk_hits, 
-                m_render_buffers.d_tmpsigma.data(), 
-                m_render_buffers.d_color_dx_out.data(), 
-                m_render_buffers.d_custom_density_grad.data()
-            );
-            });
-
-            measure(stream, m_profile_stats.trainDensityBwd, [&](){
-            m_densityMLP->backward(m_render_buffers.d_custom_density_grad.data(), padded_batch_size, stream);
-            });
-        }
-
-        trainStepCount++;
-        m_trainSteps++;
-
-        measure(stream, m_profile_stats.trainColorOpt, [&](){
-        m_colorMLP->step(m_opts.learningRate, m_opts.beta1, m_opts.beta2, m_opts.epsilon, m_opts.lossScale, stream);
-        });
-
-        measure(stream, m_profile_stats.trainDensityOpt, [&](){
-        m_densityMLP->step(m_opts.learningRate, m_opts.beta1, m_opts.beta2, m_opts.epsilon, m_opts.lossScale, stream);
-        });
-
-
-    }
-
-    if (m_opts.isProfiling) {
-        m_profile_stats.resolvePendingTimers();
+    initRenderBuffers();
+    
+    if (m_memMode == TRAINING) {
+        m_colorMLP->switchToTrainingMode();
+        m_densityMLP->switchToTrainingMode();
+    } else if (m_memMode == INFERENCE) {
+        m_colorMLP->switchToInferenceMode();
+        m_densityMLP->switchToInferenceMode();
     }
 }
 
@@ -637,7 +424,9 @@ void InstantNerf::trainWithRaysHit(
             return; // Or throw an exception to escape the infinite loop
         }
 
-        hitCounts[i] = totalHits;
+        if (hitCounts != nullptr) {
+            hitCounts[i] = totalHits;
+        }
         uint32_t padded_b_size = (totalHits + 15) & ~15;
 
         measure(stream, m_profile_stats.inferenceDensityFwd, [&](){
@@ -682,11 +471,6 @@ void InstantNerf::trainWithRaysHit(
             m_opts.bgColor,
             stream
         );
-        });
-
-        measure(stream, m_profile_stats.fillFloatKernel, [&](){
-        fill_float_kernel<<<(currentChunkRays + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_t.data(), 1.0f, currentChunkRays);
-        fill_float_kernel<<<(currentChunkRays * 3 + 255)/256, 256, 0, stream>>>(m_render_buffers.d_current_rgb.data(), 0.0f, currentChunkRays * 3);
         });
 
         if (d_rgb_out != nullptr) {
@@ -1333,5 +1117,3 @@ void InstantNerf::load(const std::string& filename) {
     in.read(reinterpret_cast<char*>(h_occupancyGrid.data()), occupancyGridBytes * sizeof(uint8_t));
     cudaMemcpy(d_occupancyGrid.data(), h_occupancyGrid.data(), occupancyGridBytes * sizeof(uint8_t), cudaMemcpyHostToDevice);
 }
-
-

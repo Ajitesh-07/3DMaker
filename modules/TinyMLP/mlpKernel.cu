@@ -18,7 +18,7 @@ __global__ void singleLayerMMA(
     int K,
     bool applyRelu
 ) {
-    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.y * blockDim.x + threadIdx.x;
     int numThreads = blockDim.x * blockDim.y;
 
     const int WMMA_M = 16;
@@ -38,9 +38,9 @@ __global__ void singleLayerMMA(
 
     // Preload the first block once
     for (int i = 0; i < numALoad; i++) {
-        int localIdx = i * numThreads + idx;
-        int local_row = localIdx / WMMA_K;
-        int local_col = localIdx % WMMA_K;
+        uint32_t localIdx = i * numThreads + idx;
+        uint32_t local_row = localIdx / WMMA_K;
+        uint32_t local_col = localIdx % WMMA_K;
 
         int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
         int global_col = local_col;
@@ -52,10 +52,10 @@ __global__ void singleLayerMMA(
         }
     }
     for (int i = 0; i < numBLoad; i++) {
-        int local_idx = (i * numThreads) + idx;
+        uint32_t local_idx = (i * numThreads) + idx;
 
-        int local_row = local_idx % WMMA_N;
-        int local_col = local_idx / WMMA_N;
+        uint32_t local_row = local_idx % WMMA_N;
+        uint32_t local_col = local_idx / WMMA_N;
 
         int global_row = local_row;
         int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -83,9 +83,9 @@ __global__ void singleLayerMMA(
 
         if (k + WMMA_K < K) {
             for (int i = 0; i < numALoad; i++) {
-                int localIdx = i * numThreads + idx;
-                int local_row = localIdx / WMMA_K;
-                int local_col = localIdx % WMMA_K;
+                uint32_t localIdx = i * numThreads + idx;
+                uint32_t local_row = localIdx / WMMA_K;
+                uint32_t local_col = localIdx % WMMA_K;
 
                 int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
                 int global_col = (k + WMMA_K) + local_col;
@@ -98,10 +98,10 @@ __global__ void singleLayerMMA(
             }
 
             for (int i = 0; i < numBLoad; i++) {
-                int local_idx = (i * numThreads) + idx;
+                uint32_t local_idx = (i * numThreads) + idx;
 
-                int local_row = local_idx % WMMA_N;
-                int local_col = local_idx / WMMA_N;
+                uint32_t local_row = local_idx % WMMA_N;
+                uint32_t local_col = local_idx / WMMA_N;
 
                 int global_row = (k + WMMA_K) + local_row;
                 int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -125,9 +125,9 @@ __global__ void singleLayerMMA(
 
     int numCLoad = (WARPS_PER_BLOCK * WMMA_M * WMMA_N) / numThreads;
     for (int i = 0; i < numCLoad; i++) {
-        int local_idx = (i * numThreads) + idx;
-        int local_row = local_idx / WMMA_N;
-        int local_col = local_idx % WMMA_N;
+        uint32_t local_idx = (i * numThreads) + idx;
+        uint32_t local_row = local_idx / WMMA_N;
+        uint32_t local_col = local_idx % WMMA_N;
 
         int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
         int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -154,7 +154,7 @@ __global__ void singleLayerMMA_fp32(
     int K,
     bool applyRelu
 ) {
-    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.y * blockDim.x + threadIdx.x;
     int numThreads = blockDim.x * blockDim.y;
 
     const int WMMA_M = 16;
@@ -174,9 +174,9 @@ __global__ void singleLayerMMA_fp32(
 
     // Preload the first block once
     for (int i = 0; i < numALoad; i++) {
-        int localIdx = i * numThreads + idx;
-        int local_row = localIdx / WMMA_K;
-        int local_col = localIdx % WMMA_K;
+        uint32_t localIdx = i * numThreads + idx;
+        uint32_t local_row = localIdx / WMMA_K;
+        uint32_t local_col = localIdx % WMMA_K;
 
         int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
         int global_col = local_col;
@@ -188,10 +188,10 @@ __global__ void singleLayerMMA_fp32(
         }
     }
     for (int i = 0; i < numBLoad; i++) {
-        int local_idx = (i * numThreads) + idx;
+        uint32_t local_idx = (i * numThreads) + idx;
 
-        int local_row = local_idx % WMMA_N;
-        int local_col = local_idx / WMMA_N;
+        uint32_t local_row = local_idx % WMMA_N;
+        uint32_t local_col = local_idx / WMMA_N;
 
         int global_row = local_row;
         int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -219,9 +219,9 @@ __global__ void singleLayerMMA_fp32(
 
         if (k + WMMA_K < K) {
             for (int i = 0; i < numALoad; i++) {
-                int localIdx = i * numThreads + idx;
-                int local_row = localIdx / WMMA_K;
-                int local_col = localIdx % WMMA_K;
+                uint32_t localIdx = i * numThreads + idx;
+                uint32_t local_row = localIdx / WMMA_K;
+                uint32_t local_col = localIdx % WMMA_K;
 
                 int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
                 int global_col = (k + WMMA_K) + local_col;
@@ -234,10 +234,10 @@ __global__ void singleLayerMMA_fp32(
             }
 
             for (int i = 0; i < numBLoad; i++) {
-                int local_idx = (i * numThreads) + idx;
+                uint32_t local_idx = (i * numThreads) + idx;
 
-                int local_row = local_idx % WMMA_N;
-                int local_col = local_idx / WMMA_N;
+                uint32_t local_row = local_idx % WMMA_N;
+                uint32_t local_col = local_idx / WMMA_N;
 
                 int global_row = (k + WMMA_K) + local_row;
                 int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -261,9 +261,9 @@ __global__ void singleLayerMMA_fp32(
 
     int numCLoad = (WARPS_PER_BLOCK * WMMA_M * WMMA_N) / numThreads;
     for (int i = 0; i < numCLoad; i++) {
-        int local_idx = (i * numThreads) + idx;
-        int local_row = local_idx / WMMA_N;
-        int local_col = local_idx % WMMA_N;
+        uint32_t local_idx = (i * numThreads) + idx;
+        uint32_t local_row = local_idx / WMMA_N;
+        uint32_t local_col = local_idx % WMMA_N;
 
         int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
         int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -313,7 +313,7 @@ __global__ void singleLayerMMA_LDGSTS(
     int K,
     bool applyRelu
 ) {
-    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.y * blockDim.x + threadIdx.x;
     int numThreads = blockDim.x * blockDim.y;
     
     const int WMMA_M = 16;
@@ -327,8 +327,8 @@ __global__ void singleLayerMMA_LDGSTS(
     __shared__ half smem_B[2][WMMA_N][WMMA_K+PAD];
     __shared__ float smem_C[WARPS_PER_BLOCK * WMMA_M][WMMA_N];
 
-    int a_chunk_row = idx / 2;
-    int a_chunk_col = (idx % 2) * 8;
+    uint32_t a_chunk_row = idx / 2;
+    uint32_t a_chunk_col = (idx % 2) * 8;
     
     int a_global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + a_chunk_row;
     int a_global_col = a_chunk_col;
@@ -340,8 +340,8 @@ __global__ void singleLayerMMA_LDGSTS(
                  a_valid);
 
     if (idx < 32) {
-        int b_chunk_col = idx / 2;
-        int b_chunk_row = (idx % 2) * 8;
+        uint32_t b_chunk_col = idx / 2;
+        uint32_t b_chunk_row = (idx % 2) * 8;
         
         int b_global_col = (blockIdx.x * WMMA_N) + b_chunk_col;
         int b_global_row = b_chunk_row;
@@ -375,8 +375,8 @@ __global__ void singleLayerMMA_LDGSTS(
                          a_next_valid);
 
             if (idx < 32) {
-                int b_chunk_col = idx / 2;
-                int b_chunk_row = (idx % 2) * 8;
+                uint32_t b_chunk_col = idx / 2;
+                uint32_t b_chunk_row = (idx % 2) * 8;
                 
                 int b_global_col = (blockIdx.x * WMMA_N) + b_chunk_col;
                 int b_next_row = (k + WMMA_K) + b_chunk_row;
@@ -407,9 +407,9 @@ __global__ void singleLayerMMA_LDGSTS(
 
     int numCLoad = (WARPS_PER_BLOCK * WMMA_M * WMMA_N) / numThreads;
     for (int i = 0; i < numCLoad; i++) {
-        int local_idx = (i * numThreads) + idx;
-        int local_row = local_idx / WMMA_N;
-        int local_col = local_idx % WMMA_N;
+        uint32_t local_idx = (i * numThreads) + idx;
+        uint32_t local_row = local_idx / WMMA_N;
+        uint32_t local_col = local_idx % WMMA_N;
 
         int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
         int global_col = (blockIdx.x * WMMA_N) + local_col;
@@ -435,7 +435,7 @@ __global__ void singleLayerMMA_LDGSTS_fp32(
     int K,
     bool applyRelu
 ) {
-    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t idx = threadIdx.y * blockDim.x + threadIdx.x;
     int numThreads = blockDim.x * blockDim.y;
     
     const int WMMA_M = 16;
@@ -449,8 +449,8 @@ __global__ void singleLayerMMA_LDGSTS_fp32(
     __shared__ half smem_B[2][WMMA_N][WMMA_K+PAD];
     __shared__ float smem_C[WARPS_PER_BLOCK * WMMA_M][WMMA_N];
     
-    int a_chunk_row = idx / 2;
-    int a_chunk_col = (idx % 2) * 8;
+    uint32_t a_chunk_row = idx / 2;
+    uint32_t a_chunk_col = (idx % 2) * 8;
     
     int a_global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + a_chunk_row;
     int a_global_col = a_chunk_col;
@@ -462,8 +462,8 @@ __global__ void singleLayerMMA_LDGSTS_fp32(
                  a_valid);
 
     if (idx < 32) {
-        int b_chunk_col = idx / 2;
-        int b_chunk_row = (idx % 2) * 8;
+        uint32_t b_chunk_col = idx / 2;
+        uint32_t b_chunk_row = (idx % 2) * 8;
         
         int b_global_col = (blockIdx.x * WMMA_N) + b_chunk_col;
         int b_global_row = b_chunk_row;
@@ -497,8 +497,8 @@ __global__ void singleLayerMMA_LDGSTS_fp32(
                          a_next_valid);
 
             if (idx < 32) {
-                int b_chunk_col = idx / 2;
-                int b_chunk_row = (idx % 2) * 8;
+                uint32_t b_chunk_col = idx / 2;
+                uint32_t b_chunk_row = (idx % 2) * 8;
                 
                 int b_global_col = (blockIdx.x * WMMA_N) + b_chunk_col;
                 int b_next_row = (k + WMMA_K) + b_chunk_row;
@@ -529,9 +529,9 @@ __global__ void singleLayerMMA_LDGSTS_fp32(
 
     int numCLoad = (WARPS_PER_BLOCK * WMMA_M * WMMA_N) / numThreads;
     for (int i = 0; i < numCLoad; i++) {
-        int local_idx = (i * numThreads) + idx;
-        int local_row = local_idx / WMMA_N;
-        int local_col = local_idx % WMMA_N;
+        uint32_t local_idx = (i * numThreads) + idx;
+        uint32_t local_row = local_idx / WMMA_N;
+        uint32_t local_col = local_idx % WMMA_N;
 
         int global_row = (blockIdx.y * WARPS_PER_BLOCK * WMMA_M) + local_row;
         int global_col = (blockIdx.x * WMMA_N) + local_col;

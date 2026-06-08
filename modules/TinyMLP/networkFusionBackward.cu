@@ -59,8 +59,8 @@ __global__ void networkFusionMMA_Backward(
     int outputDim,
     int numLayers
 ) {
-    int idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
-    int laneId = threadIdx.x + 1 - 1;
+    uint32_t idx = threadIdx.z * (blockDim.x * blockDim.y) + threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t laneId = threadIdx.x + 1 - 1;
 
     const int WMMA_M = 16;
     const int WMMA_N = 16;
@@ -73,8 +73,8 @@ __global__ void networkFusionMMA_Backward(
 
     #pragma unroll
     for (int i = 0; i < TILE_FACTOR; i++) {
-        int chunk_row = (idx + i*256) / (TILE_COUNT_X * WMMA_K / 8);
-        int chunk_col = (idx + i*256) % (TILE_COUNT_X * WMMA_K / 8) * 8;
+        uint32_t chunk_row = (idx + i*256) / (TILE_COUNT_X * WMMA_K / 8);
+        uint32_t chunk_col = (idx + i*256) % (TILE_COUNT_X * WMMA_K / 8) * 8;
 
         int global_row = (blockIdx.x * TILE_COUNT_Y * TILE_FACTOR) * WMMA_M + chunk_row;
         int global_col = chunk_col;
@@ -94,7 +94,7 @@ __global__ void networkFusionMMA_Backward(
         int threads_per_row_b = WMMA_K / 8;
         int total_threads_needed_b = (TILE_COUNT_X * WMMA_N) * threads_per_row_b;
     
-        int chunk_row_b = 0, chunk_col_b = 0, global_row_b = 0;
+        uint32_t chunk_row_b = 0, chunk_col_b = 0, global_row_b = 0;
     
         if (idx < total_threads_needed_b) {
             chunk_row_b = idx / (TILE_COUNT_X * WMMA_K / 8);
@@ -148,8 +148,8 @@ __global__ void networkFusionMMA_Backward(
         for(int j = 0; j < WARP_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                 
                 int global_row = (threadIdx.z + j*blockDim.z)*WMMA_M + local_row;
                 int global_col = threadIdx.y * WMMA_N + local_col;
@@ -184,8 +184,8 @@ __global__ void networkFusionMMA_Backward(
         int threads_per_row_w = (TILE_COUNT_X * WMMA_N) / 8; 
         int total_threads_w = WMMA_K * threads_per_row_w; 
 
-        int chunk_row_b = idx / threads_per_row_w;
-        int chunk_col_b = (idx % threads_per_row_w) * 8;
+        uint32_t chunk_row_b = idx / threads_per_row_w;
+        uint32_t chunk_col_b = (idx % threads_per_row_w) * 8;
         
         if (idx < total_threads_w) {
             bool b_valid = (chunk_row_b < outputDim) && (chunk_col_b < hiddenDim);
@@ -239,8 +239,8 @@ __global__ void networkFusionMMA_Backward(
         for(int j = 0; j < TILE_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
 
                 float val = frag_acc[j].x[i];
                 shmem_A[(threadIdx.z + j*blockDim.z)*WMMA_M + local_row][base_col + local_col] = __float2half(val);
@@ -273,7 +273,7 @@ __global__ void networkFusionMMA_Backward(
             int threads_per_row_b = WMMA_K / 8;
             int total_threads_needed_b = (TILE_COUNT_X * WMMA_N) * threads_per_row_b;
         
-            int chunk_row_b = 0, chunk_col_b = 0, global_row_b = 0;
+            uint32_t chunk_row_b = 0, chunk_col_b = 0, global_row_b = 0;
         
             if (idx < total_threads_needed_b) {
                 chunk_row_b = idx / (TILE_COUNT_X * WMMA_K / 8);
@@ -327,8 +327,8 @@ __global__ void networkFusionMMA_Backward(
             for(int j = 0; j < WARP_FACTOR; j++) {
                 #pragma unroll
                 for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                    int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                    int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                    uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                    uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                     
                     int global_row = (threadIdx.z + j*blockDim.z)*WMMA_M + local_row;
                     int global_col = threadIdx.y * WMMA_N + local_col;
@@ -367,8 +367,8 @@ __global__ void networkFusionMMA_Backward(
             int threads_per_row_w = (TILE_COUNT_X * WMMA_N) / 8; 
             int total_threads_w = WMMA_K * threads_per_row_w; 
 
-            int chunk_row_b = idx / threads_per_row_w;
-            int chunk_col_b = (idx % threads_per_row_w) * 8;
+            uint32_t chunk_row_b = idx / threads_per_row_w;
+            uint32_t chunk_col_b = (idx % threads_per_row_w) * 8;
             
             if (idx < total_threads_w) {
                 bool b_valid = (chunk_row_b < hiddenDim) && (chunk_col_b < hiddenDim);
@@ -423,8 +423,8 @@ __global__ void networkFusionMMA_Backward(
             for(int j = 0; j < TILE_FACTOR; j++) {
                 #pragma unroll
                 for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                    int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                    int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                    uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                    uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                     
                     float val = frag_acc[j].x[i];
                     shmem_A[(threadIdx.z + j*blockDim.z)*WMMA_M + local_row][base_col + local_col] = __float2half(val);
@@ -457,7 +457,7 @@ __global__ void networkFusionMMA_Backward(
         int threads_per_row_b = WMMA_K / 8; // 2
         int total_threads_needed_b = (TILE_COUNT_X * WMMA_N) * threads_per_row_b; // 128
     
-        int chunk_row_b = 0, chunk_col_b = 0, global_row_b = 0;
+        uint32_t chunk_row_b = 0, chunk_col_b = 0, global_row_b = 0;
     
         if (idx < total_threads_needed_b) {
             chunk_row_b = idx / (TILE_COUNT_X * WMMA_K / 8);
@@ -511,8 +511,8 @@ __global__ void networkFusionMMA_Backward(
         for(int j = 0; j < WARP_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
                 
                 int global_row = (threadIdx.z + j*blockDim.z)*WMMA_M + local_row;
                 int global_col = threadIdx.y * WMMA_N + local_col;
@@ -549,8 +549,8 @@ __global__ void networkFusionMMA_Backward(
         int threads_per_row_w = (TILE_COUNT_X * WMMA_N) / 8; 
         int total_threads_w = WMMA_K * threads_per_row_w; 
 
-        int chunk_row_b = idx / threads_per_row_w;
-        int chunk_col_b = (idx % threads_per_row_w) * 8;
+        uint32_t chunk_row_b = idx / threads_per_row_w;
+        uint32_t chunk_col_b = (idx % threads_per_row_w) * 8;
         
         if (idx < total_threads_w) {
             bool b_valid = (chunk_row_b < hiddenDim) && (chunk_col_b < inputDim);
@@ -604,8 +604,8 @@ __global__ void networkFusionMMA_Backward(
         for(int j = 0; j < TILE_FACTOR; j++) {
             #pragma unroll
             for (int i = 0; i < frag_acc[j].num_elements; i++) {
-                int local_row = (laneId / 4) + ((i / 2) % 2) * 8;
-                int local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
+                uint32_t local_row = (laneId / 4) + ((i / 2) % 2) * 8;
+                uint32_t local_col = (laneId % 4) * 2 + (i % 2) + (i / 4) * 8;
 
                 float val = frag_acc[j].x[i];
                 shmem_A[(threadIdx.z + j*blockDim.z)*WMMA_M + local_row][base_col + local_col] = __float2half(val);

@@ -61,8 +61,27 @@ int main() {
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
     opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
     
+    std::cout << "\n--- VRAM Usage Comparison ---" << std::endl;
+    {
+        InstantNerf nerf_train;
+        nerf_train.init(opts);
+        nerf_train.setMemoryMode(TRAINING);
+        std::cout << "TRAINING Mode: ";
+        printVRAMUsage();
+    }
+    
+    {
+        InstantNerf nerf_infer;
+        nerf_infer.init(opts);
+        nerf_infer.setMemoryMode(INFERENCE);
+        std::cout << "INFERENCE Mode: ";
+        printVRAMUsage();
+    }
+    std::cout << "-----------------------------\n" << std::endl;
+
     InstantNerf nerf;
-    std::cout << "Initializing MLPs and Grid..." << std::endl;
+    std::cout << "Initializing MLPs and Grid for Benchmark..." << std::endl;
+    nerf.setMemoryMode(TRAINING);
     nerf.init(opts);
 
     cudaEvent_t start, stop;
@@ -77,7 +96,7 @@ int main() {
     try {
         int chunks = (8192 + opts.rayChunkSize - 1) / opts.rayChunkSize;
         std::vector<uint32_t> dummyHitCounts(chunks, 0);
-        nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, 8192, dummySteps, dummyHitCounts.data());
+        nerf.trainWithRaysHit(d_rays_o, d_rays_d, d_rgb_true, 8192, dummySteps, nullptr, nullptr, 0);
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA error after warmup trainWithRays: %s\n", cudaGetErrorString(err));
@@ -102,7 +121,7 @@ int main() {
             
             int chunks = (numRays + opts.rayChunkSize - 1) / opts.rayChunkSize;
             std::vector<uint32_t> dummyHitCounts(chunks, 0);
-            nerf.trainWithRays(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps, dummyHitCounts.data());
+            nerf.trainWithRaysHit(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps, nullptr, nullptr, 0);
             
             CUDA_CHECK(cudaEventRecord(stop));
             CUDA_CHECK(cudaEventSynchronize(stop));

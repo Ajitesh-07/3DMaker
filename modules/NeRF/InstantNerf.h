@@ -22,6 +22,11 @@
 
 #define MAX_HITS 128
 
+enum MemoryMode {
+    TRAINING,
+    INFERENCE
+};
+
 // Forward declaration
 class TinyMLPHashGrid;
 class TinyMLP;
@@ -270,23 +275,14 @@ public:
     InstantNerf(const InstantNerf&) = delete;
     InstantNerf& operator=(const InstantNerf&) = delete;
 
-    void init(const NerfOptions& opts);
+    void init(const NerfOptions& opts, MemoryMode memMode = TRAINING);
     void printStats();
     void resetStats();
     void setLearningRate(float lr) { m_opts.learningRate = lr; }
     void setBgColor(float3 c) { m_opts.bgColor = c; }
     void setProfiling(bool p) { m_opts.isProfiling = p; }
 
-    void trainWithRays(
-        const float3* d_rays_o,
-        const float3* d_rays_d,
-        const float* d_rgb_true,
-        uint32_t numRays,
-        int& trainStepCount,
-        uint32_t* hitCounts,
-        float* d_rgb_out = nullptr,
-        cudaStream_t stream = 0
-    );
+    void setMemoryMode(MemoryMode mode);
 
     void trainWithRaysHit(
         const float3* d_rays_o,
@@ -330,6 +326,7 @@ private:
     TinyMLP* m_colorMLP = nullptr;
     TinyMLPHashGrid* m_densityMLP = nullptr;
     GPUStats m_profile_stats;
+    MemoryMode m_memMode; 
 
     DeviceBuffer<uint8_t> d_occupancyGrid{0};
     DeviceBuffer<float> d_masterOccupancyGrid{0}; 

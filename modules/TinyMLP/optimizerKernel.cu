@@ -25,7 +25,7 @@ __global__ void fusedAdamWeightsOptim(
     int in_d = (layer == 0) ? inputDim : hiddenDim;
     int out_d = (layer == numLayers - 1) ? outputDim : hiddenDim;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int numElements = in_d * out_d;
 
     if (idx < numElements) {
@@ -69,7 +69,7 @@ __global__ void fusedAdamBiasOptim(
     int layer = blockIdx.y;
     int out_d = (layer == numLayers - 1) ? outputDim : hiddenDim;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < out_d) {
         // 1. Read everything and unscale gradient
@@ -117,7 +117,7 @@ __global__ void fusedAdamHashGridOptim(
     int level = blockIdx.y;
     if (level >= numLevels) return;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int levelElements = tableSize * FEATURES_PER_LEVEL;
     if (idx >= levelElements) return;
 
@@ -156,7 +156,7 @@ __global__ void fusedMSELossGrad_Kernel(
     float grad_scale      
 ) {
     // We process 2 elements per thread using half2
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    uint32_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int num_elements = batchSize * padded_dim;
     int stride = blockDim.x * gridDim.x * 2;
 
@@ -206,7 +206,7 @@ __global__ void zeroGradientsKernel(float** w_grads, float** b_grads, int inputD
     int in_d = (layer == 0) ? inputDim : hiddenDim;
     int out_d = (layer == numLayers - 1) ? outputDim : hiddenDim;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < in_d * out_d) {
         w_grads[layer][idx] = 0.0f;
