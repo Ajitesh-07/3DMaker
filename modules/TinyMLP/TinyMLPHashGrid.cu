@@ -5,6 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <fstream>
+#include <cstdint>
 #include <string>
 
 __global__ void hg_padHalfToHalf(const half* __restrict__ src,half* __restrict__ dst,int batch,int undim,int padim){

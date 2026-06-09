@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "TinyMLP.h"
+#include <cstdint>
 #include "TinyMLPHashGrid.h"
 
 __global__ void fusedAdamWeightsOptim(

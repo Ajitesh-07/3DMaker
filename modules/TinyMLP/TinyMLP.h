@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <string>
+#include <cstdint>
 
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \

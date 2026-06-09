@@ -56,3 +56,33 @@ Once training is complete, a `model.inerf` file is saved. You can explore it in 
 ```
 
 *(Note: Ensure you are running from the `build` directory or your paths are correct relative to the executable).*
+
+## 🐧 Linux Build Instructions
+
+Building on Linux is fully supported using standard CMake. Ensure you have the **CUDA Toolkit (11.8 or higher)** and a modern C++ compiler (`g++-11` or higher) installed.
+
+**1. Clone and Build the Main Project:**
+```bash
+git clone https://github.com/yourusername/3DMaker.git
+cd 3DMaker
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+```
+
+**2. Compiling and Running TinyMLP Benchmarks:**
+The high-performance core (`TinyMLP`) includes several standalone benchmarks to test hash-grid and matrix multiplication speeds. You can compile these by enabling the test flag:
+```bash
+cd 3DMaker/build
+cmake -DCMAKE_BUILD_TYPE=Release -DTINYMLP_BUILD_TESTS=ON ..
+make -j$(nproc)
+```
+Once compiled, you can run the benchmarks directly from the build directory. For example:
+```bash
+# Run the Multi-Resolution Hash Grid forward/backward pass benchmarks
+./modules/TinyMLP/test_forward
+./modules/TinyMLP/test_backward
+
+# Run the raw Neural Network matrix multiplication benchmarks
+./modules/TinyMLP/test_mlp
+```

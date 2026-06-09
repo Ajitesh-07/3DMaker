@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cstdint>
 #include "TinyMLP.h"
 
 __device__ __forceinline__ void cp_async_128(void* smem, const void* global, bool valid) {

@@ -4,6 +4,7 @@
 #include <math.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include "TinyMLP.h"
 
 #define NO_WARPS 8
