@@ -98,6 +98,7 @@ if(TINYMLP_BUILD_TESTS)
     target_compile_options(demoMLP PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3>
     )
+    target_include_directories(demoMLP PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(demoMLP PRIVATE TinyMLP cublas)
 
     add_executable(test_forward tests_kernels/testNetworkFusionHashtable.cu)
@@ -130,5 +131,6 @@ if(TINYMLP_BUILD_TESTS)
     target_compile_options(demo PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3>
     )
+    target_include_directories(demo PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(demo PRIVATE TinyMLP cublas)
 endif()
