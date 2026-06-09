@@ -33,8 +33,10 @@ venv/
 *.tmp
 
 # Data and Assets
+benchmarks/
 data/
 assets/
+third_party/colmap
 
 # TinyMLP Outputs
 modules/TinyMLP/images/

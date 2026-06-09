@@ -1,5 +1,5 @@
-#include "../InstantNerf.h"
-#include "../DataLoader.h"
+#include "InstantNerf.h"
+#include "DataLoader.h"
 #include <iostream>
 #include <cuda_runtime.h>
 #include <vector>
@@ -10,7 +10,7 @@
 #include <filesystem>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "../../../third_party/stb_image_write.h"
+#include "../../third_party/stb_image_write.h"
 
 // ------------------------------------------------------------------
 // Utility Functions & Kernels
@@ -91,16 +91,12 @@ __global__ void generate_custom_rays_kernel(
 // Main Execution
 // ------------------------------------------------------------------
 
-int main(int argc, char** argv) {
+void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam, int totalSteps = 0) {
     std::cout << "Starting NeRF Hit-Centric Training with Streaming DataLoader..." << std::endl;
 
     // ==========================================
     // 1. Configuration & Setup
     // ==========================================
-    std::string dataset_path = "../../data/nerf_synthetic/lego";
-    if (argc > 1) {
-        dataset_path = argv[1];
-    }
 
     NerfOptions opts;
     opts.densityBias = 1.0f;
@@ -129,7 +125,7 @@ int main(int argc, char** argv) {
     // ==========================================
     // 2. Training Loop Variables
     // ==========================================
-    int totalEpochs = 5; 
+    int totalEpochs = totalEpochsParam; 
     int total_rays = dataset.getTotalRays();
     int trainSteps = 0;
     
@@ -161,6 +157,7 @@ int main(int argc, char** argv) {
     // 3. Main Training Epochs
     // ==========================================
     for (int epoch = 1; epoch <= totalEpochs; ++epoch) {
+        if (totalSteps > 0 && trainSteps >= totalSteps) break;
         
         // Generate a new random seed for the DataLoader to perfectly randomize rays this epoch!
         uint32_t epoch_seed = seed_dist(rng);
@@ -170,6 +167,8 @@ int main(int argc, char** argv) {
         int last_trainSteps = trainSteps;
         
         for (int offset = 0; offset < total_rays; offset += opts.rayChunkSize) {
+
+            if (totalSteps > 0 && trainSteps >= totalSteps) break;
             
             // 3.1 Cosine Annealing Learning Rate Update
             float progress = (float)current_chunk / (float)total_chunks;
@@ -316,7 +315,7 @@ int main(int argc, char** argv) {
     int video_pixels = video_w * video_h;
     
     // We approximate standard camera extrinsics
-    float camera_angle_x = 0.6911112070083618f;
+    float camera_angle_x = dataset.getCameraAngleX();
     float focal_length = 0.5f * video_w / tanf(0.5f * camera_angle_x);
 
     float* d_video_rays_o;
@@ -335,7 +334,7 @@ int main(int argc, char** argv) {
     for (int frame = 0; frame < 120; ++frame) {
         float angle = frame * (2.0f * 3.14159265f / 120.0f);
         float scale = 1.0f;
-        float radius = 4.0311f * scale; 
+        float radius = 1.2f * scale; // Keep radius inside the [-1.5, 1.5] bounding box
         float elev = 30.0f * 3.14159265f / 180.0f; // 30 degrees elevation
         
         float pz = radius * sinf(elev);
@@ -400,5 +399,4 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventDestroy(stop));
 
     std::cout << "Training Complete." << std::endl;
-    return 0;
 }

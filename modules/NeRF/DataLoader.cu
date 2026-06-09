@@ -11,7 +11,6 @@
 #include <curand.h>
 
 using json = nlohmann::json;
-
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -22,8 +21,12 @@ using json = nlohmann::json;
     } while(0)
 
 
-DataLoader::DataLoader(const std::string& dataset_path, bool is_training) 
-    : dataset_path(dataset_path), is_training(is_training), gen(nullptr), width(0), height(0), total_rays(0) {
+DataLoader::DataLoader(const std::string& dataset_path, uint32_t ray_chunk_size, bool is_training)
+        : dataset_path(dataset_path), m_is_training(is_training) {
+    int width = 0;
+    int height = 0;
+    m_ray_chunk_size = ray_chunk_size;
+
     parseTransformsJson();
     loadImages();
     loadDataToGPU();
@@ -31,44 +34,43 @@ DataLoader::DataLoader(const std::string& dataset_path, bool is_training)
 
 DataLoader::~DataLoader() {
     freeVRAM();
-    if (gen) curandDestroyGenerator((curandGenerator_t)gen);
+    if (h_images_rgba) cudaFreeHost(h_images_rgba);
 }
 
 void DataLoader::freeVRAM() {
-    if (d_images_rgba) cudaFree(d_images_rgba);
     if (d_transforms) cudaFree(d_transforms);
-
     if (d_chunk_rays_o) cudaFree(d_chunk_rays_o);
     if (d_chunk_rays_d) cudaFree(d_chunk_rays_d);
     if (d_chunk_rgb_true) cudaFree(d_chunk_rgb_true);
-    
-    if (d_indices) cudaFree(d_indices);
-    if (d_shuffled_indices) cudaFree(d_shuffled_indices);
-    if (d_random_keys) cudaFree(d_random_keys);
-    if (d_temp_storage) cudaFree(d_temp_storage);
 }
 
+
 void DataLoader::parseTransformsJson() {
-    std::string json_file = dataset_path + (is_training ? "/transforms_train.json" : "/transforms_test.json");
+    std::string json_file = dataset_path + (m_is_training ? "/transforms_train.json" : "/transforms_test.json");
     std::ifstream file(json_file);
+
     if (!file.is_open()) {
         std::cerr << "Failed to open " << json_file << std::endl;
         exit(1);
     }
+
     json j;
     file >> j;
 
     camera_angle_x = j["camera_angle_x"];
-    
+
     for (auto& frame : j["frames"]) {
         Frame f;
         std::string path = frame["file_path"];
-        if (path.find(".png") == std::string::npos) {
+        if (path.find(".png") == std::string::npos && 
+            path.find(".jpg") == std::string::npos && 
+            path.find(".jpeg") == std::string::npos) {
             path += ".png";
         }
+
         f.file_path = dataset_path + "/" + path;
-        
-        int idx = 0;
+
+                int idx = 0;
         for (int row = 0; row < 4; ++row) {
             for (int col = 0; col < 4; ++col) {
                 f.transform_matrix[idx++] = frame["transform_matrix"][row][col];
@@ -79,66 +81,107 @@ void DataLoader::parseTransformsJson() {
 }
 
 void DataLoader::loadImages() {
+    if (frames.empty()) return;
     std::cout << "Loading " << frames.size() << " images..." << std::endl;
-    for (size_t i = 0; i < frames.size(); ++i) {
-        int w, h, channels;
-        unsigned char* img = stbi_load(frames[i].file_path.c_str(), &w, &h, &channels, 4);
+
+    int w, h, channels;
+    unsigned char* img0 = stbi_load(frames[0].file_path.c_str(), &w, &h, &channels, 4);
+    if (!img0) {
+        std::cerr << "Failed to load image: " << frames[0].file_path << std::endl;
+        exit(1);
+    }
+
+    width = w;
+    height = h;
+    focal_length = 0.5f * width / tanf(0.5f * camera_angle_x);
+
+    size_t pixels_per_image = width * height;
+    size_t bytes_per_image = pixels_per_image * 4;
+
+    CUDA_CHECK(cudaHostAlloc((void**)&h_images_rgba, frames.size() * bytes_per_image, cudaHostAllocMapped));
+
+    std::memcpy(h_images_rgba, img0, bytes_per_image);
+    stbi_image_free(img0);
+
+    for (int i = 1; i < (int)frames.size(); ++i) {
+        int thread_w, thread_h, thread_channels;
+        
+        unsigned char* img = stbi_load(frames[i].file_path.c_str(), &thread_w, &thread_h, &thread_channels, 4);
+        
         if (!img) {
-            std::cerr << "Failed to load image: " << frames[i].file_path << std::endl;
-            exit(1);
+            #pragma omp critical
+            {
+                std::cerr << "Failed to load image: " << frames[i].file_path << std::endl;
+            }
+            continue;
         }
 
-        if (i == 0) {
-            width = w;
-            height = h;
-            focal_length = 0.5f * width / tanf(0.5f * camera_angle_x);
-        }
+        size_t offset = i * bytes_per_image;
+        std::memcpy(h_images_rgba + offset, img, bytes_per_image);
 
-        for (int p = 0; p < width * height; ++p) {
-            uint8_t r = img[p * 4 + 0];
-            uint8_t g = img[p * 4 + 1];
-            uint8_t b = img[p * 4 + 2];
-            uint8_t a = img[p * 4 + 3];
-
-            // For now, we will store RGBA. We can blend in the kernel.
-            h_images_rgba.push_back(r);
-            h_images_rgba.push_back(g);
-            h_images_rgba.push_back(b);
-            h_images_rgba.push_back(a);
-        }
         stbi_image_free(img);
     }
+
     total_rays = width * height * frames.size();
-    std::cout << "Loaded " << total_rays << " total rays compactly. Focal length: " << focal_length << std::endl;
+    std::cout << "Loaded " << total_rays << " total rays compactly via Pinned Memory. Focal length: " << focal_length << std::endl;
 }
 
-__global__ void fetchRayChunkKernel(
-    int offset, int size, int total_rays,
+void DataLoader::loadDataToGPU() {
+    std::cout << "Mapping Pinned Memory to GPU..." << std::endl;
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_images_rgba, (void*)h_images_rgba, 0));
+
+    std::vector<float> h_transforms(frames.size() * 16);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        for (int j = 0; j < 16; ++j) {
+            h_transforms[i * 16 + j] = frames[i].transform_matrix[j];
+        }
+    }
+    CUDA_CHECK(cudaMalloc(&d_transforms, frames.size() * 16 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_transforms, h_transforms.data(), frames.size() * 16 * sizeof(float), cudaMemcpyHostToDevice));
+
+    if (!m_is_training) {
+        m_ray_chunk_size = width * height; // Ensure buffer is large enough for a full image
+    }
+
+    CUDA_CHECK(cudaMalloc(&d_chunk_rays_o, m_ray_chunk_size * sizeof(float3)));
+    CUDA_CHECK(cudaMalloc(&d_chunk_rays_d, m_ray_chunk_size * sizeof(float3)));
+    CUDA_CHECK(cudaMalloc(&d_chunk_rgb_true, m_ray_chunk_size * 3 * sizeof(float)));
+}
+
+__device__ uint32_t pcg_hash(uint32_t input) {
+    uint32_t state = input * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+__global__ void fetchRayChunkStreamingKernel(
+    int offset, int size, int total_rays, uint32_t seed, bool randomize,
     int width, int height, float focal_length,
-    const float* d_transforms, // [num_images, 16]
-    const uint8_t* d_images_rgba, // [num_images, height, width, 4]
-    const uint32_t* d_shuffled_indices,
+    const float* d_transforms,
+    const uint8_t* d_images_rgba,
     float3* d_chunk_rays_o, float3* d_chunk_rays_d, float* d_chunk_rgb,
     float3 bg_color
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     
-    if (offset + idx >= total_rays) return;
-
-    uint32_t global_idx = d_shuffled_indices[offset + idx];
+    uint32_t global_idx;
+    if (randomize) {
+        uint32_t rand_val = pcg_hash(offset + idx + seed);
+        global_idx = rand_val % total_rays;
+    } else {
+        global_idx = (offset + idx) % total_rays;
+    }
 
     int img_idx = global_idx / (width * height);
     int pixel_idx = global_idx % (width * height);
     int px = pixel_idx % width;
     int py = pixel_idx / width;
 
-    // NeRF Camera space direction (X right, Y up, Z backwards)
     float dir_x = (px - width * 0.5f) / focal_length;
     float dir_y = -(py - height * 0.5f) / focal_length;
     float dir_z = -1.0f;
 
-    // Normalize dir in camera space
     float inv_norm = rsqrtf(dir_x*dir_x + dir_y*dir_y + dir_z*dir_z);
     dir_x *= inv_norm;
     dir_y *= inv_norm;
@@ -146,21 +189,17 @@ __global__ void fetchRayChunkKernel(
 
     const float* c2w = &d_transforms[img_idx * 16];
 
-    // C2W * dir
     float world_dir_x = c2w[0]*dir_x + c2w[1]*dir_y + c2w[2]*dir_z;
     float world_dir_y = c2w[4]*dir_x + c2w[5]*dir_y + c2w[6]*dir_z;
     float world_dir_z = c2w[8]*dir_x + c2w[9]*dir_y + c2w[10]*dir_z;
 
-    // C2W * origin (0,0,0,1) scaled to fit in AABB
-    float scale = 1.0f;
-    float world_o_x = c2w[3] * scale;
-    float world_o_y = c2w[7] * scale;
-    float world_o_z = c2w[11] * scale;
+    float world_o_x = c2w[3];
+    float world_o_y = c2w[7];
+    float world_o_z = c2w[11];
 
     d_chunk_rays_o[idx] = make_float3(world_o_x, world_o_y, world_o_z);
     d_chunk_rays_d[idx] = make_float3(world_dir_x, world_dir_y, world_dir_z);
 
-    // Decode 8-bit RGBA and blend with white
     uint8_t r = d_images_rgba[global_idx * 4 + 0];
     uint8_t g = d_images_rgba[global_idx * 4 + 1];
     uint8_t b = d_images_rgba[global_idx * 4 + 2];
@@ -180,96 +219,15 @@ __global__ void fetchRayChunkKernel(
     d_chunk_rgb[idx * 3 + 2] = fb;
 }
 
-// We just need indices 0..N-1
-__global__ void initIndicesKernel(uint32_t* indices, int n) {
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
-    if (id < n) {
-        indices[id] = id;
-    }
-}
-
-void DataLoader::setupCUBShuffle() {
-    CUDA_CHECK(cudaMalloc(&d_indices, total_rays * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_shuffled_indices, total_rays * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_random_keys, total_rays * sizeof(float)));
-
-    int blockSize = 256;
-    int gridSize = (total_rays + blockSize - 1) / blockSize;
-    initIndicesKernel<<<gridSize, blockSize>>>(d_indices, total_rays);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    curandGenerator_t generator;
-    curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(generator, 1234ULL);
-    gen = (void*)generator;
-
-    // Determine temp storage size for CUB sort
-    cub::DeviceRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
-        d_random_keys, d_random_keys, // keys
-        d_indices, d_shuffled_indices, // values
-        total_rays
-    );
-    CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
-}
-
-void DataLoader::loadDataToGPU() {
-    std::cout << "Allocating Compact VRAM Dataset..." << std::endl;
-    
-    // Store original images compactly (256 MB)
-    CUDA_CHECK(cudaMalloc(&d_images_rgba, total_rays * 4 * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMemcpy(d_images_rgba, h_images_rgba.data(), total_rays * 4 * sizeof(uint8_t), cudaMemcpyHostToDevice));
-
-    // Store camera matrices (~6.4 KB)
-    std::vector<float> h_transforms(frames.size() * 16);
-    for (size_t i = 0; i < frames.size(); ++i) {
-        for (int j = 0; j < 16; ++j) {
-            h_transforms[i * 16 + j] = frames[i].transform_matrix[j];
-        }
-    }
-    CUDA_CHECK(cudaMalloc(&d_transforms, frames.size() * 16 * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_transforms, h_transforms.data(), frames.size() * 16 * sizeof(float), cudaMemcpyHostToDevice));
-
-    // Allocate Tiny Chunk Buffers (1 Million Rays = 12 MB)
-    int max_chunk_size = 1024 * 1024; 
-    CUDA_CHECK(cudaMalloc(&d_chunk_rays_o, max_chunk_size * sizeof(float3)));
-    CUDA_CHECK(cudaMalloc(&d_chunk_rays_d, max_chunk_size * sizeof(float3)));
-    CUDA_CHECK(cudaMalloc(&d_chunk_rgb_true, max_chunk_size * 3 * sizeof(float)));
-
-    setupCUBShuffle();
-    if (is_training) {
-        shuffleRays(0);
-    } else {
-        CUDA_CHECK(cudaMemcpy(d_shuffled_indices, d_indices, total_rays * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    std::cout << "Compact Dataset completely loaded to VRAM." << std::endl;
-}
-
-void DataLoader::shuffleRays(cudaStream_t stream) {
-    curandGenerator_t generator = (curandGenerator_t)gen;
-    curandSetStream(generator, stream);
-    
-    // Generate random floats [0.0, 1.0]
-    curandGenerateUniform(generator, d_random_keys, total_rays);
-
-    // Sort indices by the random keys to shuffle them (No more moving full rays!)
-    cub::DeviceRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
-        d_random_keys, d_random_keys,
-        d_indices, d_shuffled_indices,
-        total_rays, 0, sizeof(float)*8, stream
-    );
-}
-
-void DataLoader::fetchRayChunk(int offset, int size, float3 bg_color, cudaStream_t stream) {
+void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color, cudaStream_t stream) {
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
-    fetchRayChunkKernel<<<gridSize, blockSize, 0, stream>>>(
-        offset, size, total_rays,
+    fetchRayChunkStreamingKernel<<<gridSize, blockSize, 0, stream>>>(
+        offset, size, total_rays, seed, m_is_training,
         width, height, focal_length,
-        d_transforms, d_images_rgba, d_shuffled_indices,
+        d_transforms, d_images_rgba,
         d_chunk_rays_o, d_chunk_rays_d, d_chunk_rgb_true,
         bg_color
     );
 }
+

@@ -6,68 +6,53 @@
 
 class DataLoader {
 public:
-    DataLoader(const std::string& dataset_path, bool is_training = true);
+    DataLoader(const std::string& dataset_path, uint32_t ray_chunk_size, bool is_training = true);
     ~DataLoader();
 
-    // Generates rays for all loaded images and pushes them to VRAM
-    void loadDataToGPU();
-
-    // Getters for chunk pointers
     const float3* getChunkRaysO() const { return d_chunk_rays_o; }
     const float3* getChunkRaysD() const { return d_chunk_rays_d; }
     const float* getChunkRgbTrue() const { return d_chunk_rgb_true; }
 
-    // Shuffles the pixel indices on the GPU
-    void shuffleRays(cudaStream_t stream = 0);
-
-    // Dynamically generates a chunk of rays on the GPU
-    void fetchRayChunk(int offset, int size, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0);
-
-    // Frees the compact VRAM arrays
+    void loadDataToGPU();
+    void fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0);
     void freeVRAM();
 
     uint32_t getTotalRays() const { return total_rays; }
     int getWidth() const { return width; }
     int getHeight() const { return height; }
+    float getCameraAngleX() const { return camera_angle_x; }
 
 private:
     std::string dataset_path;
-    bool is_training;
-
-    void* gen; // curandGenerator_t hidden as void* to avoid pulling curand.h in the header
+    bool m_is_training;
 
     int width;
     int height;
+    
     float camera_angle_x;
     float focal_length;
-    uint32_t total_rays;
+    uint32_t  m_ray_chunk_size;
 
     struct Frame {
         std::string file_path;
-        float transform_matrix[16]; // 4x4 matrix
+        float transform_matrix[16];
     };
 
     std::vector<Frame> frames;
-    // Replaced full vectors with a byte array for images
-    std::vector<uint8_t> h_images_rgba; // CPU buffer for 8-bit images
-
-    // GPU Buffers for compact representation
+    
+    // Pinned host memory and mapped device pointer
+    uint8_t* h_images_rgba = nullptr;
     uint8_t* d_images_rgba = nullptr;
+    
+    // GPU Buffers
     float* d_transforms = nullptr;
-
-    // GPU chunk buffers (sized for rayChunkSize)
     float3* d_chunk_rays_o = nullptr;
     float3* d_chunk_rays_d = nullptr;
     float* d_chunk_rgb_true = nullptr;
 
-    // GPU shuffle indices
-    uint32_t* d_indices = nullptr;
-    uint32_t* d_shuffled_indices = nullptr;
-    float* d_random_keys = nullptr;
-    void* d_temp_storage = nullptr;
-    size_t temp_storage_bytes = 0;
+    uint32_t total_rays;
+
 
     void parseTransformsJson();
     void loadImages();
-    void setupCUBShuffle();
 };

@@ -24,6 +24,10 @@ add_library(NeRFModule STATIC
     DeviceBuffer.h
     Timers.h
     DataLoader.cu
+    Pipeline.cu
+    Pipeline.h
+    RenderKernels.cu
+    RenderKernels.h
 )
 
 # Headers from TinyMLP module

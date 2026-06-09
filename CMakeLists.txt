@@ -56,6 +56,8 @@ file(GLOB RMLUI_BACKEND_SOURCES
     "${RMLUI_BACKEND_DIR}/RmlUi_Renderer_GL3.cpp"
 )
 
+set(TINYMLP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(NERF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(modules/NeRF)
 add_subdirectory(modules/TinyMLP)
 
@@ -74,5 +76,26 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules
     ${RMLUI_BACKEND_DIR}
+)
+
+add_executable(3DViewer src/render.cpp ${RMLUI_BACKEND_SOURCES})
+
+target_link_libraries(3DViewer PRIVATE
+    NeRFModule
+    TinyMLP
+    glfw
+    OpenGL::GL
+    RmlUi::RmlUi
+    RmlUi::Core
+    RmlUi::Debugger
+    freetype
+)
+
+target_include_directories(3DViewer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules
+    ${RMLUI_BACKEND_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
