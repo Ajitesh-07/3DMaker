@@ -10,11 +10,9 @@
 #include <NeRF/InstantNerf.h>
 #include <NeRF/RenderKernels.h>
 
-// We use the bundled JSON library to parse the transforms.json
 #include "../third_party/json.hpp"
 using json = nlohmann::json;
 
-// --- Globals for Camera ---
 float g_yaw = 0.0f;
 float g_pitch = 30.0f * (3.14159265f / 180.0f);
 float g_radius = 1.5f;
@@ -46,9 +44,8 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
 
     if (g_leftMouseDown) {
         g_yaw -= dx * 0.005f;
-        g_pitch += dy * 0.005f; // Flipped sign so dragging UP moves object UP (orbit down)
-        
-        // Clamp pitch to avoid gimbal lock and flipping
+        g_pitch += dy * 0.005f;
+
         if (g_pitch > 1.5f) g_pitch = 1.5f;
         if (g_pitch < -1.5f) g_pitch = -1.5f;
     }
@@ -76,7 +73,6 @@ int main(int argc, char** argv) {
     std::string transforms_path = argv[1];
     std::string model_path = argv[2];
 
-    // 1. Parse focal length and initial camera position from JSON
     float camera_angle_x = 0.69f;
     try {
         std::ifstream f(transforms_path);
@@ -85,7 +81,6 @@ int main(int argc, char** argv) {
             camera_angle_x = data["camera_angle_x"];
         }
         
-        // Extract initial position from the first frame's transform_matrix
         if (data.contains("frames") && data["frames"].is_array() && data["frames"].size() > 0) {
             auto matrix = data["frames"][0]["transform_matrix"];
             float px = matrix[0][3];
@@ -97,7 +92,7 @@ int main(int argc, char** argv) {
             float zc_z = matrix[2][2];
             
             g_radius = px*zc_x + py*zc_y + pz*zc_z;
-            if (g_radius < 0.1f) g_radius = 1.0f; // fallback
+            if (g_radius < 0.1f) g_radius = 1.0f;
             
             g_targetX = px - g_radius * zc_x;
             g_targetY = py - g_radius * zc_y;
@@ -114,7 +109,6 @@ int main(int argc, char** argv) {
         std::cerr << "Warning: Failed to parse from " << transforms_path << ". Using defaults." << std::endl;
     }
 
-    // 2. Initialize GLFW and OpenGL Context
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
         return 1;
@@ -142,19 +136,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 3. Initialize NeRF
     cudaSetDevice(0);
     InstantNerf nerf;
     
     std::cout << "Loading NeRF model: " << model_path << std::endl;
     nerf.load(model_path);
-    nerf.setMemoryMode(INFERENCE); // Required after loading to allocate inference buffers
+    nerf.setMemoryMode(INFERENCE);
     nerf.setBgColor(make_float3(1.0f, 1.0f, 1.0f));
     nerf.setProfiling(false);
 
     int pixels = window_width * window_height;
     
-    // Allocate CUDA buffers for rays and HDR output
     float3* d_rays_o;
     float3* d_rays_d;
     float* d_hdr_rgb;
@@ -162,7 +154,6 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_rays_d, pixels * sizeof(float3));
     cudaMalloc(&d_hdr_rgb, pixels * 3 * sizeof(float));
 
-    // 4. Setup OpenGL PBO for Zero-Copy CUDA to OpenGL Interop
     GLuint pbo;
     glGenBuffers(1, &pbo);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
@@ -172,7 +163,6 @@ int main(int argc, char** argv) {
     cudaGraphicsResource* cuda_pbo_resource;
     cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard);
 
-    // Setup OpenGL Texture
     GLuint texture;
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
@@ -180,14 +170,13 @@ int main(int argc, char** argv) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, window_width, window_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
-    // Full-screen quad setup (Legacy pipeline is easiest for simple blitting, but we use core profile, so we need a minimal shader)
     const char* vertexShaderSource = "#version 330 core\n"
         "out vec2 TexCoord;\n"
         "void main() {\n"
         "    float x = -1.0 + float((gl_VertexID & 1) << 2);\n"
         "    float y = -1.0 + float((gl_VertexID & 2) << 1);\n"
         "    TexCoord.x = (x+1.0)*0.5;\n"
-        "    TexCoord.y = 1.0 - (y+1.0)*0.5;\n" // Flip Y for OpenGL texture coordinates
+        "    TexCoord.y = 1.0 - (y+1.0)*0.5;\n" 
         "    gl_Position = vec4(x, y, 0, 1);\n"
         "}\0";
     
@@ -212,7 +201,6 @@ int main(int argc, char** argv) {
     glAttachShader(shaderProgram, fragmentShader);
     glLinkProgram(shaderProgram);
 
-    // Empty VAO is sufficient for gl_VertexID trick
     GLuint VAO;
     glGenVertexArrays(1, &VAO);
 
@@ -233,7 +221,6 @@ int main(int argc, char** argv) {
             lastTime = currentTime;
         }
 
-        // Compute Camera Math
         float pz = g_radius * sinf(g_pitch);
         float r_xy = g_radius * cosf(g_pitch);
         float px = r_xy * cosf(g_yaw);
@@ -250,7 +237,6 @@ int main(int argc, char** argv) {
         float yc_y = zc_z * xc_x - zc_x * xc_z;
         float yc_z = zc_x * xc_y - zc_y * xc_x;
 
-        // Apply Middle Mouse Panning
         if (g_panDeltaX != 0.0f || g_panDeltaY != 0.0f) {
             float dx = g_panDeltaX * 0.001f * g_radius;
             float dy = g_panDeltaY * 0.001f * g_radius;
@@ -263,18 +249,15 @@ int main(int argc, char** argv) {
             g_panDeltaY = 0.0f;
         }
 
-        // Final world coordinates include the target offset
         px += g_targetX;
         py += g_targetY;
         pz += g_targetZ;
 
-        // Map PBO for CUDA Zero-Copy
         uint8_t* d_rgba_byte;
         size_t num_bytes;
         cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
         cudaGraphicsResourceGetMappedPointer((void**)&d_rgba_byte, &num_bytes, cuda_pbo_resource);
 
-        // Generate Rays & Render
         wrapper_generate_custom_rays(
             window_width, window_height, focal_length,
             xc_x, yc_x, zc_x, px,
@@ -287,13 +270,11 @@ int main(int argc, char** argv) {
         nerf.renderImage(d_rays_o, d_rays_d, pixels, d_hdr_rgb, 0);
         cudaDeviceSynchronize();
 
-        // Convert Float to RGBA Byte Directly into PBO
         wrapper_float_to_byte(d_hdr_rgb, d_rgba_byte, pixels, 0);
         cudaDeviceSynchronize();
 
         cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 
-        // Render OpenGL Texture
         glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(shaderProgram);
 

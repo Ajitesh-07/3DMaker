@@ -4,7 +4,6 @@
 #include <filesystem>
 #include <cstdlib>
 
-// Clean library import as requested!
 #include <NeRF/Pipeline.h>
 
 namespace fs = std::filesystem;
@@ -23,7 +22,6 @@ int main(int argc, char** argv) {
     fs::path dataset_dir(dataset_path);
     std::string python_arg = dataset_path;
     
-    // If it's a video file, the python script will output to a folder of the same name.
     if (fs::is_regular_file(dataset_dir)) {
         dataset_dir = dataset_dir.parent_path() / dataset_dir.stem();
         dataset_path = dataset_dir.string();
@@ -68,8 +66,7 @@ int main(int argc, char** argv) {
     std::cout << "       Starting 3DMaker NeRF Training       \n";
     std::cout << "============================================\n\n";
 
-    // Call the encapsulated CUDA training pipeline from our library!
-    run_training_pipeline(dataset_path, 10, 5000);
+    run_training_pipeline(dataset_path, 10, 4000);
 
     return 0;
 }
