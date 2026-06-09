@@ -8,9 +8,9 @@
 #include "../TinyMLP.h"
 
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h" // Since you put it in the images folder
+#include "../stb_image.h" // Since you put it in the images folder
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include "../stb_image_write.h"
 
 using namespace std;
 

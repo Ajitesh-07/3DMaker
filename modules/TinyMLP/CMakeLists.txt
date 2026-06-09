@@ -24,7 +24,7 @@ add_library(TinyMLP STATIC
 # SM 8.0 = Ampere, 8.9 = Ada Lovelace (RTX 4060).
 # Minimum for WMMA half-precision is SM 7.0 (Volta).
 set_target_properties(TinyMLP PROPERTIES
-    CUDA_ARCHITECTURES "80;89"
+    CUDA_ARCHITECTURES "86;89"
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
@@ -59,7 +59,7 @@ option(TINYMLP_BUILD_TESTS "Build TinyMLP self-test and benchmark" OFF)
 if(TINYMLP_BUILD_TESTS)
     add_executable(test_networkfusion tests_kernels/testNetworkFusion.cu)
         set_target_properties(test_networkfusion PROPERTIES
-        CUDA_ARCHITECTURES "80;89"
+        CUDA_ARCHITECTURES "86;89"
     )
     target_compile_options(test_networkfusion PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
@@ -68,7 +68,7 @@ if(TINYMLP_BUILD_TESTS)
 
     add_executable(test_fusionbackward tests_kernels/testFusionBackward.cu)
         set_target_properties(test_networkfusion PROPERTIES
-        CUDA_ARCHITECTURES "80;89"
+        CUDA_ARCHITECTURES "86;89"
     )
     target_compile_options(test_fusionbackward PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
@@ -77,7 +77,7 @@ if(TINYMLP_BUILD_TESTS)
 
     add_executable(test_optimizer tests_kernels/testOptimizer.cu)
         set_target_properties(test_optimizer PROPERTIES
-        CUDA_ARCHITECTURES "80;89"
+        CUDA_ARCHITECTURES "86;89"
     )
     target_compile_options(test_optimizer PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
@@ -86,7 +86,7 @@ if(TINYMLP_BUILD_TESTS)
 
     add_executable(test_mlp tests_kernels/testMlp.cu)
         set_target_properties(test_mlp PROPERTIES
-        CUDA_ARCHITECTURES "80;89"
+        CUDA_ARCHITECTURES "86;89"
     )
     target_compile_options(test_mlp PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
@@ -102,7 +102,7 @@ if(TINYMLP_BUILD_TESTS)
 
     add_executable(test_forward tests_kernels/testNetworkFusionHashtable.cu)
         set_target_properties(test_forward PROPERTIES
-        CUDA_ARCHITECTURES "80;89"
+        CUDA_ARCHITECTURES "80;86;89"
     )
     target_compile_options(test_forward PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
@@ -111,7 +111,7 @@ if(TINYMLP_BUILD_TESTS)
 
     add_executable(test_backward tests_kernels/testFusionBackwardHashtable.cu)
         set_target_properties(test_forward PROPERTIES
-        CUDA_ARCHITECTURES "80;89"
+        CUDA_ARCHITECTURES "80;86;89"
     )
     target_compile_options(test_backward PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
