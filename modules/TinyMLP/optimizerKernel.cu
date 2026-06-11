@@ -4,6 +4,15 @@
 #include <cstdint>
 #include "TinyMLPHashGrid.h"
 
+// Returns x if it is a finite number, otherwise 0.0f.
+// Used to make the Adam update self-healing: a single transient Inf/NaN
+// gradient (e.g. from an fp16 activation overflow on dense real-world scenes)
+// must never be allowed to permanently poison the moments / master weights,
+// which is what makes "loss -> NaN and never recovers" happen.
+__device__ __forceinline__ float finite_or_zero(float x) {
+    return isfinite(x) ? x : 0.0f;
+}
+
 __global__ void fusedAdamWeightsOptim(
     float** __restrict__ master_weights,
     half** __restrict__ fwd_weights,
@@ -30,10 +39,13 @@ __global__ void fusedAdamWeightsOptim(
     int numElements = in_d * out_d;
 
     if (idx < numElements) {
-        float g = gradients[layer][idx] * inv_loss_scale;
-        float m_val = m[layer][idx];
-        float v_val = v[layer][idx];
-        float w_val = master_weights[layer][idx]; 
+        // Drop non-finite gradients and recover already-corrupted moments so the
+        // optimizer state can never get stuck at NaN/Inf.
+        float g = finite_or_zero(gradients[layer][idx] * inv_loss_scale);
+        float m_val = finite_or_zero(m[layer][idx]);
+        float v_val = finite_or_zero(v[layer][idx]);
+        float w_val = master_weights[layer][idx];
+        if (!isfinite(w_val)) w_val = 0.0f;
 
         m_val = beta1 * m_val + (1.0f - beta1) * g;
         v_val = beta2 * v_val + (1.0f - beta2) * g * g;
@@ -42,6 +54,7 @@ __global__ void fusedAdamWeightsOptim(
         float v_hat = v_val / bias_correction2;
 
         w_val = w_val - (lr * m_hat / (sqrtf(v_hat) + epsilon));
+        if (!isfinite(w_val)) w_val = 0.0f;
 
         m[layer][idx] = m_val;
         v[layer][idx] = v_val;
@@ -73,11 +86,12 @@ __global__ void fusedAdamBiasOptim(
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < out_d) {
-        // 1. Read everything and unscale gradient
-        float g = gradients[layer][idx] * inv_loss_scale;
-        float m_val = m[layer][idx];
-        float v_val = v[layer][idx];
-        float b_val = biases[layer][idx]; 
+        // 1. Read everything and unscale gradient (drop non-finite values)
+        float g = finite_or_zero(gradients[layer][idx] * inv_loss_scale);
+        float m_val = finite_or_zero(m[layer][idx]);
+        float v_val = finite_or_zero(v[layer][idx]);
+        float b_val = biases[layer][idx];
+        if (!isfinite(b_val)) b_val = 0.0f;
 
         // 2. Update biased moments
         m_val = beta1 * m_val + (1.0f - beta1) * g;
@@ -89,6 +103,7 @@ __global__ void fusedAdamBiasOptim(
 
         // 4. Update bias in pure FP32
         b_val = b_val - (lr * m_hat / (sqrtf(v_hat) + epsilon));
+        if (!isfinite(b_val)) b_val = 0.0f;
 
         // 5. Write back to global memory
         m[layer][idx] = m_val;
@@ -129,15 +144,21 @@ __global__ void fusedAdamHashGridOptim(
     if (g_raw == 0.0f) return;   // Nothing to do — skip m/v/master reads entirely
     gradients[flat] = 0.0f;      // Zero for next step (eliminates separate memset)
 
-    float g = g_raw * inv_loss_scale;
+    // Drop non-finite gradients and recover already-corrupted moments. An fp16
+    // hash-feature overflow on a dense real-world scene produces Inf grads here;
+    // without this guard m/v latch to NaN and every weight goes NaN permanently.
+    float g = finite_or_zero(g_raw * inv_loss_scale);
 
-    float m_val = beta1 * m[flat] + (1.0f - beta1) * g;
-    float v_val = beta2 * v[flat] + (1.0f - beta2) * g * g;
+    float m_val = beta1 * finite_or_zero(m[flat]) + (1.0f - beta1) * g;
+    float v_val = beta2 * finite_or_zero(v[flat]) + (1.0f - beta2) * g * g;
 
     float m_hat = m_val / bias_correction1;
     float v_hat = v_val / bias_correction2;
 
-    float w_val = master_hash[flat] - lr * m_hat / (sqrtf(v_hat) + epsilon);
+    float w_val = master_hash[flat];
+    if (!isfinite(w_val)) w_val = 0.0f;
+    w_val = w_val - lr * m_hat / (sqrtf(v_hat) + epsilon);
+    if (!isfinite(w_val)) w_val = 0.0f;
 
     m[flat]           = m_val;
     v[flat]           = v_val;

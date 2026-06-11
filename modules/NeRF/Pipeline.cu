@@ -1,4 +1,4 @@
-#include "InstantNerf.h"
+﻿#include "InstantNerf.h"
 #include "DataLoader.h"
 #include <iostream>
 #include <cuda_runtime.h>
@@ -133,9 +133,14 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
     int total_chunks = totalEpochs * chunks_per_epoch;
     int current_chunk = 0;
     
-    // Cosine Annealing Learning Rate limits
+    // Cosine Annealing Learning Rate limits.
+    // NOTE: min_lr must be well below max_lr or the cosine schedule below is a
+    // no-op and the LR stays pinned at the (high) max for all of training. A
+    // constant 1e-2 LR is a major instability source late in training â€” exactly
+    // when the hash grid has learned large features and gradients spike â€” so we
+    // decay down to a small floor to keep late-stage updates stable.
     float max_lr = opts.learningRate;
-    float min_lr = 1e-2f;
+    float min_lr = 1e-4f;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -330,27 +335,51 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
 
     nerf.setBgColor(make_float3(1.0f, 1.0f, 1.0f));
     
+        float3 center, up;
+    dataset.getSceneOrientation(center, up);
+
+    float O_up[3] = {up.x, up.y, up.z};
+    float O_forward[3] = {1.0f, 0.0f, 0.0f};
+    if (abs(O_up[0]) > 0.9f) { O_forward[0] = 0.0f; O_forward[1] = 1.0f; O_forward[2] = 0.0f; }
+    float dot_uf = O_up[0]*O_forward[0] + O_up[1]*O_forward[1] + O_up[2]*O_forward[2];
+    O_forward[0] -= dot_uf * O_up[0]; O_forward[1] -= dot_uf * O_up[1]; O_forward[2] -= dot_uf * O_up[2];
+    float len_f = sqrtf(O_forward[0]*O_forward[0] + O_forward[1]*O_forward[1] + O_forward[2]*O_forward[2]);
+    if(len_f>0){O_forward[0]/=len_f; O_forward[1]/=len_f; O_forward[2]/=len_f;}
+    
+    float O_right[3] = {
+        O_up[1]*O_forward[2] - O_up[2]*O_forward[1],
+        O_up[2]*O_forward[0] - O_up[0]*O_forward[2],
+        O_up[0]*O_forward[1] - O_up[1]*O_forward[0]
+    };
+
     // Fly a virtual camera in a circle around the model
     for (int frame = 0; frame < 120; ++frame) {
         float angle = frame * (2.0f * 3.14159265f / 120.0f);
         float scale = 1.0f;
-        float radius = 1.2f * scale; // Keep radius inside the [-1.5, 1.5] bounding box
+        float radius = 4.0311f * scale; 
         float elev = 30.0f * 3.14159265f / 180.0f; // 30 degrees elevation
         
-        float pz = radius * sinf(elev);
+        float r_z = radius * sinf(elev);
         float r_xy = radius * cosf(elev);
-        float px = r_xy * cosf(angle);
-        float py = r_xy * sinf(angle);
+        float local_x = r_xy * cosf(angle);
+        float local_y = r_xy * sinf(angle);
+        float local_z = r_z;
 
-        // Z_c points BACKWARDS from camera to origin (since camera looks at -Z)
-        float zc_x = px / radius, zc_y = py / radius, zc_z = pz / radius;
+        float cx = center.x + O_forward[0]*local_x + O_right[0]*local_y + O_up[0]*local_z;
+        float cy = center.y + O_forward[1]*local_x + O_right[1]*local_y + O_up[1]*local_z;
+        float cz = center.z + O_forward[2]*local_x + O_right[2]*local_y + O_up[2]*local_z;
 
-        // X_c points RIGHT. World UP is (0,0,1). X_c = normalize(cross(UP, Z_c))
-        float xc_x = -zc_y, xc_y = zc_x, xc_z = 0.0f;
-        float len_x = sqrtf(xc_x*xc_x + xc_y*xc_y);
-        if (len_x > 0.0f) { xc_x /= len_x; xc_y /= len_x; }
+        float zc_x = cx - center.x, zc_y = cy - center.y, zc_z = cz - center.z;
+        float len_zc = sqrtf(zc_x*zc_x + zc_y*zc_y + zc_z*zc_z);
+        if(len_zc > 0) { zc_x/=len_zc; zc_y/=len_zc; zc_z/=len_zc; }
 
-        // Y_c points UP. Y_c = cross(Z_c, X_c)
+        float xc_x = O_up[1]*zc_z - O_up[2]*zc_y;
+        float xc_y = O_up[2]*zc_x - O_up[0]*zc_z;
+        float xc_z = O_up[0]*zc_y - O_up[1]*zc_x;
+        float len_xc = sqrtf(xc_x*xc_x + xc_y*xc_y + xc_z*xc_z);
+        if (len_xc > 0.0f) { xc_x /= len_xc; xc_y /= len_xc; xc_z /= len_xc; }
+        else { xc_x = O_right[0]; xc_y = O_right[1]; xc_z = O_right[2]; }
+
         float yc_x = zc_y * xc_z - zc_z * xc_y;
         float yc_y = zc_z * xc_x - zc_x * xc_z;
         float yc_z = zc_x * xc_y - zc_y * xc_x;
@@ -358,12 +387,11 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
         int blocks = (video_pixels + 255) / 256;
         generate_custom_rays_kernel<<<blocks, 256>>>(
             video_w, video_h, focal_length,
-            xc_x, yc_x, zc_x, px,
-            xc_y, yc_y, zc_y, py,
-            xc_z, yc_z, zc_z, pz,
+            xc_x, yc_x, zc_x, cx,
+            xc_y, yc_y, zc_y, cy,
+            xc_z, yc_z, zc_z, cz,
             (float3*)d_video_rays_o, (float3*)d_video_rays_d
-        );
-        CUDA_CHECK(cudaDeviceSynchronize());
+        );        CUDA_CHECK(cudaDeviceSynchronize());
 
         nerf.renderImage((float3*)d_video_rays_o, (float3*)d_video_rays_d, video_pixels, d_video_out);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -400,3 +428,4 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
 
     std::cout << "Training Complete." << std::endl;
 }
+

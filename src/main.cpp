@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     std::cout << "       Starting 3DMaker NeRF Training       \n";
     std::cout << "============================================\n\n";
 
-    run_training_pipeline(dataset_path, 10, 4000);
+    run_training_pipeline(dataset_path, 10);
 
     return 0;
 }

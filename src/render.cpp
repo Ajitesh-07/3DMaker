@@ -1,4 +1,4 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 #include <RmlUi_Include_GL3.h>
 #include <GLFW/glfw3.h>
 #include <cuda_runtime.h>
@@ -19,6 +19,9 @@ float g_radius = 1.5f;
 float g_targetX = 0.0f;
 float g_targetY = 0.0f;
 float g_targetZ = 0.0f;
+
+float g_world_up[3] = {0.0f, 0.0f, 1.0f};
+float g_scene_center[3] = {0.0f, 0.0f, 0.0f};
 
 bool g_leftMouseDown = false;
 bool g_middleMouseDown = false;
@@ -45,7 +48,6 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
     if (g_leftMouseDown) {
         g_yaw -= dx * 0.005f;
         g_pitch += dy * 0.005f;
-
         if (g_pitch > 1.5f) g_pitch = 1.5f;
         if (g_pitch < -1.5f) g_pitch = -1.5f;
     }
@@ -82,6 +84,31 @@ int main(int argc, char** argv) {
         }
         
         if (data.contains("frames") && data["frames"].is_array() && data["frames"].size() > 0) {
+            float sum_px = 0.0f, sum_py = 0.0f, sum_pz = 0.0f;
+            float sum_ux = 0.0f, sum_uy = 0.0f, sum_uz = 0.0f;
+            int count = data["frames"].size();
+            for (auto& frame : data["frames"]) {
+                auto matrix = frame["transform_matrix"];
+                sum_px += (float)matrix[0][3];
+                sum_py += (float)matrix[1][3];
+                sum_pz += (float)matrix[2][3];
+                sum_ux += (float)matrix[0][1];
+                sum_uy += (float)matrix[1][1];
+                sum_uz += (float)matrix[2][1];
+            }
+            if (count > 0) {
+                g_scene_center[0] = sum_px / count;
+                g_scene_center[1] = sum_py / count;
+                g_scene_center[2] = sum_pz / count;
+                
+                float len_u = sqrtf(sum_ux*sum_ux + sum_uy*sum_uy + sum_uz*sum_uz);
+                if (len_u > 0) {
+                    g_world_up[0] = sum_ux / len_u;
+                    g_world_up[1] = sum_uy / len_u;
+                    g_world_up[2] = sum_uz / len_u;
+                }
+            }
+
             auto matrix = data["frames"][0]["transform_matrix"];
             float px = matrix[0][3];
             float py = matrix[1][3];
@@ -91,19 +118,12 @@ int main(int argc, char** argv) {
             float zc_y = matrix[1][2];
             float zc_z = matrix[2][2];
             
-            g_radius = px*zc_x + py*zc_y + pz*zc_z;
+            float rel_cx = px - g_scene_center[0];
+            float rel_cy = py - g_scene_center[1];
+            float rel_cz = pz - g_scene_center[2];
+            
+            g_radius = sqrtf(rel_cx*rel_cx + rel_cy*rel_cy + rel_cz*rel_cz);
             if (g_radius < 0.1f) g_radius = 1.0f;
-            
-            g_targetX = px - g_radius * zc_x;
-            g_targetY = py - g_radius * zc_y;
-            g_targetZ = pz - g_radius * zc_z;
-            
-            float rel_x = g_radius * zc_x;
-            float rel_y = g_radius * zc_y;
-            float rel_z = g_radius * zc_z;
-            
-            g_pitch = std::asin(rel_z / g_radius);
-            g_yaw = std::atan2(rel_y, rel_x);
         }
     } catch (std::exception& e) {
         std::cerr << "Warning: Failed to parse from " << transforms_path << ". Using defaults." << std::endl;
@@ -221,21 +241,58 @@ int main(int argc, char** argv) {
             lastTime = currentTime;
         }
 
-        float pz = g_radius * sinf(g_pitch);
+        // Orbit basis
+        float O_up[3] = {g_world_up[0], g_world_up[1], g_world_up[2]};
+        float O_forward[3] = {1.0f, 0.0f, 0.0f};
+        if (abs(O_up[0]) > 0.9f) { O_forward[0] = 0.0f; O_forward[1] = 1.0f; O_forward[2] = 0.0f; }
+        
+        float dot_uf = O_up[0]*O_forward[0] + O_up[1]*O_forward[1] + O_up[2]*O_forward[2];
+        O_forward[0] -= dot_uf * O_up[0]; 
+        O_forward[1] -= dot_uf * O_up[1]; 
+        O_forward[2] -= dot_uf * O_up[2];
+        
+        float len_f = sqrtf(O_forward[0]*O_forward[0] + O_forward[1]*O_forward[1] + O_forward[2]*O_forward[2]);
+        if(len_f > 0){O_forward[0]/=len_f; O_forward[1]/=len_f; O_forward[2]/=len_f;}
+        
+        float O_right[3] = {
+            O_up[1]*O_forward[2] - O_up[2]*O_forward[1],
+            O_up[2]*O_forward[0] - O_up[0]*O_forward[2],
+            O_up[0]*O_forward[1] - O_up[1]*O_forward[0]
+        };
+
+        float r_z = g_radius * sinf(g_pitch);
         float r_xy = g_radius * cosf(g_pitch);
-        float px = r_xy * cosf(g_yaw);
-        float py = r_xy * sinf(g_yaw);
+        float local_x = r_xy * cosf(g_yaw);
+        float local_y = r_xy * sinf(g_yaw);
+        float local_z = r_z;
 
-        float zc_x = px / g_radius, zc_y = py / g_radius, zc_z = pz / g_radius;
+        float cx = g_scene_center[0] + O_forward[0]*local_x + O_right[0]*local_y + O_up[0]*local_z;
+        float cy = g_scene_center[1] + O_forward[1]*local_x + O_right[1]*local_y + O_up[1]*local_z;
+        float cz = g_scene_center[2] + O_forward[2]*local_x + O_right[2]*local_y + O_up[2]*local_z;
 
-        float xc_x = -zc_y, xc_y = zc_x, xc_z = 0.0f;
-        float len_x = sqrtf(xc_x*xc_x + xc_y*xc_y);
-        if (len_x > 0.0f) { xc_x /= len_x; xc_y /= len_x; }
-        else { xc_x = 1.0f; xc_y = 0.0f; xc_z = 0.0f; }
+        cx += g_targetX;
+        cy += g_targetY;
+        cz += g_targetZ;
 
-        float yc_x = zc_y * xc_z - zc_z * xc_y;
-        float yc_y = zc_z * xc_x - zc_x * xc_z;
-        float yc_z = zc_x * xc_y - zc_y * xc_x;
+        float look_x = g_scene_center[0] + g_targetX;
+        float look_y = g_scene_center[1] + g_targetY;
+        float look_z = g_scene_center[2] + g_targetZ;
+        
+        float zc_x = cx - look_x, zc_y = cy - look_y, zc_z = cz - look_z;
+        float len_zc = sqrtf(zc_x*zc_x + zc_y*zc_y + zc_z*zc_z);
+        if(len_zc > 0) { zc_x/=len_zc; zc_y/=len_zc; zc_z/=len_zc; }
+
+        float xc_x = O_up[1]*zc_z - O_up[2]*zc_y;
+        float xc_y = O_up[2]*zc_x - O_up[0]*zc_z;
+        float xc_z = O_up[0]*zc_y - O_up[1]*zc_x;
+        float len_xc = sqrtf(xc_x*xc_x + xc_y*xc_y + xc_z*xc_z);
+        
+        if(len_xc > 0) { xc_x/=len_xc; xc_y/=len_xc; xc_z/=len_xc; }
+        else { xc_x = O_right[0]; xc_y = O_right[1]; xc_z = O_right[2]; }
+
+        float yc_x = zc_y*xc_z - zc_z*xc_y;
+        float yc_y = zc_z*xc_x - zc_x*xc_z;
+        float yc_z = zc_x*xc_y - zc_y*xc_x;
 
         if (g_panDeltaX != 0.0f || g_panDeltaY != 0.0f) {
             float dx = g_panDeltaX * 0.001f * g_radius;
@@ -249,10 +306,6 @@ int main(int argc, char** argv) {
             g_panDeltaY = 0.0f;
         }
 
-        px += g_targetX;
-        py += g_targetY;
-        pz += g_targetZ;
-
         uint8_t* d_rgba_byte;
         size_t num_bytes;
         cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
@@ -260,9 +313,9 @@ int main(int argc, char** argv) {
 
         wrapper_generate_custom_rays(
             window_width, window_height, focal_length,
-            xc_x, yc_x, zc_x, px,
-            xc_y, yc_y, zc_y, py,
-            xc_z, yc_z, zc_z, pz,
+            xc_x, yc_x, zc_x, cx,
+            xc_y, yc_y, zc_y, cy,
+            xc_z, yc_z, zc_z, cz,
             d_rays_o, d_rays_d, 0
         );
         cudaDeviceSynchronize();

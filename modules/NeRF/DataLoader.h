@@ -20,6 +20,31 @@ public:
     uint32_t getTotalRays() const { return total_rays; }
     int getWidth() const { return width; }
     int getHeight() const { return height; }
+
+    void getSceneOrientation(float3& center, float3& up) const {
+        if (frames.empty()) {
+            center = make_float3(0, 0, 0);
+            up = make_float3(0, 0, 1);
+            return;
+        }
+        float sum_px = 0, sum_py = 0, sum_pz = 0;
+        float sum_ux = 0, sum_uy = 0, sum_uz = 0;
+        for (const auto& f : frames) {
+            sum_px += f.transform_matrix[3];
+            sum_py += f.transform_matrix[7];
+            sum_pz += f.transform_matrix[11];
+            sum_ux += f.transform_matrix[1];
+            sum_uy += f.transform_matrix[5];
+            sum_uz += f.transform_matrix[9];
+        }
+        center = make_float3(sum_px / frames.size(), sum_py / frames.size(), sum_pz / frames.size());
+        float len = sqrtf(sum_ux*sum_ux + sum_uy*sum_uy + sum_uz*sum_uz);
+        if (len > 0) {
+            up = make_float3(sum_ux/len, sum_uy/len, sum_uz/len);
+        } else {
+            up = make_float3(0, 0, 1);
+        }
+    }
     float getCameraAngleX() const { return camera_angle_x; }
 
 private:

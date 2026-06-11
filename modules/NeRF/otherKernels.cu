@@ -191,6 +191,24 @@ __global__ void compute_SH_gather(
     float4 d811  = densityOut_vec[2];
     float4 d1215 = densityOut_vec[3];
 
+    // Sanitize the raw density logits before they (a) drive sigma via expf and
+    // (b) get packed into fp16 as the color-MLP input. On dense real-world
+    // scenes a logit can blow past the fp16 range; left unchecked it becomes an
+    // Inf/NaN color input that taints the loss. Clamp to a safe fp16-representable
+    // band and scrub NaNs so neither path can carry a non-finite value forward.
+    auto sanitize_logit = [](float v) -> float {
+        v = fmaxf(-30000.0f, fminf(30000.0f, v));
+        return (v != v) ? 0.0f : v;
+    };
+    d03.x = sanitize_logit(d03.x); d03.y = sanitize_logit(d03.y);
+    d03.z = sanitize_logit(d03.z); d03.w = sanitize_logit(d03.w);
+    d47.x = sanitize_logit(d47.x); d47.y = sanitize_logit(d47.y);
+    d47.z = sanitize_logit(d47.z); d47.w = sanitize_logit(d47.w);
+    d811.x = sanitize_logit(d811.x); d811.y = sanitize_logit(d811.y);
+    d811.z = sanitize_logit(d811.z); d811.w = sanitize_logit(d811.w);
+    d1215.x = sanitize_logit(d1215.x); d1215.y = sanitize_logit(d1215.y);
+    d1215.z = sanitize_logit(d1215.z); d1215.w = sanitize_logit(d1215.w);
+
     d_density_sigma[idx] = expf(fminf(d03.x - densityBias, 8.0f));
 
     // Pack 16 floats into 4 float4s (8 halfs per float4)
