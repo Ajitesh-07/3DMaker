@@ -7,32 +7,15 @@
 #include <fstream>
 #include <chrono>
 
-void sampleNonUniform(
-    float* d_samples,
-    uint8_t* d_occupancy_grid,
-    int* d_activeCellIndices,
-    int* d_numActiveCells,
-    int totalCells,
-    float3 aabbMin,
-    float3 aabbMax,
-    uint3 gridResolution,
-    int N,
-    unsigned long long seed = 42ULL,
-    cudaStream_t stream = 0
-) {
-    cudaMemsetAsync(d_numActiveCells, 0, sizeof(int), stream);
-
-    int threads = 256;
-    int blocks = (totalCells + threads - 1) / threads;
-    extractActiveCells<<<blocks, threads, 0, stream>>>(
-        d_occupancy_grid, d_activeCellIndices, d_numActiveCells, totalCells
-    );
-
-    blocks = (N + threads - 1) / threads;
-    sampleOccupiedAABB<<<blocks, threads, 0, stream>>>(
-        d_samples, d_activeCellIndices, d_numActiveCells, 
-        aabbMin, aabbMax, gridResolution, N, seed
-    );
+// Total cells of one cascade's pyramid (level-0 + every mip level) = the per-cascade
+// stride 'S' used by the bitgrid layout the marcher reads (cascade*S + level_offset + voxel).
+static inline int pyramidCellsPerCascade(uint3 res, int levels) {
+    int s = 0;
+    for (int l = 0; l < levels; ++l) {
+        s += (int)(res.x * res.y * res.z);
+        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    }
+    return s;
 }
 
 std::vector<uint32_t> get_chunk_boundaries_cpu(
@@ -186,8 +169,12 @@ void InstantNerf::initRenderBuffers()
     m_render_buffers.d_active_rays_count = DeviceBuffer<uint32_t>(1);
     m_render_buffers.d_num_steps = DeviceBuffer<uint32_t>(m_opts.rayChunkSize);
     m_render_buffers.d_ray_offsets = DeviceBuffer<uint32_t>(m_opts.rayChunkSize);
-    uint32_t occupancyGridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
-    uint32_t max_density_out = std::max((uint32_t)(16 * m_opts.batchSize), (uint32_t)(16 * occupancyGridCells));
+    int gridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z; // G: one cascade
+    int masterGridCells = m_opts.numCascades * gridCells;                                          // full persistent grid
+    // Occupancy updates process one cascade (G cells) per density call, so the transient
+    // density/sample buffers stay sized for a single cascade regardless of numCascades —
+    // this preserves the pre-cascade VRAM footprint.
+    uint32_t max_density_out = std::max((uint32_t)(16 * m_opts.batchSize), (uint32_t)(16 * gridCells));
     m_render_buffers.d_density_out = DeviceBuffer<float>(max_density_out);
     m_render_buffers.d_color_input = DeviceBuffer<half>(32 * m_opts.batchSize);
     m_render_buffers.d_color_output = DeviceBuffer<float>(3 * m_opts.batchSize);
@@ -200,14 +187,14 @@ void InstantNerf::initRenderBuffers()
     m_render_buffers.d_tmpsigma = DeviceBuffer<float>(m_opts.batchSize);
     m_render_buffers.d_color_dx_out = DeviceBuffer<half>(32 * m_opts.batchSize);
 
-    m_render_buffers.d_occupancy_samples = DeviceBuffer<float>(4 * m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
-    m_render_buffers.d_tmp_grid = DeviceBuffer<float>(m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
+    m_render_buffers.d_occupancy_samples = DeviceBuffer<float>(4 * gridCells); // one cascade chunk
+    m_render_buffers.d_tmp_grid = DeviceBuffer<float>(masterGridCells);
     m_render_buffers.d_sum = DeviceBuffer<float>(1);
 
     m_render_buffers.d_numActiveCells = DeviceBuffer<int>(1);
-    m_render_buffers.d_activeCellIndices = DeviceBuffer<int>(m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
+    m_render_buffers.d_activeCellIndices = DeviceBuffer<int>(masterGridCells);
 
-    cub::DeviceReduce::Sum(m_render_buffers.d_temp_storage, m_render_buffers.temp_storage_bytes, d_masterOccupancyGrid.data(), m_render_buffers.d_sum.data(), m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
+    cub::DeviceReduce::Sum(m_render_buffers.d_temp_storage, m_render_buffers.temp_storage_bytes, d_masterOccupancyGrid.data(), m_render_buffers.d_sum.data(), masterGridCells);
     cudaMalloc(&m_render_buffers.d_temp_storage, m_render_buffers.temp_storage_bytes);
 
     m_render_buffers.h_ray_offsets.reserve(m_opts.rayChunkSize);
@@ -290,16 +277,18 @@ void InstantNerf::freeBuffers() {
 void InstantNerf::init(const NerfOptions& opts, MemoryMode memMode) {
     m_opts = opts;
     m_memMode = memMode;
-    
-    uint3 res = make_uint3(opts.gridResolution.x, opts.gridResolution.y, opts.gridResolution.z);
+
     int occupancyGridCells = 0;
-    for (int i = 0; i < opts.levelsMipmap; i++) {
-        occupancyGridCells += res.x * res.y * res.z;
-        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    for (int j = 0; j < opts.numCascades; j++) {
+        uint3 res = make_uint3(opts.gridResolution.x, opts.gridResolution.y, opts.gridResolution.z);
+        for (int i = 0; i < opts.levelsMipmap; i++) {
+            occupancyGridCells += res.x * res.y * res.z;
+            res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+        }
     }
     
     int occupancyGridBytes = (occupancyGridCells + 7)/ 8;
-    int masterGridCells = opts.gridResolution.x * opts.gridResolution.y * opts.gridResolution.z;
+    int masterGridCells = opts.numCascades * (opts.gridResolution.x * opts.gridResolution.y * opts.gridResolution.z);
 
     d_occupancyGrid = DeviceBuffer<uint8_t>(occupancyGridBytes);
     d_occupancyGrid.fill(0);
@@ -391,6 +380,7 @@ void InstantNerf::trainWithRaysHit(
         compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
             currentChunkRaysUpperBound,
             chunk_o, chunk_d, m_opts.aabbMin, m_opts.aabbMax,
+            m_opts.numCascades,
             m_render_buffers.d_rays_d_inv_chunk.data(),
             m_render_buffers.d_nears_chunk.data(),
             m_render_buffers.d_fars_chunk.data()
@@ -405,6 +395,7 @@ void InstantNerf::trainWithRaysHit(
             d_occupancyGrid.data(),
             m_opts.gridResolution,
             m_opts.aabbMin, m_opts.aabbMax,
+            m_opts.numCascades,
             m_opts.levelsMipmap,
             m_opts.batchSize,
             &totalHits,
@@ -597,7 +588,7 @@ void InstantNerf::renderImage(
                 currentChunkRays,
                 chunk_o,
                 chunk_d,
-                m_opts.aabbMin, m_opts.aabbMax,
+                m_opts.aabbMin, m_opts.aabbMax, m_opts.numCascades,
                 m_render_buffers.d_rays_d_inv_chunk.data(),
                 m_render_buffers.d_nears_chunk.data(),
                 m_render_buffers.d_fars_chunk.data()
@@ -610,7 +601,8 @@ void InstantNerf::renderImage(
                 m_render_buffers.d_fars_chunk.data(),
                 d_occupancyGrid.data(),
                 m_opts.gridResolution,
-                m_opts.aabbMin, m_opts.aabbMax, m_opts.levelsMipmap,
+                m_opts.aabbMin, m_opts.aabbMax, 
+                m_opts.numCascades, m_opts.levelsMipmap,
                 m_render_buffers.d_sparse_ts.data(), 
                 m_render_buffers.d_num_steps.data(),
                 m_render_buffers.d_ray_offsets.data(),
@@ -718,7 +710,7 @@ void InstantNerf::renderImageHit(
         int gs = (currentChunkRaysUpperBound + BS - 1) / BS;
         compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
             currentChunkRaysUpperBound,
-            chunk_o, chunk_d, m_opts.aabbMin, m_opts.aabbMax,
+            chunk_o, chunk_d, m_opts.aabbMin, m_opts.aabbMax, m_opts.numCascades,
             m_render_buffers.d_rays_d_inv_chunk.data(),
             m_render_buffers.d_nears_chunk.data(),
             m_render_buffers.d_fars_chunk.data()
@@ -733,6 +725,7 @@ void InstantNerf::renderImageHit(
             d_occupancyGrid.data(),
             m_opts.gridResolution,
             m_opts.aabbMin, m_opts.aabbMax,
+            m_opts.numCascades,
             m_opts.levelsMipmap,
             m_opts.batchSize,
             &totalHits,
@@ -811,7 +804,9 @@ void InstantNerf::renderImageHit(
 }
 
 void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
-    int N = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    int G = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    int N = m_opts.numCascades * G;
+    int S = pyramidCellsPerCascade(m_opts.gridResolution, m_opts.levelsMipmap);
     int halfN = N / 2;
 
     constexpr int BS = 256;
@@ -819,52 +814,66 @@ void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
 
     cudaMemsetAsync(m_render_buffers.d_tmp_grid.data(), 0, N * sizeof(float), stream);
 
-    int occupiedSamples = halfN / 2;
-    int uniformSamples = halfN - occupiedSamples;
-
-    measure(stream, m_profile_stats.lateOccupancySampleNonUniformTime, [&](){
-    sampleNonUniform(
-        m_render_buffers.d_occupancy_samples.data(),
+    // Build the active-cell list once over the full grid (it is constant during this update).
+    cudaMemsetAsync(m_render_buffers.d_numActiveCells.data(), 0, sizeof(int), stream);
+    extractActiveCells<<<gs, BS, 0, stream>>>(
         d_occupancyGrid.data(),
         m_render_buffers.d_activeCellIndices.data(),
         m_render_buffers.d_numActiveCells.data(),
-        N,
-        m_opts.aabbMin,
-        m_opts.aabbMax,
-        m_opts.gridResolution,
-        occupiedSamples,
-        (unsigned long long)m_trainSteps,
-        stream
+        N, G, S
     );
-    });
 
-    int uniformGs = (uniformSamples + BS - 1) / BS;
-    measure(stream, m_profile_stats.lateOccupancySampleUniformTime, [&](){
-    sampleAABB<<<uniformGs, BS, 0, stream>>>(
-        m_render_buffers.d_occupancy_samples.data() + occupiedSamples * 4,
-        m_opts.aabbMin, m_opts.aabbMax, uniformSamples,
-        (unsigned long long)(m_trainSteps + 1)
-    );
-    });
+    // Split the half-N sample budget across numCascades chunks so the transient density/sample
+    // buffers stay sized for a single cascade. Each chunk draws half occupied-biased + half
+    // uniform (global) samples — matching the original sampling ratios in aggregate.
+    int chunks = m_opts.numCascades;
+    int perChunk = halfN / chunks;            // ~ G/2
+    int occPerChunk = perChunk / 2;
+    int uniPerChunk = perChunk - occPerChunk;
 
-    int paddedBatchSize = (halfN + 15) & ~15;
+    for (int ch = 0; ch < chunks; ++ch) {
+        unsigned long long seedBase = (unsigned long long)m_trainSteps * (2ULL * chunks) + 2ULL * ch;
 
-    measure(stream, m_profile_stats.lateOccupancyDensityFwd, [&](){
-    m_densityMLP->inference(m_render_buffers.d_occupancy_samples.data(), m_render_buffers.d_density_out.data(), paddedBatchSize, stream);
-    });
+        int occGs = (occPerChunk + BS - 1) / BS;
+        measure(stream, m_profile_stats.lateOccupancySampleNonUniformTime, [&](){
+        sampleOccupiedAABB<<<occGs, BS, 0, stream>>>(
+            m_render_buffers.d_occupancy_samples.data(),
+            m_render_buffers.d_activeCellIndices.data(),
+            m_render_buffers.d_numActiveCells.data(),
+            m_opts.aabbMin, m_opts.aabbMax, m_opts.gridResolution,
+            occPerChunk, seedBase
+        );
+        });
 
-    measure(stream, m_profile_stats.lateOccupancyUpdateTmpGrid, [&](){
-    updateTmpGrid<<<(halfN + BS - 1) / BS, BS, 0, stream>>>(
-        m_render_buffers.d_occupancy_samples.data(),
-        m_render_buffers.d_density_out.data(),
-        m_render_buffers.d_tmp_grid.data(),
-        m_opts.densityBias,
-        m_opts.aabbMin,
-        m_opts.aabbMax,
-        m_opts.gridResolution,
-        halfN
-    );
-    });
+        int uniGs = (uniPerChunk + BS - 1) / BS;
+        measure(stream, m_profile_stats.lateOccupancySampleUniformTime, [&](){
+        sampleAABB<<<uniGs, BS, 0, stream>>>(
+            m_render_buffers.d_occupancy_samples.data() + occPerChunk * 4,
+            m_opts.aabbMin, m_opts.aabbMax, m_opts.gridResolution,
+            uniPerChunk, N, 0, seedBase + 1ULL
+        );
+        });
+
+        int chunkCount = occPerChunk + uniPerChunk;
+        int paddedBatchSize = (chunkCount + 15) & ~15;
+
+        measure(stream, m_profile_stats.lateOccupancyDensityFwd, [&](){
+        m_densityMLP->inference(m_render_buffers.d_occupancy_samples.data(), m_render_buffers.d_density_out.data(), paddedBatchSize, stream);
+        });
+
+        measure(stream, m_profile_stats.lateOccupancyUpdateTmpGrid, [&](){
+        updateTmpGrid<<<(chunkCount + BS - 1) / BS, BS, 0, stream>>>(
+            m_render_buffers.d_occupancy_samples.data(),
+            m_render_buffers.d_density_out.data(),
+            m_render_buffers.d_tmp_grid.data(),
+            m_opts.densityBias,
+            m_opts.aabbMin,
+            m_opts.aabbMax,
+            m_opts.gridResolution,
+            chunkCount
+        );
+        });
+    }
 
     measure(stream, m_profile_stats.lateOccupancyUpdateMasterGrid, [&](){
     updateMasterGrid<<<gs, BS, 0, stream>>>(m_render_buffers.d_tmp_grid.data(), d_masterOccupancyGrid.data(), m_opts.decayValue, N);
@@ -879,9 +888,9 @@ void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
     measure(stream, m_profile_stats.lateOccupancyUpdateBitgrid, [&](){
     updateOccupancyGrid<<<gs, BS, 0, stream>>>(
         d_occupancy_grid_32,
-        d_masterOccupancyGrid.data(), 
+        d_masterOccupancyGrid.data(),
         m_render_buffers.d_sum.data(),
-        N
+        N, G, S
     );
     });
 
@@ -892,34 +901,46 @@ void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
 }
 
 void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
-    int N = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    int G = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    int N = m_opts.numCascades * G;
+    int S = pyramidCellsPerCascade(m_opts.gridResolution, m_opts.levelsMipmap);
     constexpr int BS = 256;
     int gs = (N + BS - 1) / BS;
 
     cudaMemsetAsync(m_render_buffers.d_tmp_grid.data(), 0, N * sizeof(float), stream);
 
-    measure(stream, m_profile_stats.earlyOccupancySampleTime, [&](){
-    sampleAABB<<<gs, BS, 0, stream>>>(m_render_buffers.d_occupancy_samples.data(), m_opts.aabbMin, m_opts.aabbMax, N, (unsigned long long)m_trainSteps);
-    });
+    // Sample + evaluate density one cascade at a time so the transient buffers stay sized for a
+    // single cascade (G cells). Each cascade deterministically covers its own G level-0 cells
+    // (dense range [c*G, c*G + G)); cell ranges are disjoint so the shared tmp grid is safe.
+    int cgs = (G + BS - 1) / BS;
+    int paddedBatchSize = (G + 15) & ~15;
+    for (int c = 0; c < m_opts.numCascades; ++c) {
+        int cellOffset = c * G;
 
-    int paddedBatchSize = (N + 15) & ~15;
+        measure(stream, m_profile_stats.earlyOccupancySampleTime, [&](){
+        sampleAABB<<<cgs, BS, 0, stream>>>(
+            m_render_buffers.d_occupancy_samples.data(),
+            m_opts.aabbMin, m_opts.aabbMax, m_opts.gridResolution,
+            G, G, cellOffset, (unsigned long long)m_trainSteps + (unsigned long long)c);
+        });
 
-    measure(stream, m_profile_stats.earlyOccupancyDensityFwd, [&](){
-    m_densityMLP->inference(m_render_buffers.d_occupancy_samples.data(), m_render_buffers.d_density_out.data(), paddedBatchSize, stream);
-    });
+        measure(stream, m_profile_stats.earlyOccupancyDensityFwd, [&](){
+        m_densityMLP->inference(m_render_buffers.d_occupancy_samples.data(), m_render_buffers.d_density_out.data(), paddedBatchSize, stream);
+        });
 
-    measure(stream, m_profile_stats.earlyOccupancyUpdateTmpGrid, [&](){
-    updateTmpGrid<<<(N + BS - 1) / BS, BS, 0, stream>>>(
-        m_render_buffers.d_occupancy_samples.data(),
-        m_render_buffers.d_density_out.data(),
-        m_render_buffers.d_tmp_grid.data(),
-        m_opts.densityBias,
-        m_opts.aabbMin,
-        m_opts.aabbMax,
-        m_opts.gridResolution,
-        N
-    );
-    });
+        measure(stream, m_profile_stats.earlyOccupancyUpdateTmpGrid, [&](){
+        updateTmpGrid<<<cgs, BS, 0, stream>>>(
+            m_render_buffers.d_occupancy_samples.data(),
+            m_render_buffers.d_density_out.data(),
+            m_render_buffers.d_tmp_grid.data(),
+            m_opts.densityBias,
+            m_opts.aabbMin,
+            m_opts.aabbMax,
+            m_opts.gridResolution,
+            G
+        );
+        });
+    }
 
     measure(stream, m_profile_stats.earlyOccupancyUpdateMasterGrid, [&](){
     updateMasterGrid<<<gs, BS, 0, stream>>>(m_render_buffers.d_tmp_grid.data(), d_masterOccupancyGrid.data(), m_opts.decayValue, N);
@@ -934,9 +955,9 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
     measure(stream, m_profile_stats.earlyOccupancyUpdateBitgrid, [&](){
     updateOccupancyGrid<<<gs, BS, 0, stream>>>(
         d_occupancy_grid_32,
-        d_masterOccupancyGrid.data(), 
+        d_masterOccupancyGrid.data(),
         m_render_buffers.d_sum.data(),
-        N
+        N, G, S
     );
     });
 
@@ -946,34 +967,36 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
 }
 
 void InstantNerf::buildMipmaps(cudaStream_t stream, int level0_cells) {
-    uint32_t level0_bytes = level0_cells / 8;
-    uint32_t total_bytes = d_occupancyGrid.size();
-    
-    if (total_bytes > level0_bytes) {
-        cudaMemsetAsync(d_occupancyGrid.data() + level0_bytes, 0, total_bytes - level0_bytes, stream);
-    }
+    // Each cascade owns a contiguous per-cascade pyramid region [c*S, c*S + S) in the bitgrid,
+    // where S = level-0 + all mip levels of one cascade. updateOccupancyGrid has already written
+    // every cascade's level-0 bits; here we build the higher mip levels independently per cascade.
+    // No pre-zeroing is needed: every mip word is fully overwritten by bitfield_max_pool, since
+    // each level's cell count is a multiple of 32 for the supported resolutions.
+    int S = pyramidCellsPerCascade(m_opts.gridResolution, m_opts.levelsMipmap);  // cells per cascade pyramid
+    size_t cascade_stride_bytes = (size_t)S / 8;  // S is a multiple of 32 -> exact
 
-    uint8_t* current_level_ptr = d_occupancyGrid.data();
-    uint3 current_res = m_opts.gridResolution;
+    for (int c = 0; c < m_opts.numCascades; ++c) {
+        uint8_t* current_level_ptr = d_occupancyGrid.data() + c * cascade_stride_bytes;
+        uint3 current_res = m_opts.gridResolution;
 
-    for (int l = 0; l < m_opts.levelsMipmap - 1; ++l) {
-        
-        uint3 next_res = make_uint3(current_res.x / 2, current_res.y / 2, current_res.z / 2);
-        int next_cells = next_res.x * next_res.y * next_res.z;
-        uint32_t current_level_bytes = (current_res.x * current_res.y * current_res.z) / 8;
-        uint8_t* next_level_ptr = current_level_ptr + current_level_bytes;
+        for (int l = 0; l < m_opts.levelsMipmap - 1; ++l) {
+            uint3 next_res = make_uint3(current_res.x / 2, current_res.y / 2, current_res.z / 2);
+            int next_cells = next_res.x * next_res.y * next_res.z;
+            uint32_t current_level_bytes = (current_res.x * current_res.y * current_res.z) / 8;
+            uint8_t* next_level_ptr = current_level_ptr + current_level_bytes;
 
-        int threads = 256;
-        int blocks = (next_cells + threads - 1) / threads;
+            int threads = 256;
+            int blocks = (next_cells + threads - 1) / threads;
 
-        bitfield_max_pool<<<blocks, threads, 0, stream>>>(
-            current_level_ptr, 
-            reinterpret_cast<uint32_t*>(next_level_ptr),
-            next_res
-        );
+            bitfield_max_pool<<<blocks, threads, 0, stream>>>(
+                current_level_ptr,
+                reinterpret_cast<uint32_t*>(next_level_ptr),
+                next_res
+            );
 
-        current_level_ptr = next_level_ptr;
-        current_res = next_res;
+            current_level_ptr = next_level_ptr;
+            current_res = next_res;
+        }
     }
 }
 

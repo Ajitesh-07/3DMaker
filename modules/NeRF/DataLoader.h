@@ -46,6 +46,7 @@ public:
         }
     }
     float getCameraAngleX() const { return camera_angle_x; }
+    int getNumCascades() const { return num_cascades; }
 
 private:
     std::string dataset_path;
@@ -55,6 +56,7 @@ private:
     int height;
     
     float camera_angle_x;
+    int num_cascades = 1;   // from transforms.json; defaults to 1 (bounded) when absent
     float focal_length;
     uint32_t  m_ray_chunk_size;
 

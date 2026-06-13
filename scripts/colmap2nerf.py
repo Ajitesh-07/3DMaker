@@ -193,20 +193,24 @@ def main():
                     num_views = (len(parts) - 8) // 2
                     points.append({"pos": [x, y, z], "views": num_views})
     
-    # Sort by views descending and keep top 20% to isolate the main subject
-    if len(points) > 100:
-        points.sort(key=lambda p: p["views"], reverse=True)
-        points = points[:int(len(points) * 0.20)]
-    
-    # Align points to match cameras
-    pts_aligned = []
-    for p in points:
-        pos = p["pos"]
-        # Flip Y and Z to match OpenCV -> OpenGL conversion
+    # Align a single point to camera space (OpenCV -> OpenGL flip, then PCA alignment).
+    def align_pt(pos):
         p_flip = [pos[0], -pos[1], -pos[2]]
-        # Apply PCA alignment
-        p_new = [sum(R_align[r][c] * p_flip[c] for c in range(3)) for r in range(3)]
-        pts_aligned.append(p_new)
+        return [sum(R_align[r][c] * p_flip[c] for c in range(3)) for r in range(3)]
+
+    # Align EVERY point first — we need the full cloud to estimate the background extent
+    # (and therefore how many cascades the engine needs), not just the subject.
+    all_aligned = [align_pt(p["pos"]) for p in points]
+
+    # Subject = top 20% most-viewed points, which isolates the main object from background.
+    subject_points = points
+    if len(points) > 100:
+        subject_points = sorted(points, key=lambda p: p["views"], reverse=True)[:int(len(points) * 0.20)]
+    pts_aligned = [align_pt(p["pos"]) for p in subject_points]
+
+    # Default: single cascade (object-centric / bounded scene). Overridden below if the
+    # background reaches well beyond the subject.
+    num_cascades = 1
 
     if len(pts_aligned) > 100:
         # Use median for robust center
@@ -215,11 +219,31 @@ def main():
             sorted([p[1] for p in pts_aligned])[len(pts_aligned)//2],
             sorted([p[2] for p in pts_aligned])[len(pts_aligned)//2]
         ]
-        # Use 90th percentile distance for robust scaling
+        # Use 90th percentile distance for robust scaling (subject fills ~unit sphere -> cascade 0)
         dists = sorted([math.sqrt((p[0]-center[0])**2 + (p[1]-center[1])**2 + (p[2]-center[2])**2) for p in pts_aligned])
         obj_radius = dists[int(len(dists) * 0.90)]
         scale = 1.0 / (obj_radius + 1e-5)
         print(f"Scene bounds computed from Point Cloud. Object radius: {obj_radius:.2f}, Scale: {scale:.2f}")
+
+        # Estimate how far the background extends relative to the subject. Cascade c covers a
+        # power-of-2 box (~1.5 * 2^c in normalized units), so pick enough cascades to enclose
+        # the 95th-percentile scene radius. ratio ~1 (turntable) -> 1 cascade; bigger room ->
+        # more. Clamped to a sane maximum.
+        if len(all_aligned) > 100:
+            scene_dists = sorted(
+                math.sqrt((p[0]-center[0])**2 + (p[1]-center[1])**2 + (p[2]-center[2])**2)
+                for p in all_aligned
+            )
+            scene_radius = scene_dists[int(len(scene_dists) * 0.95)]
+            ratio = scene_radius / (obj_radius + 1e-5)
+            # Cascade 0 is the engine's base AABB, which already spans ~1.5x the unit subject
+            # radius. Only background BEYOND that needs extra (power-of-2) cascades, so divide
+            # out the base-box headroom before taking log2. ratio <= 1.5 -> everything fits in
+            # cascade 0 -> num_cascades = 1.
+            BASE_HALF_EXTENT = 1.5  # must match NerfOptions aabb half-width in Pipeline.cu
+            needed = max(ratio / BASE_HALF_EXTENT, 1e-6)
+            num_cascades = max(1, min(6, int(math.ceil(math.log2(needed))) + 1))
+            print(f"Scene radius: {scene_radius:.2f} (ratio {ratio:.2f}) -> num_cascades = {num_cascades}")
     else:
         # Fallback to camera center
         cam_centers = [[frame["transform_matrix"][0][3], frame["transform_matrix"][1][3], frame["transform_matrix"][2][3]] for frame in frames]
@@ -237,6 +261,7 @@ def main():
 
     transforms = {
         "camera_angle_x": camera_angle_x,
+        "num_cascades": num_cascades,
         "frames": frames
     }
 

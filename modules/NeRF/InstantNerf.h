@@ -36,6 +36,7 @@ struct NerfOptions {
     float3  aabbMin         = make_float3(-1.0f, -1.0f, -1.0f);
     float3  aabbMax         = make_float3( 1.0f,  1.0f,  1.0f);
     int levelsMipmap = 4;
+    int numCascades = 4;
 
     int densityHiddenDim = 64;
     int densityNumLayers = 2;
@@ -57,7 +58,7 @@ struct NerfOptions {
     float beta1 = 0.9f;
     float beta2 = 0.999f;
     float epsilon = 1e-8f;
-    float lossScale = 1.0f; // backward kernel uses FP16 shmem — keep at 1.0
+    float lossScale = 1.0f; 
 
     // Background color for volume rendering compositing
     float3 bgColor = make_float3(1.0f, 1.0f, 1.0f); // white for nerf_synthetic
@@ -371,6 +372,7 @@ extern "C" void launchMarchRaysDDA(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
     uint32_t* packed_coords_out,
     float* t_hits_out,
@@ -389,6 +391,7 @@ extern "C" void processRaysChunk(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
 
     uint32_t* d_sparse_morton,   
@@ -418,6 +421,7 @@ extern "C" void processRaysChunkLinear(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
 
     float* d_sparse_ts,
@@ -443,6 +447,7 @@ extern "C" int processRaysHitLinear(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
     const int batchSize,
     uint32_t* totalHits,

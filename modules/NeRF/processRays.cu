@@ -7,6 +7,44 @@
 #include <cub/cub.cuh>
 #include "InstantNerf.h"
 
+
+__device__ __forceinline__ int get_cascade(float3 pos, float3 aabb_min, float3 aabb_max, int num_cascades) {
+    float rx = fmaxf(pos.x / aabb_max.x, pos.x / aabb_min.x);
+    float ry = fmaxf(pos.y / aabb_max.y, pos.y / aabb_min.y);
+    float rz = fmaxf(pos.z / aabb_max.z, pos.z / aabb_min.z);
+    float max_scale = fmaxf(rx, fmaxf(ry, rz));
+    if (max_scale <= 1.0f) return 0;
+    int cascade = (int)ceilf(log2f(max_scale));
+    return max(0, min(cascade, num_cascades - 1));
+}
+
+__device__ __forceinline__ float3 contract_pos(float3 pos, float3 aabb_min, float3 aabb_max) {
+    float3 aabb_extent = make_float3(aabb_max.x - aabb_min.x, aabb_max.y - aabb_min.y, aabb_max.z - aabb_min.z);
+    
+    float3 rel_pos = make_float3(
+        (pos.x - aabb_min.x) / aabb_extent.x,
+        (pos.y - aabb_min.y) / aabb_extent.y,
+        (pos.z - aabb_min.z) / aabb_extent.z
+    );
+    
+    float3 norm_pos = make_float3(
+        rel_pos.x * 2.0f - 1.0f,
+        rel_pos.y * 2.0f - 1.0f,
+        rel_pos.z * 2.0f - 1.0f
+    );
+    
+    float3 contracted;
+    contracted.x = fabsf(norm_pos.x) <= 1.0f ? norm_pos.x : (2.0f - 1.0f / fabsf(norm_pos.x)) * copysignf(1.0f, norm_pos.x);
+    contracted.y = fabsf(norm_pos.y) <= 1.0f ? norm_pos.y : (2.0f - 1.0f / fabsf(norm_pos.y)) * copysignf(1.0f, norm_pos.y);
+    contracted.z = fabsf(norm_pos.z) <= 1.0f ? norm_pos.z : (2.0f - 1.0f / fabsf(norm_pos.z)) * copysignf(1.0f, norm_pos.z);
+    
+    return make_float3(
+        fmaxf(0.0f, fminf((contracted.x + 2.0f) * 0.25f, 1.0f)),
+        fmaxf(0.0f, fminf((contracted.y + 2.0f) * 0.25f, 1.0f)),
+        fmaxf(0.0f, fminf((contracted.z + 2.0f) * 0.25f, 1.0f))
+    );
+}
+
 __device__ __forceinline__ void store_uint4(uint4* addr, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
     #ifndef __INTELLISENSE__
     asm volatile(
@@ -66,6 +104,7 @@ __global__ void march_rays_dda_kernel(
     const uint3    grid_resolution, // This is the base Level 0 resolution (e.g. 128x128x128)
     const float3   aabb_min,
     const float3   aabb_max,
+    const int      num_cascades,
     const int      levelsMipmap,    // NEW PARAMETER
     uint32_t* __restrict__ packed_coords_out, 
     float* __restrict__ t_hits_out,
@@ -95,6 +134,12 @@ __global__ void march_rays_dda_kernel(
     int current_level = levelsMipmap - 1;
 
     while (current_t < t_max_ray && (hit_count + local_idx) < MAX_HITS) {
+        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
+        int cascade = get_cascade(current_pos, aabb_min, aabb_max, num_cascades);
+        float cascade_scale = exp2f((float)cascade);
+        
+        float3 c_aabb_min = make_float3(aabb_min.x * cascade_scale, aabb_min.y * cascade_scale, aabb_min.z * cascade_scale);
+        float3 c_aabb_extent = make_float3(aabb_extent.x * cascade_scale, aabb_extent.y * cascade_scale, aabb_extent.z * cascade_scale);
         
         uint3 res_l = make_uint3(
             grid_resolution.x >> current_level,
@@ -103,29 +148,28 @@ __global__ void march_rays_dda_kernel(
         );
 
         float3 voxel_size_l = make_float3(
-            aabb_extent.x / res_l.x,
-            aabb_extent.y / res_l.y,
-            aabb_extent.z / res_l.z
+            c_aabb_extent.x / res_l.x,
+            c_aabb_extent.y / res_l.y,
+            c_aabb_extent.z / res_l.z
         );
-
-        // 2. Where are we in space right now?
-        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
         
         float3 rel_pos = make_float3(
-            (current_pos.x - aabb_min.x) / aabb_extent.x,
-            (current_pos.y - aabb_min.y) / aabb_extent.y,
-            (current_pos.z - aabb_min.z) / aabb_extent.z
+            (current_pos.x - c_aabb_min.x) / c_aabb_extent.x,
+            (current_pos.y - c_aabb_min.y) / c_aabb_extent.y,
+            (current_pos.z - c_aabb_min.z) / c_aabb_extent.z
         );
-
+        
         int3 voxel_index = make_int3(
             max(0, min((int)floorf(rel_pos.x * res_l.x), (int)res_l.x - 1)),
             max(0, min((int)floorf(rel_pos.y * res_l.y), (int)res_l.y - 1)),
             max(0, min((int)floorf(rel_pos.z * res_l.z), (int)res_l.z - 1))
         );
-
-        // 3. Read the bit from the specific mipmap level
+        
         uint32_t level_offset = get_mipmap_offset(grid_resolution, current_level);
-        uint32_t flat_idx = level_offset + 
+        uint32_t total_mipmap_cells = get_mipmap_offset(grid_resolution, levelsMipmap);
+        uint32_t cascade_offset = cascade * total_mipmap_cells;
+        
+        uint32_t flat_idx = cascade_offset + level_offset + 
                             voxel_index.z * (res_l.x * res_l.y) + 
                             voxel_index.y * res_l.x + 
                             voxel_index.x;
@@ -160,9 +204,9 @@ __global__ void march_rays_dda_kernel(
         }
 
         float3 next_boundary = make_float3(
-            aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
-            aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
-            aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
+            c_aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
+            c_aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
+            c_aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
         );
 
         float3 t_max_axis = make_float3(
@@ -201,6 +245,7 @@ void launchMarchRaysDDA(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int      numCascades,
     const int mipmapLevels,
     uint32_t* packed_coords_out,
     float* t_hits_out,
@@ -223,6 +268,7 @@ void launchMarchRaysDDA(
         grid_resolution,
         aabb_min,
         aabb_max,
+        numCascades,
         mipmapLevels,
         packed_coords_out,
         t_hits_out,
@@ -282,15 +328,7 @@ __global__ void generate_mlp_batch_kernel(
     pos.y = o.y + t * d.y;
     pos.z = o.z + t * d.z;
 
-    // Scale position to [0, 1] using AABB
-    pos.x = (pos.x - aabb_min.x) / (aabb_max.x - aabb_min.x);
-    pos.y = (pos.y - aabb_min.y) / (aabb_max.y - aabb_min.y);
-    pos.z = (pos.z - aabb_min.z) / (aabb_max.z - aabb_min.z);
-
-    // Clamp to [0, 1] just in case of precision issues
-    pos.x = fmaxf(0.0f, fminf(pos.x, 1.0f));
-    pos.y = fmaxf(0.0f, fminf(pos.y, 1.0f));
-    pos.z = fmaxf(0.0f, fminf(pos.z, 1.0f));
+    pos = contract_pos(pos, aabb_min, aabb_max);
 
     float4* mlp_positions_vec = reinterpret_cast<float4*>(mlp_positions);
     store_float4(&mlp_positions_vec[idx], pos.x, pos.y, pos.z, 0.0f);
@@ -310,6 +348,7 @@ void processRaysChunk(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
 
     uint32_t* d_sparse_morton,   
@@ -341,6 +380,7 @@ void processRaysChunk(
         grid_resolution,
         aabb_min,
         aabb_max,
+        numCascades,
         mipmapLevels,
         d_sparse_morton,
         d_sparse_ts,
@@ -500,6 +540,7 @@ void processRaysChunkLinear(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
 
     float* d_sparse_ts,
@@ -523,6 +564,7 @@ void processRaysChunkLinear(
         nears, fars,
         occupancy_grid,
         grid_resolution, aabb_min, aabb_max,
+        numCascades,
         mipmapLevels,
         nullptr, d_sparse_ts, d_num_steps
     );
@@ -571,6 +613,7 @@ __global__ void march_rays_dda_calc_hits(
     const uint3    grid_resolution, // This is the base Level 0 resolution (e.g. 128x128x128)
     const float3   aabb_min,
     const float3   aabb_max,
+    const int      num_cascades,
     const int      levelsMipmap,
     uint32_t* __restrict__ num_steps_per_ray
 ) {
@@ -593,34 +636,42 @@ __global__ void march_rays_dda_calc_hits(
     int current_level = levelsMipmap - 1;
 
     while (current_t < t_max_ray && hit_count < MAX_HITS) {
+        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
+        int cascade = get_cascade(current_pos, aabb_min, aabb_max, num_cascades);
+        float cascade_scale = exp2f((float)cascade);
+        
+        float3 c_aabb_min = make_float3(aabb_min.x * cascade_scale, aabb_min.y * cascade_scale, aabb_min.z * cascade_scale);
+        float3 c_aabb_extent = make_float3(aabb_extent.x * cascade_scale, aabb_extent.y * cascade_scale, aabb_extent.z * cascade_scale);
+        
         uint3 res_l = make_uint3(
             grid_resolution.x >> current_level,
             grid_resolution.y >> current_level,
             grid_resolution.z >> current_level
         );
-
+        
         float3 voxel_size_l = make_float3(
-            aabb_extent.x / res_l.x,
-            aabb_extent.y / res_l.y,
-            aabb_extent.z / res_l.z
+            c_aabb_extent.x / res_l.x,
+            c_aabb_extent.y / res_l.y,
+            c_aabb_extent.z / res_l.z
         );
-
-        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
-
+        
         float3 rel_pos = make_float3(
-            (current_pos.x - aabb_min.x) / aabb_extent.x,
-            (current_pos.y - aabb_min.y) / aabb_extent.y,
-            (current_pos.z - aabb_min.z) / aabb_extent.z
+            (current_pos.x - c_aabb_min.x) / c_aabb_extent.x,
+            (current_pos.y - c_aabb_min.y) / c_aabb_extent.y,
+            (current_pos.z - c_aabb_min.z) / c_aabb_extent.z
         );
-
+        
         int3 voxel_index = make_int3(
             max(0, min((int)floorf(rel_pos.x * res_l.x), (int)res_l.x - 1)),
             max(0, min((int)floorf(rel_pos.y * res_l.y), (int)res_l.y - 1)),
             max(0, min((int)floorf(rel_pos.z * res_l.z), (int)res_l.z - 1))
         );
-
+        
         uint32_t level_offset = get_mipmap_offset(grid_resolution, current_level);
-        uint32_t flat_idx = level_offset + 
+        uint32_t total_mipmap_cells = get_mipmap_offset(grid_resolution, levelsMipmap);
+        uint32_t cascade_offset = cascade * total_mipmap_cells;
+        
+        uint32_t flat_idx = cascade_offset + level_offset + 
                             voxel_index.z * (res_l.x * res_l.y) + 
                             voxel_index.y * res_l.x + 
                             voxel_index.x;
@@ -637,9 +688,9 @@ __global__ void march_rays_dda_calc_hits(
         }
 
         float3 next_boundary = make_float3(
-            aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
-            aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
-            aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
+            c_aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
+            c_aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
+            c_aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
         );
 
         float3 t_max_axis = make_float3(
@@ -701,6 +752,7 @@ __global__ void march_rays_dda_offset(
     const uint3    grid_resolution,
     const float3   aabb_min,
     const float3   aabb_max,
+    const int      num_cascades,
     const int      levelsMipmap,
     const uint32_t* __restrict__ ray_offsets,
     float* __restrict__ t_hits_out,
@@ -726,35 +778,42 @@ __global__ void march_rays_dda_offset(
     int current_level = levelsMipmap - 1;
 
     while (current_t < t_max_ray && hit_count < MAX_HITS) {
+        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
+        int cascade = get_cascade(current_pos, aabb_min, aabb_max, num_cascades);
+        float cascade_scale = exp2f((float)cascade);
         
-        uint3 res_l = make_uint3(
+        float3 c_aabb_min = make_float3(aabb_min.x * cascade_scale, aabb_min.y * cascade_scale, aabb_min.z * cascade_scale);
+        float3 c_aabb_extent = make_float3(aabb_extent.x * cascade_scale, aabb_extent.y * cascade_scale, aabb_extent.z * cascade_scale);
+    
+        uint3 res_l = make_uint3(    
             grid_resolution.x >> current_level,
             grid_resolution.y >> current_level,
             grid_resolution.z >> current_level
         );
-
-        float3 voxel_size_l = make_float3(
-            aabb_extent.x / res_l.x,
-            aabb_extent.y / res_l.y,
-            aabb_extent.z / res_l.z
-        );
-
-        float3 current_pos = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
         
-        float3 rel_pos = make_float3(
-            (current_pos.x - aabb_min.x) / aabb_extent.x,
-            (current_pos.y - aabb_min.y) / aabb_extent.y,
-            (current_pos.z - aabb_min.z) / aabb_extent.z
+        float3 voxel_size_l = make_float3(
+            c_aabb_extent.x / res_l.x,
+            c_aabb_extent.y / res_l.y,
+            c_aabb_extent.z / res_l.z
         );
-
+    
+        float3 rel_pos = make_float3( 
+            (current_pos.x - c_aabb_min.x) / c_aabb_extent.x,
+            (current_pos.y - c_aabb_min.y) / c_aabb_extent.y,
+            (current_pos.z - c_aabb_min.z) / c_aabb_extent.z
+        );
+    
         int3 voxel_index = make_int3(
             max(0, min((int)floorf(rel_pos.x * res_l.x), (int)res_l.x - 1)),
             max(0, min((int)floorf(rel_pos.y * res_l.y), (int)res_l.y - 1)),
             max(0, min((int)floorf(rel_pos.z * res_l.z), (int)res_l.z - 1))
         );
-
+        
         uint32_t level_offset = get_mipmap_offset(grid_resolution, current_level);
-        uint32_t flat_idx = level_offset + 
+        uint32_t total_mipmap_cells = get_mipmap_offset(grid_resolution, levelsMipmap);
+        uint32_t cascade_offset = cascade * total_mipmap_cells;
+
+        uint32_t flat_idx = cascade_offset + level_offset + 
                             voxel_index.z * (res_l.x * res_l.y) + 
                             voxel_index.y * res_l.x + 
                             voxel_index.x;
@@ -779,9 +838,7 @@ __global__ void march_rays_dda_offset(
                     o.z + current_t * d.z
                 );
                 
-                pos.x = fmaxf(0.0f, fminf((pos.x - aabb_min.x) / aabb_extent.x, 1.0f));
-                pos.y = fmaxf(0.0f, fminf((pos.y - aabb_min.y) / aabb_extent.y, 1.0f));
-                pos.z = fmaxf(0.0f, fminf((pos.z - aabb_min.z) / aabb_extent.z, 1.0f));
+                pos = contract_pos(pos, aabb_min, aabb_max);
                 
                 float4* mlp_pos_vec = reinterpret_cast<float4*>(mlp_positions);
                 store_float4(&mlp_pos_vec[write_idx], pos.x, pos.y, pos.z, 0.0f);
@@ -791,9 +848,9 @@ __global__ void march_rays_dda_offset(
         }
 
         float3 next_boundary = make_float3(
-            aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
-            aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
-            aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
+            c_aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x,
+            c_aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y,
+            c_aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z
         );
 
         float3 t_max_axis = make_float3(
@@ -819,6 +876,7 @@ int processRaysHitLinear(
     const uint3 grid_resolution,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int numCascades,
     const int mipmapLevels,
     const int batchSize,
     uint32_t* totalHits,
@@ -846,6 +904,7 @@ int processRaysHitLinear(
         grid_resolution,
         aabb_min,
         aabb_max,
+        numCascades,
         mipmapLevels,
         d_num_steps
     );
@@ -902,6 +961,7 @@ int processRaysHitLinear(
         grid_resolution,
         aabb_min,
         aabb_max,
+        numCascades,
         mipmapLevels,
         d_ray_offsets,
         d_t_sorted,

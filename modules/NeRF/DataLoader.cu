@@ -59,6 +59,13 @@ void DataLoader::parseTransformsJson() {
 
     camera_angle_x = j["camera_angle_x"];
 
+    // Optional: number of spatial-occupancy cascades estimated by colmap2nerf for this scene.
+    // Absent in legacy/synthetic datasets -> stays 1 (bounded, single occupancy grid).
+    if (j.contains("num_cascades")) {
+        num_cascades = j["num_cascades"];
+        if (num_cascades < 1) num_cascades = 1;
+    }
+
     for (auto& frame : j["frames"]) {
         Frame f;
         std::string path = frame["file_path"];

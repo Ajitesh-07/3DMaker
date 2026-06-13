@@ -94,12 +94,27 @@ __global__ void compute_ray_aabb_inv_kernel(
     const float3* __restrict__ rays_d,
     const float3 aabb_min,
     const float3 aabb_max,
+    const int num_cascades,
     float3* __restrict__ rays_d_inv,
     float* __restrict__ nears,
     float* __restrict__ fars
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_rays) return;
+
+    float scale = exp2f((float)(num_cascades - 1));
+    float3 min_bound = make_float3(
+        aabb_min.x * scale,
+        aabb_min.y * scale,
+        aabb_min.z * scale
+    );
+
+    float3 max_bound = make_float3(
+        aabb_max.x * scale,
+        aabb_max.y * scale,
+        aabb_max.z * scale
+    );
+
 
     float3 o = rays_o[i];
     float3 d = rays_d[i];
@@ -114,16 +129,16 @@ __global__ void compute_ray_aabb_inv_kernel(
     d_inv.z = 1.0f / d.z;
     rays_d_inv[i] = d_inv;
 
-    float t1x = (aabb_min.x - o.x) * d_inv.x;
-    float t2x = (aabb_max.x - o.x) * d_inv.x;
+    float t1x = (min_bound.x - o.x) * d_inv.x;
+    float t2x = (max_bound.x - o.x) * d_inv.x;
     if (t1x > t2x) { float tmp = t1x; t1x = t2x; t2x = tmp; }
 
-    float t1y = (aabb_min.y - o.y) * d_inv.y;
-    float t2y = (aabb_max.y - o.y) * d_inv.y;
+    float t1y = (min_bound.y - o.y) * d_inv.y;
+    float t2y = (max_bound.y - o.y) * d_inv.y;
     if (t1y > t2y) { float tmp = t1y; t1y = t2y; t2y = tmp; }
 
-    float t1z = (aabb_min.z - o.z) * d_inv.z;
-    float t2z = (aabb_max.z - o.z) * d_inv.z;
+    float t1z = (min_bound.z - o.z) * d_inv.z;
+    float t2z = (max_bound.z - o.z) * d_inv.z;
     if (t1z > t2z) { float tmp = t1z; t1z = t2z; t2z = tmp; }
 
     float t_enter = fmaxf(fmaxf(t1x, t1y), t1z);
@@ -543,11 +558,41 @@ __global__ void compute_density_grad(
     store_float4(&custom_density_grad_vec[1], out1.x, out1.y, out1.z, out1.w);
 }
 
+static __device__ __forceinline__ float3 contract_pos(float3 pos, float3 aabb_min, float3 aabb_max) {
+    float3 aabb_extent = make_float3(aabb_max.x - aabb_min.x, aabb_max.y - aabb_min.y, aabb_max.z - aabb_min.z);
+    
+    float3 rel_pos = make_float3(
+        (pos.x - aabb_min.x) / aabb_extent.x,
+        (pos.y - aabb_min.y) / aabb_extent.y,
+        (pos.z - aabb_min.z) / aabb_extent.z
+    );
+    
+    float3 norm_pos = make_float3(
+        rel_pos.x * 2.0f - 1.0f,
+        rel_pos.y * 2.0f - 1.0f,
+        rel_pos.z * 2.0f - 1.0f
+    );
+    
+    float3 contracted;
+    contracted.x = fabsf(norm_pos.x) <= 1.0f ? norm_pos.x : (2.0f - 1.0f / fabsf(norm_pos.x)) * copysignf(1.0f, norm_pos.x);
+    contracted.y = fabsf(norm_pos.y) <= 1.0f ? norm_pos.y : (2.0f - 1.0f / fabsf(norm_pos.y)) * copysignf(1.0f, norm_pos.y);
+    contracted.z = fabsf(norm_pos.z) <= 1.0f ? norm_pos.z : (2.0f - 1.0f / fabsf(norm_pos.z)) * copysignf(1.0f, norm_pos.z);
+    
+    return make_float3(
+        fmaxf(0.0f, fminf((contracted.x + 2.0f) * 0.25f, 1.0f)),
+        fmaxf(0.0f, fminf((contracted.y + 2.0f) * 0.25f, 1.0f)),
+        fmaxf(0.0f, fminf((contracted.z + 2.0f) * 0.25f, 1.0f))
+    );
+}
+
 __global__ void sampleAABB(
     float* __restrict__ samples,
     float3 aabbMin,
     float3 aabbMax,
+    uint3 gridResolution,
     int N,
+    int totalCells,
+    int cellOffset,
     unsigned long long seed
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -557,9 +602,46 @@ __global__ void sampleAABB(
     curand_init(seed, idx, 0, &state);
 
     float4 rnd = curand_uniform4(&state);
+
+    // cellOffset shifts into the dense cell range of the current cascade chunk
+    // (dense numbering: cell_idx = cascade * G + local). When N == totalCells we
+    // deterministically cover every cell of the chunk; otherwise pick at random
+    // within [cellOffset, cellOffset + totalCells).
+    int cell_idx;
+    if (N == totalCells) {
+        cell_idx = cellOffset + idx;
+    } else {
+        cell_idx = cellOffset + min((int)(rnd.w * totalCells), totalCells - 1);
+    }
+    
+    int cells_per_level = gridResolution.x * gridResolution.y * gridResolution.z;
+    int cascade = cell_idx / cells_per_level;
+    int local_cell = cell_idx % cells_per_level;
+    
+    int gridX = local_cell % gridResolution.x;
+    int gridY = (local_cell / gridResolution.x) % gridResolution.y;
+    int gridZ = local_cell / (gridResolution.x * gridResolution.y);
+    
+    float cascade_scale = exp2f((float)cascade);
+    float3 c_aabb_min = make_float3(aabbMin.x * cascade_scale, aabbMin.y * cascade_scale, aabbMin.z * cascade_scale);
+    float3 c_aabb_max = make_float3(aabbMax.x * cascade_scale, aabbMax.y * cascade_scale, aabbMax.z * cascade_scale);
+    
+    float3 cellSize = make_float3(
+        (c_aabb_max.x - c_aabb_min.x) / gridResolution.x,
+        (c_aabb_max.y - c_aabb_min.y) / gridResolution.y,
+        (c_aabb_max.z - c_aabb_min.z) / gridResolution.z
+    );
+    
+    float3 pos = make_float3(
+        c_aabb_min.x + (gridX + rnd.x) * cellSize.x,
+        c_aabb_min.y + (gridY + rnd.y) * cellSize.y,
+        c_aabb_min.z + (gridZ + rnd.z) * cellSize.z
+    );
+    
+    pos = contract_pos(pos, aabbMin, aabbMax);
     
     float4* samples_vec = reinterpret_cast<float4*>(samples);
-    store_float4(&samples_vec[idx], rnd.x, rnd.y, rnd.z, 0.0f);
+    store_float4(&samples_vec[idx], pos.x, pos.y, pos.z, __int_as_float(cell_idx));
 }
 
 __device__ inline float atomicMaxFloatFast(float* address, float val) {
@@ -584,22 +666,12 @@ __global__ void updateTmpGrid(
     const float4* samples_vec = reinterpret_cast<const float4*>(samples);
     float4 p_val = samples_vec[idx];
 
-    float3 p_norm = make_float3(
-        p_val.x,
-        p_val.y,
-        p_val.z
-    );
-
-    int ix = min(max((int)floorf(p_norm.x * gridResolution.x), 0), (int)gridResolution.x - 1);
-    int iy = min(max((int)floorf(p_norm.y * gridResolution.y), 0), (int)gridResolution.y - 1);
-    int iz = min(max((int)floorf(p_norm.z * gridResolution.z), 0), (int)gridResolution.z - 1);
-
-    uint32_t gridIdx = ix + iy * gridResolution.x + iz * gridResolution.x * gridResolution.y;
+    int cell_idx = __float_as_int(p_val.w);
 
     float densityValue = density_out[idx*16];
     float sigma = expf(fminf(densityValue - densityBias, 8.0f));
 
-    atomicMaxFloatFast(&tmpGrid[gridIdx], sigma);   
+    atomicMaxFloatFast(&tmpGrid[cell_idx], sigma);   
 }
 
 __global__ void updateMasterGrid(
@@ -626,11 +698,12 @@ __global__ void updateOccupancyGrid(
     uint32_t* d_occupancy_grid,
     const float* d_master_grid,
     float* d_sum,
-    int total_cells
+    int total_cells,
+    int cells_per_cascade,          // G  (level-0 cells of one cascade)
+    int pyramid_cells_per_cascade   // S  (level-0 + all mip levels of one cascade)
 ) {
-    int cell_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float mean_density = (*d_sum) / static_cast<float>(total_cells);
-    
+    int cell_idx = blockIdx.x * blockDim.x + threadIdx.x;  // dense: cascade * G + local
+
     bool is_active = false;
     if (cell_idx < total_cells) {
         float threshold = 0.01f;
@@ -640,9 +713,14 @@ __global__ void updateOccupancyGrid(
     unsigned int warp_mask = __ballot_sync(0xFFFFFFFF, is_active);
 
     int lane_id = threadIdx.x % 32;
-    if (lane_id == 0) {
-        int word_idx = cell_idx / 32;
-        d_occupancy_grid[word_idx] = warp_mask;
+    if (lane_id == 0 && cell_idx < total_cells) {
+        // Translate dense (stride-G) numbering into the per-cascade pyramid
+        // (stride-S) bit layout the marcher reads: bit = cascade*S + level0_local.
+        // G and S are multiples of 32, so a 32-lane warp maps to exactly one word.
+        int cascade = cell_idx / cells_per_cascade;
+        int local   = cell_idx % cells_per_cascade;
+        int bitpos  = cascade * pyramid_cells_per_cascade + local;
+        d_occupancy_grid[bitpos / 32] = warp_mask;
     }
 }
 
@@ -707,19 +785,26 @@ __global__ void extractActiveCells(
     const uint8_t* __restrict__ occupancyGrid,
     int* __restrict__ activeCellIndices,
     int* __restrict__ numActiveCells,
-    int totalCells
+    int totalCells,                 // dense N = numCascades * G
+    int cells_per_cascade,          // G
+    int pyramid_cells_per_cascade   // S
 ) {
-    int cellIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int cellIdx = blockIdx.x * blockDim.x + threadIdx.x;  // dense: cascade * G + local
     if (cellIdx >= totalCells) return;
 
-    int byteIdx = cellIdx / 8;
-    int bitIdx  = cellIdx % 8;
+    // Map dense (stride-G) id to its level-0 bit in the per-cascade (stride-S) layout.
+    int cascade = cellIdx / cells_per_cascade;
+    int local   = cellIdx % cells_per_cascade;
+    int bitpos  = cascade * pyramid_cells_per_cascade + local;
+
+    int byteIdx = bitpos / 8;
+    int bitIdx  = bitpos % 8;
 
     bool isOccupied = (occupancyGrid[byteIdx] >> bitIdx) & 1;
 
     if (isOccupied) {
         int writePos = atomicAdd(numActiveCells, 1);
-        activeCellIndices[writePos] = cellIdx;
+        activeCellIndices[writePos] = cellIdx;   // store dense id; decoded by sampleOccupiedAABB
     }
 }
 
@@ -747,21 +832,32 @@ __global__ void sampleOccupiedAABB(
     int listIdx = min((int)(rnd.w * totalActive), totalActive - 1);
     int cell1D = activeCellIndices[listIdx];
 
-    int gridX = cell1D % gridResolution.x;
-    int gridY = (cell1D / gridResolution.x) % gridResolution.y;
-    int gridZ = cell1D / (gridResolution.x * gridResolution.y);
+    int cells_per_level = gridResolution.x * gridResolution.y * gridResolution.z;
+    int cascade = cell1D / cells_per_level;
+    int local_cell = cell1D % cells_per_level;
 
-    float3 cellSizeNorm = make_float3(
-        1.0f / (float)gridResolution.x,
-        1.0f / (float)gridResolution.y,
-        1.0f / (float)gridResolution.z
+    int gridX = local_cell % gridResolution.x;
+    int gridY = (local_cell / gridResolution.x) % gridResolution.y;
+    int gridZ = local_cell / (gridResolution.x * gridResolution.y);
+
+    float cascade_scale = exp2f((float)cascade);
+    float3 c_aabb_min = make_float3(aabbMin.x * cascade_scale, aabbMin.y * cascade_scale, aabbMin.z * cascade_scale);
+    float3 c_aabb_max = make_float3(aabbMax.x * cascade_scale, aabbMax.y * cascade_scale, aabbMax.z * cascade_scale);
+
+    float3 cellSize = make_float3(
+        (c_aabb_max.x - c_aabb_min.x) / gridResolution.x,
+        (c_aabb_max.y - c_aabb_min.y) / gridResolution.y,
+        (c_aabb_max.z - c_aabb_min.z) / gridResolution.z
     );
-    float3 cellMinNorm = make_float3(
-        gridX * cellSizeNorm.x,
-        gridY * cellSizeNorm.y,
-        gridZ * cellSizeNorm.z
+
+    float3 pos = make_float3(
+        c_aabb_min.x + (gridX + rnd.x) * cellSize.x,
+        c_aabb_min.y + (gridY + rnd.y) * cellSize.y,
+        c_aabb_min.z + (gridZ + rnd.z) * cellSize.z
     );
+
+    pos = contract_pos(pos, aabbMin, aabbMax);
 
     float4* samples_vec = reinterpret_cast<float4*>(samples);
-    store_float4(&samples_vec[idx], cellMinNorm.x + rnd.x * cellSizeNorm.x, cellMinNorm.y + rnd.y * cellSizeNorm.y, cellMinNorm.z + rnd.z * cellSizeNorm.z, 0.0f);
+    store_float4(&samples_vec[idx], pos.x, pos.y, pos.z, __int_as_float(cell1D));
 }

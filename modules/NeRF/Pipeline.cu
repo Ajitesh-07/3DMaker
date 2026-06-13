@@ -91,7 +91,7 @@ __global__ void generate_custom_rays_kernel(
 // Main Execution
 // ------------------------------------------------------------------
 
-void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam, int totalSteps = 0) {
+void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam, int totalSteps = 0, int numCascades = 0) {
     std::cout << "Starting NeRF Hit-Centric Training with Streaming DataLoader..." << std::endl;
 
     // ==========================================
@@ -116,6 +116,12 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
 
     std::cout << "\nLoading test dataset for rendering..." << std::endl;
     DataLoader test_dataset(dataset_path, opts.rayChunkSize, false); // Pass false to load transforms_test.json
+
+    // Use the cascade count estimated by colmap2nerf for this scene (defaults to 1 for
+    // bounded/legacy datasets). This drives the occupancy-grid extent and ray AABB scale.
+    opts.numCascades = dataset.getNumCascades();
+    if (numCascades != 0 ) opts.numCascades = numCascades;
+    std::cout << "Using numCascades = " << opts.numCascades << " (from dataset)" << std::endl;
 
     std::cout << "\nInitializing NeRF Model..." << std::endl;
     InstantNerf nerf;

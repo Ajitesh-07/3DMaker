@@ -112,6 +112,7 @@ int main(int argc, char** argv) {
     opts.lossScale = 128.0f;     // FP16 Mixed Precision scaling
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
+    opts.numCascades = 8;
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
     opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
 
