@@ -186,6 +186,8 @@ void InstantNerf::initRenderBuffers()
     m_render_buffers.d_custom_density_grad = DeviceBuffer<half>(16 * m_opts.batchSize);
     m_render_buffers.d_tmpsigma = DeviceBuffer<float>(m_opts.batchSize);
     m_render_buffers.d_color_dx_out = DeviceBuffer<half>(32 * m_opts.batchSize);
+    m_render_buffers.d_dw_out = DeviceBuffer<float>(m_opts.batchSize);
+    m_render_buffers.d_weight_sum = DeviceBuffer<float>(m_opts.rayChunkSize);
 
     m_render_buffers.d_occupancy_samples = DeviceBuffer<float>(4 * gridCells); // one cascade chunk
     m_render_buffers.d_tmp_grid = DeviceBuffer<float>(masterGridCells);
@@ -459,6 +461,9 @@ void InstantNerf::trainWithRaysHit(
             m_render_buffers.d_render_rgb_chunk.data(),
             m_render_buffers.d_render_depth_chunk.data(),
             m_render_buffers.d_phi_chunk.data(),
+            m_render_buffers.d_dw_out.data(),
+            m_render_buffers.d_weight_sum.data(),
+            m_opts.lambdaDist,
             m_opts.bgColor,
             stream
         );
@@ -516,6 +521,8 @@ void InstantNerf::trainWithRaysHit(
                 m_render_buffers.d_color_output.data(),
                 m_render_buffers.d_phi_chunk.data(),
                 m_render_buffers.d_render_rgb_chunk.data(),
+                m_render_buffers.d_dw_out.data(),
+                m_render_buffers.d_weight_sum.data(),
                 m_render_buffers.d_custom_color_grad.data(),
                   m_render_buffers.d_tmpsigma.data(),
                   m_opts.lossScale,
@@ -668,6 +675,7 @@ void InstantNerf::renderImage(
             m_render_buffers.d_render_rgb_chunk.data(),
             m_render_buffers.d_render_depth_chunk.data(),
             m_render_buffers.d_phi_chunk.data(),
+            nullptr, nullptr, 0,
             m_opts.bgColor,
             stream
         );
@@ -786,6 +794,7 @@ void InstantNerf::renderImageHit(
             m_render_buffers.d_render_rgb_chunk.data(),
             m_render_buffers.d_render_depth_chunk.data(),
             m_render_buffers.d_phi_chunk.data(),
+            nullptr, nullptr, 0,
             m_opts.bgColor,
             stream
         );

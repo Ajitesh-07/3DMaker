@@ -36,7 +36,7 @@ struct NerfOptions {
     float3  aabbMin         = make_float3(-1.0f, -1.0f, -1.0f);
     float3  aabbMax         = make_float3( 1.0f,  1.0f,  1.0f);
     int levelsMipmap = 4;
-    int numCascades = 4;
+    int numCascades = 1;
 
     int densityHiddenDim = 64;
     int densityNumLayers = 2;
@@ -54,6 +54,7 @@ struct NerfOptions {
     int rayChunkSize = 256 * 1024;
 
     // Optimization hyperparameters
+    float lambdaDist = 0.0362781f;
     float learningRate = 1e-3f;
     float beta1 = 0.9f;
     float beta2 = 0.999f;
@@ -103,6 +104,8 @@ struct RenderingBuffers {
     DeviceBuffer<half> d_custom_density_grad{0};
     DeviceBuffer<float> d_tmpsigma{0};
     DeviceBuffer<half> d_color_dx_out{0};
+    DeviceBuffer<float> d_dw_out{0};
+    DeviceBuffer<float> d_weight_sum{0};
 
     DeviceBuffer<float> d_occupancy_samples{0};
     DeviceBuffer<float> d_tmp_grid{0};
@@ -481,6 +484,9 @@ extern "C" void launchVolumeRendering(
     float* d_render_rgb,
     float* d_render_depth,
     float* d_phi_out,
+    float* d_dw_out,
+    float* d_weight_sum,
+    float lambda_dist,
     float3 bg_color = make_float3(1.0f, 1.0f, 1.0f),
     cudaStream_t stream = 0
 );

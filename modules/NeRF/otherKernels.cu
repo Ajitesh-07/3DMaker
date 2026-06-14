@@ -321,6 +321,8 @@ __global__ void compute_color_grad(
     const float* __restrict__ color_mlp_out,
     const float* __restrict__ phi_chunk,
     const float* __restrict__ final_rgb,
+    const float* __restrict__ dw_out,
+    const float* __restrict__ weight_sum,
     half* __restrict__ custom_color_grad,
     float* __restrict__ tmp_dsigma,
     float loss_scale,
@@ -334,7 +336,9 @@ __global__ void compute_color_grad(
 
     float currentT = 1.0f;
     float3 currentRgb = make_float3(0.0f, 0.0f, 0.0f);
+    float currentWeightG = 0.0f;
     uint32_t rayIdx = ray_offsets[globalIdx];
+    float crrWeightGSum = weight_sum[globalIdx];
     float t = t_sorted[rayIdx];
     uint32_t maxDepth = num_steps[globalIdx];
 
@@ -399,12 +403,17 @@ __global__ void compute_color_grad(
         float ds_g = currentT * c_g * (1.0f - alpha) - suff_g;
         float ds_b = currentT * c_b * (1.0f - alpha) - suff_b;
 
+        float g_i = dw_out[i];
+        currentWeightG += weight * g_i;                          // include sample i -> suffix = sum_{k>i} g_k w_k
+        float suffix_weight = crrWeightGSum - currentWeightG;
         float d_sigma_i = delta_t * (ds_r * phi_r + ds_g * phi_g + ds_b * phi_b);
+        d_sigma_i += delta_t * (g_i * currentT * (1.0f - alpha) - suffix_weight);
         float ds = d_sigma_i * sigma * loss_scale * batch_scale;
         ds = fmaxf(-65504.0f, fminf(65504.0f, ds));
         if (ds != ds) {
             ds = 0.0f;
         }
+
         tmp_dsigma[i] = ds;
         currentT = currentT * (1.0f -  alpha);
     }

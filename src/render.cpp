@@ -84,46 +84,94 @@ int main(int argc, char** argv) {
         }
         
         if (data.contains("frames") && data["frames"].is_array() && data["frames"].size() > 0) {
+            int count = data["frames"].size();
+
+            // Camera centroid (fallback) + average up axis (transform column 1).
             float sum_px = 0.0f, sum_py = 0.0f, sum_pz = 0.0f;
             float sum_ux = 0.0f, sum_uy = 0.0f, sum_uz = 0.0f;
-            int count = data["frames"].size();
+
+            // Ray-convergence center: the point closest to every camera's view ray (where the
+            // cameras actually look). Solve M p = b, M = Sum(I - f f^T), b = Sum(I - f f^T) C.
+            // The camera centroid is WRONG for top-down/nadir captures -- it floats in the air
+            // above the content; this finds the content itself.
+            double M[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+            double bvec[3] = {0,0,0};
+
             for (auto& frame : data["frames"]) {
                 auto matrix = frame["transform_matrix"];
-                sum_px += (float)matrix[0][3];
-                sum_py += (float)matrix[1][3];
-                sum_pz += (float)matrix[2][3];
-                sum_ux += (float)matrix[0][1];
-                sum_uy += (float)matrix[1][1];
-                sum_uz += (float)matrix[2][1];
-            }
-            if (count > 0) {
-                g_scene_center[0] = sum_px / count;
-                g_scene_center[1] = sum_py / count;
-                g_scene_center[2] = sum_pz / count;
-                
-                float len_u = sqrtf(sum_ux*sum_ux + sum_uy*sum_uy + sum_uz*sum_uz);
-                if (len_u > 0) {
-                    g_world_up[0] = sum_ux / len_u;
-                    g_world_up[1] = sum_uy / len_u;
-                    g_world_up[2] = sum_uz / len_u;
-                }
+                float Cx = (float)matrix[0][3], Cy = (float)matrix[1][3], Cz = (float)matrix[2][3];
+                sum_px += Cx; sum_py += Cy; sum_pz += Cz;
+                sum_ux += (float)matrix[0][1]; sum_uy += (float)matrix[1][1]; sum_uz += (float)matrix[2][1];
+
+                // forward = -Z axis (column 2): cameras look along -Z
+                float fx = -(float)matrix[0][2], fy = -(float)matrix[1][2], fz = -(float)matrix[2][2];
+                float fl = sqrtf(fx*fx + fy*fy + fz*fz);
+                if (fl > 0) { fx/=fl; fy/=fl; fz/=fl; }
+
+                double a00 = 1.0 - (double)fx*fx, a01 = -(double)fx*fy, a02 = -(double)fx*fz;
+                double a11 = 1.0 - (double)fy*fy, a12 = -(double)fy*fz, a22 = 1.0 - (double)fz*fz;
+                M[0][0]+=a00; M[0][1]+=a01; M[0][2]+=a02;
+                M[1][0]+=a01; M[1][1]+=a11; M[1][2]+=a12;
+                M[2][0]+=a02; M[2][1]+=a12; M[2][2]+=a22;
+                bvec[0] += a00*Cx + a01*Cy + a02*Cz;
+                bvec[1] += a01*Cx + a11*Cy + a12*Cz;
+                bvec[2] += a02*Cx + a12*Cy + a22*Cz;
             }
 
-            auto matrix = data["frames"][0]["transform_matrix"];
-            float px = matrix[0][3];
-            float py = matrix[1][3];
-            float pz = matrix[2][3];
-            
-            float zc_x = matrix[0][2];
-            float zc_y = matrix[1][2];
-            float zc_z = matrix[2][2];
-            
-            float rel_cx = px - g_scene_center[0];
-            float rel_cy = py - g_scene_center[1];
-            float rel_cz = pz - g_scene_center[2];
-            
-            g_radius = sqrtf(rel_cx*rel_cx + rel_cy*rel_cy + rel_cz*rel_cz);
+            float cen_x = sum_px/count, cen_y = sum_py/count, cen_z = sum_pz/count;
+            g_scene_center[0] = cen_x; g_scene_center[1] = cen_y; g_scene_center[2] = cen_z;
+
+            float len_u = sqrtf(sum_ux*sum_ux + sum_uy*sum_uy + sum_uz*sum_uz);
+            if (len_u > 0) { g_world_up[0]=sum_ux/len_u; g_world_up[1]=sum_uy/len_u; g_world_up[2]=sum_uz/len_u; }
+
+            // Ridge-regularize toward the centroid so M stays invertible even when cameras are
+            // near-parallel (the view-axis direction is otherwise unconstrained for pure nadir).
+            double eps = 1e-3 * (M[0][0] + M[1][1] + M[2][2]);
+            M[0][0]+=eps; M[1][1]+=eps; M[2][2]+=eps;
+            bvec[0]+=eps*cen_x; bvec[1]+=eps*cen_y; bvec[2]+=eps*cen_z;
+
+            double det =
+                M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+              - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+              + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+            if (fabs(det) > 1e-9) {
+                double bx=bvec[0], by=bvec[1], bz=bvec[2];
+                double px = ( bx*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+                            - M[0][1]*(by*M[2][2]-M[1][2]*bz)
+                            + M[0][2]*(by*M[2][1]-M[1][1]*bz) ) / det;
+                double py = ( M[0][0]*(by*M[2][2]-M[1][2]*bz)
+                            - bx*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+                            + M[0][2]*(M[1][0]*bz-by*M[2][0]) ) / det;
+                double pz = ( M[0][0]*(M[1][1]*bz-by*M[2][1])
+                            - M[0][1]*(M[1][0]*bz-by*M[2][0])
+                            + bx*(M[1][0]*M[2][1]-M[1][1]*M[2][0]) ) / det;
+                g_scene_center[0]=(float)px; g_scene_center[1]=(float)py; g_scene_center[2]=(float)pz;
+            }
+
+            // Orbit radius + initial elevation from camera geometry relative to the center, so the
+            // view starts framed like the capture (near top-down for nadir, side-on for orbits).
+            float sum_r = 0.0f, sum_elev = 0.0f;
+            for (auto& frame : data["frames"]) {
+                auto matrix = frame["transform_matrix"];
+                float dx=(float)matrix[0][3]-g_scene_center[0];
+                float dy=(float)matrix[1][3]-g_scene_center[1];
+                float dz=(float)matrix[2][3]-g_scene_center[2];
+                float r = sqrtf(dx*dx+dy*dy+dz*dz);
+                sum_r += r;
+                if (r > 1e-6f) {
+                    float e = (dx*g_world_up[0]+dy*g_world_up[1]+dz*g_world_up[2]) / r;
+                    sum_elev += asinf(fmaxf(-1.0f, fminf(1.0f, e)));
+                }
+            }
+            g_radius = sum_r / count;
             if (g_radius < 0.1f) g_radius = 1.0f;
+            g_pitch = sum_elev / count;
+            if (g_pitch > 1.5f) g_pitch = 1.5f;
+            if (g_pitch < -1.5f) g_pitch = -1.5f;
+
+            std::cout << "[viewer] center=(" << g_scene_center[0] << "," << g_scene_center[1] << ","
+                      << g_scene_center[2] << ") radius=" << g_radius
+                      << " pitch=" << (g_pitch * 57.2958f) << " deg" << std::endl;
         }
     } catch (std::exception& e) {
         std::cerr << "Warning: Failed to parse from " << transforms_path << ". Using defaults." << std::endl;

@@ -115,15 +115,24 @@ int main(int argc, char** argv) {
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
     // AABB + numCascades are overridden below from the DataLoader's pose-derived scene bounds.
-    opts.numCascades = 4;
-    opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
-    opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
+    opts.numCascades = 1;
+    opts.aabbMin = make_float3(-1.5f, -1.5f, -0.7f);
+    opts.aabbMax = make_float3(1.5f, 1.5f, 0.7f);
+
+    // Distortion-loss weight: argv[2] overrides the default so we can A/B without rebuilds.
+    // 0 disables the distortion gradient entirely (g_k = 0).
+    opts.lambdaDist = 0;
+    if (argc > 2) {
+        opts.lambdaDist = (float)atof(argv[2]);
+    }
+    printf("[TRAIN] Using Lambda %f", opts.lambdaDist);
+    std::cout << "lambdaDist = " << opts.lambdaDist << std::endl;
 
     std::cout << "\nLoading training dataset..." << std::endl;
     DataLoader dataset(dataset_path, opts.rayChunkSize, true, false);
 
     // Pull the per-axis grid bounds + cascade estimate the DataLoader derived from the poses.
-    dataset.getGridBounds(opts.aabbMin, opts.aabbMax);
+    // dataset.getGridBounds(opts.aabbMin, opts.aabbMax);
     // opts.numCascades = dataset.getNumCascades();
     std::cout << "[train_hit] Using derived AABB min=(" << opts.aabbMin.x << "," << opts.aabbMin.y << ","
               << opts.aabbMin.z << ") max=(" << opts.aabbMax.x << "," << opts.aabbMax.y << "," << opts.aabbMax.z

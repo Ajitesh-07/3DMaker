@@ -87,6 +87,7 @@ __global__ void render_rays_distortion_kernel(
     float* __restrict__ final_depth,
     float* __restrict__ phi_out,
     float* __restrict__ dw_out,
+    float* __restrict weight_sum,
     float lambda_dist,
     float3 bg_color
 ) {
@@ -140,6 +141,7 @@ __global__ void render_rays_distortion_kernel(
         dw_out[idx] = weight;
     }
 
+    float weight_g_sum = 0.0f;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t idx = offset + i;
         float t = t_sorted[idx];
@@ -158,10 +160,13 @@ __global__ void render_rays_distortion_kernel(
 
         float dl_bilinear = m * (2 * dw_sum - dw_global_sum) + (dwm_global_sum - 2*dwm_sum);
         dw_out[idx] = lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_t);
+        weight_g_sum += crrWeight*lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_t);
 
         dw_sum += crrWeight;
         dwm_sum += crrWeight * m;
     }
+
+    weight_sum[r] = weight_g_sum;
 
     r_c += T * bg_color.x;
     g_c += T * bg_color.y;
@@ -192,6 +197,9 @@ extern "C" void launchVolumeRendering(
     float* d_render_rgb,
     float* d_render_depth,
     float* d_phi_out,
+    float* d_dw_out,
+    float* d_weight_sum,
+    float lambda_dist,
     float3 bg_color,
     cudaStream_t stream
 ) {
@@ -199,18 +207,37 @@ extern "C" void launchVolumeRendering(
     
     constexpr int BS = 256;
     int gs = (num_rays + BS - 1) / BS;
-    
-    render_rays_kernel<<<gs, BS, 0, stream>>>(
-        num_rays,
-        d_ray_offsets,
-        d_num_steps,
-        d_t_sorted,
-        d_density_sigma,
-        d_rgb_output,
-        d_rgb_true,
-        d_render_rgb,
-        d_render_depth,
-        d_phi_out,
-        bg_color
-    );
+
+    if (d_dw_out == nullptr) {
+        render_rays_kernel<<<gs, BS, 0, stream>>>(
+            num_rays,
+            d_ray_offsets,
+            d_num_steps,
+            d_t_sorted,
+            d_density_sigma,
+            d_rgb_output,
+            d_rgb_true,
+            d_render_rgb,
+            d_render_depth,
+            d_phi_out,
+            bg_color
+        );
+    } else {
+        render_rays_distortion_kernel<<<gs, BS, 0, stream>>>(
+            num_rays,
+            d_ray_offsets,
+            d_num_steps,
+            d_t_sorted,
+            d_density_sigma,
+            d_rgb_output,
+            d_rgb_true,
+            d_render_rgb,
+            d_render_depth,
+            d_phi_out,
+            d_dw_out,
+            d_weight_sum,
+            lambda_dist,
+            bg_color
+        );
+    }
 }
