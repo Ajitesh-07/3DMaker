@@ -207,12 +207,17 @@ __global__ void compute_SH_gather(
     float4 d1215 = densityOut_vec[3];
 
     // Sanitize the raw density logits before they (a) drive sigma via expf and
-    // (b) get packed into fp16 as the color-MLP input. On dense real-world
-    // scenes a logit can blow past the fp16 range; left unchecked it becomes an
-    // Inf/NaN color input that taints the loss. Clamp to a safe fp16-representable
-    // band and scrub NaNs so neither path can carry a non-finite value forward.
+    // (b) get packed into fp16 as the color-MLP input. The clamp band must be
+    // *matmul-safe*, not merely fp16-storable: a feature near the fp16 max
+    // (65504) is representable but, once multiplied by color-MLP weights and
+    // summed across the hidden dim, overflows fp16 -> Inf -> Inf-Inf=NaN ->
+    // sigmoid(NaN)=NaN -> NaN render -> NaN loss -> the density field collapses
+    // and the occupancy grid empties (unrecoverable). Healthy geometry features
+    // are O(1-10), so +/-64 is far above anything legitimate yet leaves ample
+    // headroom under the fp16 overflow point. Density is unaffected: value[0]
+    // feeds expf(fminf(.-bias,8)), which already saturates at +8, and -64 -> ~0.
     auto sanitize_logit = [](float v) -> float {
-        v = fmaxf(-30000.0f, fminf(30000.0f, v));
+        v = fmaxf(-64.0f, fminf(64.0f, v));
         return (v != v) ? 0.0f : v;
     };
     d03.x = sanitize_logit(d03.x); d03.y = sanitize_logit(d03.y);

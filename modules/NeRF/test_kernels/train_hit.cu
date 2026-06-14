@@ -102,6 +102,8 @@ int main(int argc, char** argv) {
         dataset_path = argv[1];
     }
 
+    int maxSteps = 15000;
+
     NerfOptions opts;
     opts.densityBias = 1.0f;
     opts.rayChunkSize = 64 * 1024; // Limit VRAM per training step
@@ -112,15 +114,28 @@ int main(int argc, char** argv) {
     opts.lossScale = 128.0f;     // FP16 Mixed Precision scaling
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
-    opts.numCascades = 8;
+    // AABB + numCascades are overridden below from the DataLoader's pose-derived scene bounds.
+    opts.numCascades = 4;
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
     opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
 
     std::cout << "\nLoading training dataset..." << std::endl;
-    DataLoader dataset(dataset_path, opts.rayChunkSize); 
+    DataLoader dataset(dataset_path, opts.rayChunkSize, true, false);
 
+    // Pull the per-axis grid bounds + cascade estimate the DataLoader derived from the poses.
+    dataset.getGridBounds(opts.aabbMin, opts.aabbMax);
+    // opts.numCascades = dataset.getNumCascades();
+    std::cout << "[train_hit] Using derived AABB min=(" << opts.aabbMin.x << "," << opts.aabbMin.y << ","
+              << opts.aabbMin.z << ") max=(" << opts.aabbMax.x << "," << opts.aabbMax.y << "," << opts.aabbMax.z
+              << ") numCascades=" << opts.numCascades << std::endl;
+
+    // The test loader must live in the SAME normalized frame as training, so reuse the
+    // transform instead of deriving its own (test poses differ from train for e.g. lego).
+    float3 sc_center; float sc_scale;
+    dataset.getSceneTransform(sc_center, sc_scale);
     std::cout << "\nLoading test dataset for rendering..." << std::endl;
-    DataLoader test_dataset(dataset_path, opts.rayChunkSize, false); // Pass false to load transforms_test.json
+    DataLoader test_dataset(dataset_path, opts.rayChunkSize, false,
+                            sc_center, sc_scale, opts.aabbMin, opts.aabbMax);
 
     std::cout << "\nInitializing NeRF Model..." << std::endl;
     InstantNerf nerf;
@@ -140,7 +155,7 @@ int main(int argc, char** argv) {
     
     // Cosine Annealing Learning Rate limits
     float max_lr = opts.learningRate;
-    float min_lr = 1e-2f;
+    float min_lr = 1e-4f;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -162,6 +177,7 @@ int main(int argc, char** argv) {
     // 3. Main Training Epochs
     // ==========================================
     for (int epoch = 1; epoch <= totalEpochs; ++epoch) {
+        if (maxSteps > 0 && trainSteps > maxSteps) break;
         
         // Generate a new random seed for the DataLoader to perfectly randomize rays this epoch!
         uint32_t epoch_seed = seed_dist(rng);
@@ -172,8 +188,18 @@ int main(int argc, char** argv) {
         
         for (int offset = 0; offset < total_rays; offset += opts.rayChunkSize) {
             
+            if (maxSteps > 0 && trainSteps > maxSteps) break;
+
             // 3.1 Cosine Annealing Learning Rate Update
-            float progress = (float)current_chunk / (float)total_chunks;
+            // Anneal over the ACTUAL run length. trainSteps (incremented inside
+            // trainWithRaysHit, ~32 per chunk) advances far faster than current_chunk, so on a
+            // maxSteps-capped run current_chunk/total_chunks only reaches ~3% -> LR stays pinned
+            // near max_lr the whole run, driving late-training divergence. Drive the cosine by
+            // trainSteps/maxSteps so the LR truly sweeps max_lr -> min_lr; fall back to the full
+            // chunk schedule when uncapped (maxSteps <= 0).
+            float progress = (maxSteps > 0)
+                ? fminf((float)trainSteps / (float)maxSteps, 1.0f)
+                : (float)current_chunk / (float)total_chunks;
             float current_lr = min_lr + 0.5f * (max_lr - min_lr) * (1.0f + cosf(3.14159265359f * progress));
             nerf.setLearningRate(current_lr);
             current_chunk++;

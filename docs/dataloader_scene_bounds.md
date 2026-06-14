@@ -455,3 +455,205 @@ actively penalized. `house1`'s vertical smear needs the third leg.
 - Per-axis `gridResolution` vs. uniform (gotcha 3).
 - How to carry the point cloud to the loader for pre-built datasets that have one (sidecar file?).
 - Double-normalization guard for our own `colmap2nerf` outputs (gotcha 7).
+
+---
+
+## 15. Review addendum — §6 must be regime-gated (orbit "camera-shell" inflation)
+
+**Finding (review of §6.2).** The march depth `D ≈ 2·median‖Cᵢ − p*‖` is wrong for
+inward-converging (orbit) captures — and the bug is the `2·d` factor and the union-of-frustums
+geometry, *not* the choice of statistic.
+
+### 15.1 Why the orbit march inflates to the camera shell
+Marching from each camera produces samples in the **empty space between the camera and the
+object**. For an inward orbit, rays arrive from all directions and crisscross, so the union of
+samples fills the entire interior **ball of radius ≈ camera distance**, not the object.
+
+> **Worked example.** 100 cameras on a ring of radius `d = 3` looking at an object of radius
+> `r_obj = 1` at the origin, `D = 2d = 6`. Camera `(3,0,0)` marches to `(−3,0,0)`; `(0,3,0)`
+> marches to `(0,−3,0)`; etc. The samples fill the **disk of radius 3**, so `Q98%` per axis ≈ `3`
+> → the box half-extent is the *camera radius*, not the object.
+
+After normalizing the largest axis to `1.5`, the object (radius 1) lands at radius
+`1.5·(1/3) = 0.5` — it fills only a third of the box linearly, **~1/27 by volume**. That is the
+"object underfills the grid → blur" failure from the scale discussion. (It does *not* cause fog
+here — rays pass through the gap and constrain it empty — it wastes resolution.)
+
+**Consequence:** switching `median → Q95` makes this *slightly worse*, not better, because it
+nudges `D`/`d` upward. The statistic was never the problem.
+
+### 15.2 The frustum march is only valid for diverging / parallel captures
+For nadir / forward-facing / panorama captures, rays **don't** crisscross, so the union of
+frustums genuinely is the content slab — which is why the march works for `house1`. The
+distinction is exactly:
+
+| Capture | Rays | Union of frustums | Frustum march? |
+|---|---|---|---|
+| Orbit / inward (`inwardness ≳ 0.9`) | converge | whole interior ball (≫ object) | ❌ inflates → use `r_obj` |
+| Nadir / forward / panorama | diverge or parallel | the content slab | ✅ correct |
+
+### 15.3 Fix — regime-gate the box construction (amends §6.2 / §6.4)
+- **Orbit / inward-converging:** do **not** march. Use §5's framing-estimator `r_obj` directly
+  for a symmetric box (`H[a] = r_obj`, normalized so the max axis → `1.5`). This restores the
+  object to unit radius and maximizes resolution.
+- **Nadir / forward / panorama (diverging or parallel):** use the frustum march, with
+  **`D = k · Q95(footprint)`** — i.e. the `median → Q95` change from review, scoped to the only
+  branch where the march applies. `Q95` (not `max`) rejects outlier poses; `Q98%` in §6.3 still
+  trims the sample tail.
+
+### 15.4 Net change to §6
+```
+if regime == ORBIT (inwardness ≳ 0.9):
+    H[a] = r_obj              # from §5 framing estimator; symmetric box, no march
+else:  # NADIR / FORWARD / PANORAMA
+    D    = k · Q95(footprint) # was 2·median camera distance — fixed
+    march frustum-corner rays to D  →  samples P
+    lo[a],hi[a] = Q2%, Q98% of {P_a}
+    H[a] = (hi[a]-lo[a]) / 2
+# then §6.4 recenter + isotropic scale + clamp to 1.5 as before
+```
+
+**Takeaway:** the frustum march measures *where cameras can see*, which equals *where content is*
+only when rays don't converge. For orbits that's false (cameras see the whole interior), so the
+object's scale must come from `r_obj`, not from marching to the opposite camera.
+
+---
+
+## 16. Refinement — DataLoader-owned COLMAP point cloud (preferred path)
+
+This supersedes the pose-only derivation (§4–7, §15) **whenever a point cloud is available**.
+The pose-only path is retained only as the fallback when COLMAP fails or returns too few points.
+
+### 16.0 Resolved open questions (from §14)
+- **Asymmetric box: ADOPTED.** The AABB may have `aabb_min.a ≠ −aabb_max.a` when the content
+  wants it (e.g. a house pokes *up* from a flat ground plane). The kernels already support this
+  (per-axis, per-side `get_cascade`; per-axis `contract_pos`/`cellSize`). The only requirement is
+  that the **origin stays inside the content** (recenter to the subject center) so cascade 0
+  contains the subject.
+- **Grid resolution: FIXED.** `gridResolution` stays uniform; **cascades scale the box, the
+  resolution fits it** (constant cells per cascade level). Consequence: with an anisotropic box
+  the cells are rectangular and the thin axis gets *finer* sampling per unit length — accepted
+  (it's free resolution where content is thin). We do **not** make `gridResolution.a ∝ H[a]`.
+
+### 16.1 Architecture / data flow
+The main script only **extracts images**. The DataLoader owns geometry:
+
+```
+DataLoader(images_dir):
+    if transforms_train.json exists:
+        poses ← json (TRUSTED — may be synthetic ground truth / higher quality than COLMAP)
+        if points cache exists: points ← cache
+        else:
+            run COLMAP (feature → match → map)          # for the POINT CLOUD only
+            register COLMAP frame → json frame (§16.2)   # poses differ; must align
+            points ← similarity-transformed COLMAP points
+            save points cache (.ply / bin sidecar)       # COLMAP runs ONCE
+    else:                                                # pure images (no json)
+        run COLMAP (or reuse cache) → poses AND points   # same frame, no registration
+    if points are sufficient (≥ N_min): geometric path (§16.3–16.6)
+    else:                                                 # COLMAP sparse/failed
+        pose-only fallback (§4–7, §15)
+```
+
+### 16.2 Registration — align COLMAP points to the trusted poses (Umeyama similarity)
+COLMAP reconstructs its **own** camera poses `{Aᵢ}` (centers) *and* points `{Xⱼ}` in an arbitrary
+frame. If we keep the json poses `{Bᵢ}`, the points are in the wrong frame. Because COLMAP also
+posed the **same images**, we have center correspondences `Aᵢ ↔ Bᵢ` (matched by filename) and can
+solve the 7-DoF similarity `(s_reg, R, t)` that maps COLMAP → json:
+
+$$\min_{s_{\text{reg}},R,t}\ \sum_i \big\lVert B_i - (s_{\text{reg}} R A_i + t)\big\rVert^2$$
+
+**Umeyama (1991) closed form.** With `μ_A, μ_B` the centroids, `σ_A² = (1/n)Σ‖Aᵢ − μ_A‖²`, and
+cross-covariance `Σ = (1/n) Σ (Bᵢ − μ_B)(Aᵢ − μ_A)^⊤`, take the SVD `Σ = U D V^⊤`:
+
+$$S = \begin{cases} I & \det(U)\det(V) \ge 0\\ \operatorname{diag}(1,1,-1) & \text{otherwise}\end{cases}, \quad
+R = U S V^\top, \quad s_{\text{reg}} = \frac{\operatorname{tr}(D S)}{\sigma_A^2}, \quad t = \mu_B - s_{\text{reg}} R\,\mu_A$$
+
+Then transform every point: `Xⱼ^json = s_reg R Xⱼ^colmap + t`.
+
+> **`s_reg` is the *registration* scale (COLMAP→json units) — a different quantity from the
+> *normalization* scale `s_norm` of §16.4.** Keep them distinct in code.
+
+**Caveats:**
+- Needs `≥ 3` non-collinear correspondences. The `S` term fixes the reflection/handedness
+  ambiguity (e.g. an OpenCV↔OpenGL world flip).
+- **Coplanar cameras** (nadir `house1`: all at one altitude) → the in-plane fit is well-posed but
+  the out-of-plane direction is weakly constrained; check the **residual** `Σ‖Bᵢ − (s_regRAᵢ+t)‖²`.
+- If the residual is large, the json convention differs by something the proper-rotation fit
+  can't absorb → log and fall back to pose-only (§16.1).
+
+### 16.3 Subject vs. background, center, per-axis extents
+Each `points3D` entry carries a **track** = list of `(image_id, point2d_idx)`; its length is the
+**view count** `vⱼ` (how many cameras saw it). Well-observed points lie on the main subject;
+stray background/floaters are seen rarely.
+
+```
+subject  = points with vⱼ in the top 20% by view count    # isolate the object
+center   = component-wise MEDIAN of subject               # robust to floaters; origin goes here
+```
+
+Recenter all poses **and** points by `−center` (origin → subject center; §16.0 requirement).
+Then per axis `a`, per side, take **robust percentile** extents of the subject (reject the
+outer-tail floaters that survived the view-count filter):
+
+$$e_a^{+} = Q_{90\%}\big(\{X_{j,a} : X_{j,a} > 0\}\big), \qquad
+  e_a^{-} = \big\lvert Q_{10\%}\big(\{X_{j,a} : X_{j,a} < 0\}\big)\big\rvert$$
+
+(The two sides differ ⇒ the **asymmetry the content wants**, e.g. taller `+z` than `−z`.)
+
+### 16.4 Isotropic normalization scale
+Map the **widest subject extent** to radius `1.0`, deliberately leaving the `1.0 → 1.5` band of
+the base box as headroom for the outer-10% subject points and immediate background (so they stay
+in cascade 0 instead of spilling to cascade 1):
+
+$$s_{\text{norm}} = \frac{1.0}{\max_a\big(\max(e_a^{+}, e_a^{-})\big)}$$
+
+Apply `s_norm` (one **isotropic** scalar — §3.3) to all pose translations and points.
+
+> *Difference from the pose-only §6.4 (which maps to `1.5`):* there we had no subject/background
+> separation, so we filled the box. Here the point cloud *separates* them, so we reserve the
+> headroom on purpose and let the background drive cascades (§16.5). Same philosophy, better data.
+
+### 16.5 `num_cascades` from real geometry (replaces the §7 classifier)
+With the subject at radius `~1.0`, measure how far the **whole** cloud reaches:
+
+$$\text{scene\_radius} = Q_{95\%}\big(\{\lVert X_j\rVert_{\text{norm}}\}\big), \qquad
+\texttt{num\_cascades} = \operatorname{clamp}\!\Big(\big\lceil \log_2(\text{scene\_radius}/1.5)\big\rceil + 1,\ 1,\ 6\Big)$$
+
+This is the §9 formula, now always available — it *measures* background extent instead of
+*guessing the regime*. A file-supplied `aabb_scale`/`num_cascades` still overrides (the `house1`
+lesson, §7).
+
+### 16.6 AABB assembly (asymmetric, per-axis, fixed grid)
+```
+H_a^+ = clamp( margin · e_a^+ · s_norm , H_min , 1.5 )      # margin ≈ 1.1–1.5
+H_a^- = clamp( margin · e_a^- · s_norm , H_min , 1.5 )
+aabb_min = ( -H_x^- , -H_y^- , -H_z^- )                     # asymmetric allowed
+aabb_max = ( +H_x^+ , +H_y^+ , +H_z^+ )
+gridResolution = fixed uniform uint3                        # §16.0: grid scales, res fits
+```
+
+### 16.7 Worked prediction — `house1` with points
+- COLMAP runs on the 50 images → dense-ish ground + house points; registered to the json poses
+  via §16.2 (`s_reg` ~ matches the instant-ngp normalization scale; coplanar-camera residual
+  checked).
+- Subject (top-20% viewed) = the house + nearby ground. Median center sits **on the ground**, not
+  at the camera plane — fixing the `p* ≈ camera altitude` problem (§11) *with geometry instead of
+  the march heuristic*.
+- Per-axis extents: wide XY, thin Z, and **`+z` (house height) > `−z` (flat ground)** → genuinely
+  asymmetric box. After `s_norm`: roughly `aabb_max ≈ (1.5, 1.5, +0.5)`,
+  `aabb_min ≈ (−1.5, −1.5, −0.15)`.
+- `num_cascades`: measured from the actual ground extent (likely `1`, consistent with
+  `aabb_scale=1`) rather than the nadir classifier's misleading "unbounded → many."
+
+### 16.8 What stays vs. what becomes fallback
+| Concern | With point cloud (preferred) | Pose-only fallback |
+|---|---|---|
+| Center | subject **median** (§16.3) | ray convergence `p*` / box midpoint (§4, §6.4) |
+| Scale | widest subject extent → `1.0` (§16.4) | framing estimator / frustum march (§5, §6) |
+| Per-axis AABB | subject percentiles, asymmetric (§16.6) | frustum march, regime-gated (§15) |
+| `num_cascades` | measured `log2`-ratio (§16.5) | regime classifier, logged estimate (§7) |
+| Registration | Umeyama if json poses kept (§16.2) | n/a (COLMAP poses used directly) |
+
+The point cloud removes every ambiguous knob (`D`, `f_fill`, the classifier thresholds); they
+survive only on the fallback path.
