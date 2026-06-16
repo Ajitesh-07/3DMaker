@@ -52,14 +52,15 @@ int main() {
     CUDA_CHECK(cudaMemset(d_rgb_out2, 0, numRays * 3 * sizeof(float)));
 
     NerfOptions opts;
-    opts.rayChunkSize = 256 * 1024;
+    opts.rayChunkSize = 64 * 1024;
     opts.batchSize = 256 * 1024;
     opts.isProfiling = true;
+    opts.legacyRenderFlag = true;   // renderImage needs the rayChunkSize*MAX_HITS sparse buffers
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
     opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
     
     InstantNerf nerf;
-    nerf.init(opts);
+    nerf.init(opts, INFERENCE);
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));

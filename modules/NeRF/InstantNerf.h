@@ -50,6 +50,7 @@ struct NerfOptions {
     int baseResolution = 16;
     int featuresPerLevel = 2;
 
+    int renderBatchSize = 2048 * 1024;
     int batchSize = 256 * 1024;
     int rayChunkSize = 256 * 1024;
 
@@ -67,6 +68,7 @@ struct NerfOptions {
     float decayValue = 0.95f;
     float densityBias = 1.0f;
 
+    bool legacyRenderFlag = false;
     bool isProfiling = false;
 };
 
@@ -488,5 +490,54 @@ extern "C" void launchVolumeRendering(
     float* d_weight_sum,
     float lambda_dist,
     float3 bg_color = make_float3(1.0f, 1.0f, 1.0f),
+    uint32_t base = 0,
+    uint32_t raysDone = 0,
     cudaStream_t stream = 0
+);
+
+extern "C" void processRaysHitData(
+    const uint32_t num_rays,
+    const float3* rays_o,
+    const float3* rays_d,
+    const float3* rays_d_inv,
+    const float* nears,
+    const float* fars,
+    const uint8_t* occupancy_grid,
+    const uint3 grid_resolution,
+    const float3 aabb_min,
+    const float3 aabb_max,
+    const int numCascades,
+    const int mipmapLevels,
+    uint32_t* d_num_steps,
+    uint32_t* d_ray_offsets,
+    uint32_t* d_block_sums,
+    cudaStream_t stream
+);
+
+extern "C" int processRaysHitPositions(
+    const uint32_t num_rays,
+    const float3* rays_o,
+    const float3* rays_d,
+    const float3* rays_d_inv,
+    const float* nears,
+    const float* fars,
+    const uint8_t* occupancy_grid,
+    const uint3 grid_resolution,
+    const float3 aabb_min,
+    const float3 aabb_max,
+    const int numCascades,
+    const int mipmapLevels,
+
+    const uint32_t rays_done,
+    const int batchSize,
+    uint32_t* totalHits,
+    uint32_t* out_base,
+    uint32_t* d_num_steps,
+    uint32_t* d_ray_offsets,
+    float* d_mlp_positions_batch,
+    uint32_t* d_ray_indices,
+    uint32_t* d_active_rays_count,
+    float* d_t_sorted,
+    uint32_t* d_block_sums,
+    cudaStream_t stream
 );

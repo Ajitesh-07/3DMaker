@@ -4,6 +4,8 @@
 
 __global__ void render_rays_kernel(
     const uint32_t num_rays,
+    const uint32_t base,
+    const uint32_t raysDone,
     const uint32_t* __restrict__ ray_offsets,
     const uint32_t* __restrict__ num_steps,
     const float* __restrict__ t_sorted,
@@ -18,7 +20,7 @@ __global__ void render_rays_kernel(
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= num_rays) return;
 
-    uint32_t offset = ray_offsets[r];
+    uint32_t offset = ray_offsets[r + raysDone] - base;
     uint32_t count = num_steps[r];
 
     float T = 1.0f;
@@ -201,6 +203,8 @@ extern "C" void launchVolumeRendering(
     float* d_weight_sum,
     float lambda_dist,
     float3 bg_color,
+    uint32_t base,
+    uint32_t raysDone,
     cudaStream_t stream
 ) {
     if (num_rays == 0) return;
@@ -211,6 +215,8 @@ extern "C" void launchVolumeRendering(
     if (d_dw_out == nullptr) {
         render_rays_kernel<<<gs, BS, 0, stream>>>(
             num_rays,
+            base,
+            raysDone,
             d_ray_offsets,
             d_num_steps,
             d_t_sorted,

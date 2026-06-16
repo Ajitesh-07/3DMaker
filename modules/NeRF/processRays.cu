@@ -741,6 +741,36 @@ __global__ void find_cutoff_ray_kernel(
     }
 }
 
+__global__ void find_cutoff_ray_from_kernel(
+    const uint32_t num_rays,
+    const uint32_t* __restrict__ ray_offsets,
+    const uint32_t* __restrict__ num_steps,
+    const uint32_t batch_size,
+    const uint32_t rays_done,
+    uint32_t* __restrict__ next_rays_done
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x + rays_done;
+    if (i >= num_rays) return;
+
+    const uint32_t base = ray_offsets[rays_done];
+
+    uint32_t hits_inclusive = ray_offsets[i] + num_steps[i] - base;
+
+    if (hits_inclusive <= batch_size) {
+        bool boundary = true;
+        if (i < num_rays - 1) {
+            uint32_t next_hits_inclusive = ray_offsets[i + 1] + num_steps[i + 1] - base;
+            if (next_hits_inclusive <= batch_size) {
+                boundary = false;
+            }
+        }
+
+        if (boundary) {
+            *next_rays_done = i + 1;
+        }
+    }
+}
+
 __global__ void march_rays_dda_offset(
     const uint32_t num_rays,
     const float3* __restrict__ rays_o,
@@ -755,6 +785,7 @@ __global__ void march_rays_dda_offset(
     const int      num_cascades,
     const int      levelsMipmap,
     const uint32_t* __restrict__ ray_offsets,
+    const uint32_t   base_offset,   // subtract so writes land batch-local (0-based); pass 0 for a fresh prefix sum
     float* __restrict__ t_hits_out,
     uint32_t* __restrict__ ray_indices_out,
     float* __restrict__ mlp_positions
@@ -771,8 +802,8 @@ __global__ void march_rays_dda_offset(
     float3 aabb_extent = make_float3(aabb_max.x - aabb_min.x, aabb_max.y - aabb_min.y, aabb_max.z - aabb_min.z);
     int3 step = make_int3((d.x >= 0.0f) ? 1 : -1, (d.y >= 0.0f) ? 1 : -1, (d.z >= 0.0f) ? 1 : -1);
 
-    uint32_t hit_count = 0; 
-    uint32_t out_base_idx = ray_offsets[i];
+    uint32_t hit_count = 0;
+    uint32_t out_base_idx = ray_offsets[i] - base_offset;
     
     float current_t = t_min;
     int current_level = levelsMipmap - 1;
@@ -964,11 +995,141 @@ int processRaysHitLinear(
         numCascades,
         mipmapLevels,
         d_ray_offsets,
+        0u,
         d_t_sorted,
         d_ray_indices,
         d_mlp_positions_batch
     );
 
     return h_active_rays_count;
+}
+
+void processRaysHitData(
+    const uint32_t num_rays,
+    const float3* rays_o,
+    const float3* rays_d,
+    const float3* rays_d_inv,
+    const float* nears,
+    const float* fars,
+    const uint8_t* occupancy_grid,
+    const uint3 grid_resolution,
+    const float3 aabb_min,
+    const float3 aabb_max,
+    const int numCascades,
+    const int mipmapLevels,
+    uint32_t* d_num_steps,
+    uint32_t* d_ray_offsets,
+    uint32_t* d_block_sums,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 256;
+    const int gs = (num_rays + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    march_rays_dda_calc_hits<<<gs, BLOCK_SIZE, 0, stream>>>(
+        num_rays,
+        rays_o,
+        rays_d,
+        rays_d_inv,
+        nears,
+        fars,
+        occupancy_grid,
+        grid_resolution,
+        aabb_min,
+        aabb_max,
+        numCascades,
+        mipmapLevels,
+        d_num_steps
+    );
+
+    custom_exclusive_sum(d_num_steps, d_ray_offsets, d_block_sums, num_rays, stream);
+}
+
+int processRaysHitPositions(
+    const uint32_t num_rays,
+    const float3* rays_o,
+    const float3* rays_d,
+    const float3* rays_d_inv,
+    const float* nears,
+    const float* fars,
+    const uint8_t* occupancy_grid,
+    const uint3 grid_resolution,
+    const float3 aabb_min,
+    const float3 aabb_max,
+    const int numCascades,
+    const int mipmapLevels,
+
+    const uint32_t rays_done,
+    const int batchSize,
+    uint32_t* totalHits,
+    uint32_t* out_base,
+    uint32_t* d_num_steps,
+    uint32_t* d_ray_offsets,
+    float* d_mlp_positions_batch,
+    uint32_t* d_ray_indices,
+    uint32_t* d_active_rays_count,
+    float* d_t_sorted,
+    uint32_t* d_block_sums,
+    cudaStream_t stream
+) {
+
+    const uint32_t raysLeft = num_rays - rays_done;
+    constexpr int BLOCK_SIZE = 256;
+    const int gs = (raysLeft + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    cudaMemsetAsync(d_active_rays_count, 0, sizeof(uint32_t), stream);
+
+    find_cutoff_ray_from_kernel<<<gs, BLOCK_SIZE, 0, stream>>>(
+        num_rays,
+        d_ray_offsets,
+        d_num_steps,
+        (uint32_t)batchSize,
+        rays_done,                 
+        d_active_rays_count
+    );
+
+    uint32_t next_abs = 0;
+    cudaMemcpyAsync(&next_abs, d_active_rays_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (next_abs <= rays_done) {
+        *totalHits = 0;
+        return 0;
+    }
+
+    const uint32_t batch_rays = next_abs - rays_done;
+
+    uint32_t base = 0;
+    cudaMemcpyAsync(&base, &d_ray_offsets[rays_done], sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+
+    uint32_t last_offset = 0, last_count = 0;
+    cudaMemcpyAsync(&last_offset, &d_ray_offsets[next_abs - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(&last_count,  &d_num_steps[next_abs - 1],  sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    *out_base = base;
+    *totalHits = (last_offset + last_count) - base;
+
+    const int gs2 = (batch_rays + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    march_rays_dda_offset<<<gs2, BLOCK_SIZE, 0, stream>>>(
+        batch_rays,
+        rays_o     + rays_done,
+        rays_d     + rays_done,
+        rays_d_inv + rays_done,
+        nears      + rays_done,
+        fars       + rays_done,
+        occupancy_grid,
+        grid_resolution,
+        aabb_min,
+        aabb_max,
+        numCascades,
+        mipmapLevels,
+        d_ray_offsets + rays_done,
+        base,                   
+        d_t_sorted,
+        d_ray_indices,
+        d_mlp_positions_batch
+    );
+
+    return batch_rays;
+
 }
 
