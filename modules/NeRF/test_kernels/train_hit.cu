@@ -93,6 +93,28 @@ __global__ void generate_custom_rays_kernel(
 // ------------------------------------------------------------------
 
 int main(int argc, char** argv) {
+    for (int a = 1; a < argc; ++a) {
+        std::string arg = argv[a];
+        if (arg == "--help" || arg == "-h") {
+            std::cout <<
+                "train_hit -- from-scratch CUDA NeRF trainer (hit-centric path)\n\n"
+                "Usage:\n"
+                "  train_hit [dataset] [lambdaDist] [K] [maxSteps] [numCascades] [profiling]\n\n"
+                "Positional args (all optional, parsed left-to-right):\n"
+                "  dataset      dataset dir with transforms_train.json + images   (default ../../data/nerf_synthetic/lego)\n"
+                "  lambdaDist   distortion-loss weight, 0 = off                    (default 0)\n"
+                "  K            samplesPerVoxel: sub-voxel samples / occupied voxel (default 1)\n"
+                "  maxSteps     training-step cap, <=0 = run all epochs            (default 15000)\n"
+                "  numCascades  occupancy cascades: 1 bounded, 2-4 for 360 scenes  (default 2)\n"
+                "  profiling    1 = enable per-stage GPU timers                    (default 0)\n\n"
+                "Examples:\n"
+                "  train_hit ../../data/nerf_synthetic/lego\n"
+                "  train_hit ../../data/mip_nerf360/bicycle 0.0362781 8 100000 2 0\n"
+                "  train_hit --help\n";
+            return 0;
+        }
+    }
+
     std::cout << "Starting NeRF Hit-Centric Training with Streaming DataLoader..." << std::endl;
 
     // ==========================================
@@ -348,7 +370,7 @@ int main(int argc, char** argv) {
             for (int off = 0; off < pixels; off += render_tile) {
                 int count = std::min(render_tile, pixels - off);
                 // Stream this tile's rays to the GPU (offsets stay within one image).
-                test_dataset.fetchRayChunk(i * pixels + off, count, 0, make_float3(1.0f, 1.0f, 1.0f));
+                test_dataset.fetchRayChunk(i * pixels + off, count, 0, make_float3(1.0f, 1.0f, 1.0f), 0, /*forceSequential=*/true);
                 CUDA_CHECK(cudaDeviceSynchronize());
                 // Render the tile into its slice of the output buffer.
                 nerf.renderImageHit(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), count, d_render_out + (size_t)off * 3, 0);

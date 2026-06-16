@@ -21,7 +21,7 @@ public:
     const float* getChunkRgbTrue() const { return d_chunk_rgb_true; }
 
     void loadDataToGPU();
-    void fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0);
+    void fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0, bool forceSequential = false);
     void freeVRAM();
 
     uint32_t getTotalRays() const { return total_rays; }

@@ -511,11 +511,14 @@ __global__ void fetchRayChunkStreamingKernel(
     d_chunk_rgb[idx * 3 + 2] = fb;
 }
 
-void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color, cudaStream_t stream) {
+void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color, cudaStream_t stream, bool forceSequential) {
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
+    // Training fetches randomize rays for SGD; renders must fetch image-coherent (sequential) rays
+    // -- otherwise the preview is a scatter of random pixels from across all images (pure noise).
+    bool randomize = m_is_training && !forceSequential;
     fetchRayChunkStreamingKernel<<<gridSize, blockSize, 0, stream>>>(
-        offset, size, total_rays, seed, m_is_training,
+        offset, size, total_rays, seed, randomize,
         width, height, focal_length,
         d_transforms, d_images_rgba,
         d_chunk_rays_o, d_chunk_rays_d, d_chunk_rgb_true,
