@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
 #include <cuda_runtime.h>
 
 class DataLoader {

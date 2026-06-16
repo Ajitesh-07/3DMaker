@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <algorithm>
+#include <cstdint>
 
 struct MetricTracker {
     double totalMs = 0.0;

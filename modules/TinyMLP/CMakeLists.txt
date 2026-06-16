@@ -6,6 +6,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(TinyMLP VERSION 0.1 LANGUAGES CXX CUDA)
 endif()
 
+# Default to the GPU(s) present on the build host (CMake 3.24+ "native"); override with
+# -DCMAKE_CUDA_ARCHITECTURES=120 for an RTX 5090 / Blackwell (sm_120) box.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 add_library(TinyMLP STATIC
     TinyMLP.cu
     TinyMLPHashGrid.cu
@@ -24,7 +30,7 @@ add_library(TinyMLP STATIC
 # SM 8.0 = Ampere, 8.9 = Ada Lovelace (RTX 4060).
 # Minimum for WMMA half-precision is SM 7.0 (Volta).
 set_target_properties(TinyMLP PROPERTIES
-    CUDA_ARCHITECTURES "86;89"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION OFF
 )
 

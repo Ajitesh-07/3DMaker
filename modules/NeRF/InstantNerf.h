@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <string>
+#include <cstdint>
 #include "DeviceBuffer.h"
 #include "Timers.h"
 
