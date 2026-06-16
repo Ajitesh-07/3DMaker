@@ -77,6 +77,10 @@ __global__ void render_rays_kernel(
     }
 }
 
+__device__ __forceinline__ float disparity_warp(float t, float t_near, float inv_g_range) {
+    return (1.0f - t_near / fmaxf(t, 1e-4f)) * inv_g_range;
+}
+
 __global__ void render_rays_distortion_kernel(
     const uint32_t num_rays,
     const uint32_t* __restrict__ ray_offsets,
@@ -98,6 +102,10 @@ __global__ void render_rays_distortion_kernel(
 
     uint32_t offset = ray_offsets[r];
     uint32_t count = num_steps[r];
+    float t_near    = (count > 0) ? fmaxf(t_sorted[offset], 1e-4f) : 1.0f;
+    float t_far_ray = (count > 0) ? t_sorted[offset + count - 1] : 1.0f;
+    float g_far = 1.0f - t_near / fmaxf(t_far_ray, t_near + 1e-4f);
+    float inv_g_range = (g_far > 1e-6f) ? (1.0f / g_far) : 0.0f;
 
     float T = 1.0f;
     float r_c = 0.0f, g_c = 0.0f, b_c = 0.0f;
@@ -115,16 +123,13 @@ __global__ void render_rays_distortion_kernel(
         uint32_t idx = offset + i;
         float t = t_sorted[idx];
 
-        float delta_t = 0.0f;
-        if (i < count - 1) {
-            delta_t = t_sorted[idx + 1] - t;
-        } else {
-            delta_t = 1e-3f;
-        }
+        float t_next = (i < count - 1) ? t_sorted[idx + 1] : (t + 1e-3f);
+        float delta_t = t_next - t;
+        if (delta_t < 0.0f) { delta_t = 0.0f; t_next = t; }
 
-        if (delta_t < 0.0f) delta_t = 0.0f;
-        
-        float m = t + delta_t / 2;
+        float s      = disparity_warp(t,      t_near, inv_g_range);
+        float s_next = disparity_warp(t_next, t_near, inv_g_range);
+        float m = 0.5f * (s + s_next);
 
         float sigma = density_sigma[idx];
         float alpha = 1.0f - expf(-sigma * delta_t);
@@ -133,7 +138,7 @@ __global__ void render_rays_distortion_kernel(
         r_c += weight * rgb_output[idx * 3 + 0];
         g_c += weight * rgb_output[idx * 3 + 1];
         b_c += weight * rgb_output[idx * 3 + 2];
-        
+
         depth += weight * t;
 
         T *= (1.0f - alpha);
@@ -148,21 +153,21 @@ __global__ void render_rays_distortion_kernel(
         uint32_t idx = offset + i;
         float t = t_sorted[idx];
 
-        float delta_t = 0.0f;
-        if (i < count - 1) {
-            delta_t = t_sorted[idx + 1] - t;
-        } else {
-            delta_t = 1e-3f;
-        }
+        float t_next = (i < count - 1) ? t_sorted[idx + 1] : (t + 1e-3f);
+        float delta_t = t_next - t;
+        if (delta_t < 0.0f) { delta_t = 0.0f; t_next = t; }
 
-        if (delta_t < 0.0f) delta_t = 0.0f;
+        float s      = disparity_warp(t,      t_near, inv_g_range);
+        float s_next = disparity_warp(t_next, t_near, inv_g_range);
+        float m = 0.5f * (s + s_next);
+        float delta_s = s_next - s;
+        if (delta_s < 0.0f) delta_s = 0.0f;
 
         float crrWeight = dw_out[idx];
-        float m = t + delta_t / 2;
 
         float dl_bilinear = m * (2 * dw_sum - dw_global_sum) + (dwm_global_sum - 2*dwm_sum);
-        dw_out[idx] = lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_t);
-        weight_g_sum += crrWeight*lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_t);
+        dw_out[idx] = lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_s);
+        weight_g_sum += crrWeight*lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_s);
 
         dw_sum += crrWeight;
         dwm_sum += crrWeight * m;
