@@ -720,7 +720,16 @@ __global__ void updateOccupancyGrid(
 
     bool is_active = false;
     if (cell_idx < total_cells) {
-        float threshold = 0.01f;
+        // Mean-density bootstrap, matching instant-ngp's thresh = min(NERF_MIN_OPTICAL_THICKNESS, mean).
+        // d_sum holds the master-grid sum (computeSum() runs just before this kernel); all master
+        // values are >= 0 so sum/N == mean of max(0,.). 0.43 = 0.01 / base-voxel-size, i.e. the
+        // raw-sigma equivalent of instant-ngp's 0.01 optical-thickness threshold for our
+        // one-sample-per-voxel marcher (opacity ~0.01 over a step). Early in training the mean is
+        // tiny so thresh = mean keeps the grid populated; as densities grow the mean rises and
+        // thresh caps at 0.43, pruning the low-density fog. A fixed 0.43 instead empties the grid
+        // at init (initial sigma = exp(-bias) ~ 0.37 < 0.43) -> no hits -> never trains.
+        float mean_density = d_sum[0] / (float)total_cells;
+        float threshold = fminf(0.43f, mean_density);
         is_active = (d_master_grid[cell_idx] > threshold);
     }
 

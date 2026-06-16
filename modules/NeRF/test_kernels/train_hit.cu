@@ -8,6 +8,7 @@
 #include <chrono>
 #include <iomanip>
 #include <filesystem>
+#include <memory>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../../third_party/stb_image_write.h"
@@ -105,7 +106,7 @@ int main(int argc, char** argv) {
     int maxSteps = 15000;
 
     NerfOptions opts;
-    opts.densityBias = 1.0f;
+    opts.densityBias = 0.0f;
     opts.rayChunkSize = 64 * 1024; // Limit VRAM per training step
     opts.colorHiddenDim = 32;
     opts.colorNumLayers = 3;
@@ -116,8 +117,8 @@ int main(int argc, char** argv) {
     opts.isProfiling = false;
     // AABB + numCascades are overridden below from the DataLoader's pose-derived scene bounds.
     opts.numCascades = 1;
-    opts.aabbMin = make_float3(-1.5f, -1.5f, -0.7f);
-    opts.aabbMax = make_float3(1.5f, 1.5f, 0.7f);
+    opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
+    opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
 
     // Distortion-loss weight: argv[2] overrides the default so we can A/B without rebuilds.
     // 0 disables the distortion gradient entirely (g_k = 0).
@@ -138,13 +139,27 @@ int main(int argc, char** argv) {
               << opts.aabbMin.z << ") max=(" << opts.aabbMax.x << "," << opts.aabbMax.y << "," << opts.aabbMax.z
               << ") numCascades=" << opts.numCascades << std::endl;
 
-    // The test loader must live in the SAME normalized frame as training, so reuse the
-    // transform instead of deriving its own (test poses differ from train for e.g. lego).
-    float3 sc_center; float sc_scale;
-    dataset.getSceneTransform(sc_center, sc_scale);
-    std::cout << "\nLoading test dataset for rendering..." << std::endl;
-    DataLoader test_dataset(dataset_path, opts.rayChunkSize, false,
-                            sc_center, sc_scale, opts.aabbMin, opts.aabbMax);
+    // Whether to load transforms_test.json as a SEPARATE loader for the between-epoch render.
+    // For real captures (e.g. house1) the test set is identical to train, and mapping a second
+    // full-res zero-copy image buffer doubles GPU usage (3.31GB -> 6.6GB) and OOMs the 8GB card
+    // at DataLoader.cu:423 (cudaHostGetDevicePointer). When off, we reuse the train loader for
+    // rendering (render from train poses) and skip the redundant 3.31GB mapping entirely.
+    // Flip to true for synthetic scenes (lego etc.) where test poses genuinely differ.
+    bool loadSeparateTestSet = false;
+    std::unique_ptr<DataLoader> test_dataset_owned;
+    if (loadSeparateTestSet) {
+        // The test loader must live in the SAME normalized frame as training, so reuse the
+        // transform instead of deriving its own (test poses differ from train for e.g. lego).
+        float3 sc_center; float sc_scale;
+        dataset.getSceneTransform(sc_center, sc_scale);
+        std::cout << "\nLoading test dataset for rendering..." << std::endl;
+        test_dataset_owned = std::make_unique<DataLoader>(dataset_path, opts.rayChunkSize, false,
+                                sc_center, sc_scale, opts.aabbMin, opts.aabbMax);
+    } else {
+        std::cout << "\nReusing train dataset for between-epoch rendering (no separate test load)." << std::endl;
+    }
+    // All downstream test_dataset.* calls are read-only render accessors; bind to whichever loader.
+    DataLoader& test_dataset = loadSeparateTestSet ? *test_dataset_owned : dataset;
 
     std::cout << "\nInitializing NeRF Model..." << std::endl;
     InstantNerf nerf;
@@ -311,15 +326,21 @@ int main(int argc, char** argv) {
 
         // Just test on the first 3 images in the dataset
         int num_test_frames = std::min(3, (int)(test_dataset.getTotalRays() / pixels));
+        // The train loader streams rays in rayChunkSize-sized tiles, so a full image does NOT fit
+        // its ray buffers in one fetch -- a full-image fetch overflows them (illegal memory access
+        // at fetchRayChunk). Render each image tile-by-tile into the matching slice of d_render_out.
+        // (The dedicated test loader sizes its buffers to width*height; the train loader does not.)
+        int render_tile = (int)opts.rayChunkSize;
         for (int i = 0; i < num_test_frames; ++i) {
-            
-            // Stream the ray data to the GPU (offset perfectly matches image boundaries)
-            test_dataset.fetchRayChunk(i * pixels, pixels, 0, make_float3(1.0f, 1.0f, 1.0f));
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Execute the highly parallel rendering pipeline
-            nerf.renderImage(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), pixels, d_render_out);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            for (int off = 0; off < pixels; off += render_tile) {
+                int count = std::min(render_tile, pixels - off);
+                // Stream this tile's rays to the GPU (offsets stay within one image).
+                test_dataset.fetchRayChunk(i * pixels + off, count, 0, make_float3(1.0f, 1.0f, 1.0f));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                // Render the tile into its slice of the output buffer.
+                nerf.renderImage(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), count, d_render_out + (size_t)off * 3);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
             
             // Convert HDR float to LDR byte and save
             int blocks = (pixels + 255) / 256;
