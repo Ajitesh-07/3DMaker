@@ -162,9 +162,15 @@ __global__ void networkFusionMMA_Backward(
 
             #pragma unroll
             for (int i = 0; i < WARP_FACTOR; i++) {
-                nvcuda::wmma::load_matrix_sync(frag_a, &shmem_B[buf][0][(threadIdx.z + i*blockDim.z)*WMMA_M], TILE_COUNT_X * WMMA_N + PAD);
-                nvcuda::wmma::load_matrix_sync(frag_b, &shmem_A[k][threadIdx.y*WMMA_K], TILE_COUNT_X*WMMA_K + PAD);
-                nvcuda::wmma::mma_sync(frag_acc[i], frag_a, frag_b, frag_acc[i]);
+                // Surplus z-threads (blockDim.z = TILE_COUNT_Y can exceed TILE_COUNT_X) must not
+                // index past shmem_B's TILE_COUNT_X col-blocks. Warp-uniform guard; no-op for the
+                // balanced configs. Same shared-OOB as networkFusionBackward.cu -- benign on Ada,
+                // hard fault on Blackwell (sm_120).
+                if ((threadIdx.z + i*blockDim.z) < TILE_COUNT_X) {
+                    nvcuda::wmma::load_matrix_sync(frag_a, &shmem_B[buf][0][(threadIdx.z + i*blockDim.z)*WMMA_M], TILE_COUNT_X * WMMA_N + PAD);
+                    nvcuda::wmma::load_matrix_sync(frag_b, &shmem_A[k][threadIdx.y*WMMA_K], TILE_COUNT_X*WMMA_K + PAD);
+                    nvcuda::wmma::mma_sync(frag_acc[i], frag_a, frag_b, frag_acc[i]);
+                }
             }
 
             if (k + WMMA_K < TILE_COUNT_Y * TILE_FACTOR * WMMA_M) {
@@ -341,9 +347,11 @@ __global__ void networkFusionMMA_Backward(
 
                 #pragma unroll
                 for (int i = 0; i < WARP_FACTOR; i++) {
-                    nvcuda::wmma::load_matrix_sync(frag_a, &shmem_B[buf][0][(threadIdx.z + i*blockDim.z)*WMMA_M], TILE_COUNT_X * WMMA_N + PAD);
-                    nvcuda::wmma::load_matrix_sync(frag_b, &shmem_A[k][threadIdx.y*WMMA_K], TILE_COUNT_X*WMMA_K + PAD);
-                    nvcuda::wmma::mma_sync(frag_acc[i], frag_a, frag_b, frag_acc[i]);
+                    if ((threadIdx.z + i*blockDim.z) < TILE_COUNT_X) {
+                        nvcuda::wmma::load_matrix_sync(frag_a, &shmem_B[buf][0][(threadIdx.z + i*blockDim.z)*WMMA_M], TILE_COUNT_X * WMMA_N + PAD);
+                        nvcuda::wmma::load_matrix_sync(frag_b, &shmem_A[k][threadIdx.y*WMMA_K], TILE_COUNT_X*WMMA_K + PAD);
+                        nvcuda::wmma::mma_sync(frag_acc[i], frag_a, frag_b, frag_acc[i]);
+                    }
                 }
 
                 if (k + WMMA_K < TILE_COUNT_Y * TILE_FACTOR * WMMA_M) {
@@ -525,9 +533,15 @@ __global__ void networkFusionMMA_Backward(
 
             #pragma unroll
             for (int i = 0; i < WARP_FACTOR; i++) {
-                nvcuda::wmma::load_matrix_sync(frag_a, &shmem_B[buf][0][(threadIdx.z + i*blockDim.z)*WMMA_M], TILE_COUNT_X * WMMA_N + PAD);
-                nvcuda::wmma::load_matrix_sync(frag_b, &shmem_A[k][threadIdx.y*WMMA_K], TILE_COUNT_X*WMMA_K + PAD);
-                nvcuda::wmma::mma_sync(frag_acc[i], frag_a, frag_b, frag_acc[i]);
+                // Surplus z-threads (blockDim.z = TILE_COUNT_Y can exceed TILE_COUNT_X) must not
+                // index past shmem_B's TILE_COUNT_X col-blocks. Warp-uniform guard; no-op for the
+                // balanced configs. Same shared-OOB as networkFusionBackward.cu -- benign on Ada,
+                // hard fault on Blackwell (sm_120).
+                if ((threadIdx.z + i*blockDim.z) < TILE_COUNT_X) {
+                    nvcuda::wmma::load_matrix_sync(frag_a, &shmem_B[buf][0][(threadIdx.z + i*blockDim.z)*WMMA_M], TILE_COUNT_X * WMMA_N + PAD);
+                    nvcuda::wmma::load_matrix_sync(frag_b, &shmem_A[k][threadIdx.y*WMMA_K], TILE_COUNT_X*WMMA_K + PAD);
+                    nvcuda::wmma::mma_sync(frag_acc[i], frag_a, frag_b, frag_acc[i]);
+                }
             }
 
             if (k + WMMA_K < TILE_COUNT_Y * TILE_FACTOR * WMMA_M) {
