@@ -110,13 +110,17 @@ int main(int argc, char** argv) {
     opts.rayChunkSize = 64 * 1024; // Limit VRAM per training step
     opts.colorHiddenDim = 32;
     opts.colorNumLayers = 3;
+    opts.renderBatchSize = 256 * 1024;
     opts.batchSize = 256 * 1024; // Neural Network internal batch size
+    opts.samplesPerVoxel = 1;         // K sub-voxel samples per occupied finest voxel
+    opts.minDensityThreshold = 0.01f; // opacity cull bar (per-cascade)
     opts.learningRate = 1e-2f;
     opts.lossScale = 128.0f;     // FP16 Mixed Precision scaling
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
+    opts.legacyRenderFlag = false;
     // AABB + numCascades are overridden below from the DataLoader's pose-derived scene bounds.
-    opts.numCascades = 1;
+    opts.numCascades = 2;
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
     opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
 
@@ -128,6 +132,15 @@ int main(int argc, char** argv) {
     }
     printf("[TRAIN] Using Lambda %f", opts.lambdaDist);
     std::cout << "lambdaDist = " << opts.lambdaDist << std::endl;
+
+    // Optional positional overrides so ONE binary runs the whole benchmark matrix:
+    //   argv[3]=samplesPerVoxel(K)  argv[4]=maxSteps  argv[5]=numCascades  argv[6]=isProfiling(0/1)
+    if (argc > 3) opts.samplesPerVoxel = atoi(argv[3]);
+    if (argc > 4) maxSteps             = atoi(argv[4]);
+    if (argc > 5) opts.numCascades     = atoi(argv[5]);
+    if (argc > 6) opts.isProfiling     = (atoi(argv[6]) != 0);
+    std::cout << "[TRAIN] K=" << opts.samplesPerVoxel << " maxSteps=" << maxSteps
+              << " numCascades=" << opts.numCascades << " profiling=" << opts.isProfiling << std::endl;
 
     std::cout << "\nLoading training dataset..." << std::endl;
     DataLoader dataset(dataset_path, opts.rayChunkSize, true, false);
@@ -169,7 +182,7 @@ int main(int argc, char** argv) {
     // ==========================================
     // 2. Training Loop Variables
     // ==========================================
-    int totalEpochs = 5; 
+    int totalEpochs = 100; 
     int total_rays = dataset.getTotalRays();
     int trainSteps = 0;
     
@@ -338,7 +351,7 @@ int main(int argc, char** argv) {
                 test_dataset.fetchRayChunk(i * pixels + off, count, 0, make_float3(1.0f, 1.0f, 1.0f));
                 CUDA_CHECK(cudaDeviceSynchronize());
                 // Render the tile into its slice of the output buffer.
-                nerf.renderImage(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), count, d_render_out + (size_t)off * 3);
+                nerf.renderImageHit(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), count, d_render_out + (size_t)off * 3, 0);
                 CUDA_CHECK(cudaDeviceSynchronize());
             }
             
@@ -423,7 +436,7 @@ int main(int argc, char** argv) {
         );
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        nerf.renderImage((float3*)d_video_rays_o, (float3*)d_video_rays_d, video_pixels, d_video_out);
+        nerf.renderImageHit((float3*)d_video_rays_o, (float3*)d_video_rays_d, video_pixels, d_video_out, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
         
         float_to_byte_kernel<<<blocks, 256>>>(d_video_out, d_video_byte, video_pixels);

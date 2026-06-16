@@ -368,7 +368,7 @@ int main(int argc, char** argv) {
         );
         cudaDeviceSynchronize();
 
-        nerf.renderImage(d_rays_o, d_rays_d, pixels, d_hdr_rgb, 0);
+        nerf.renderImageHit(d_rays_o, d_rays_d, pixels, d_hdr_rgb, 0);
         cudaDeviceSynchronize();
 
         wrapper_float_to_byte(d_hdr_rgb, d_rgba_byte, pixels, 0);

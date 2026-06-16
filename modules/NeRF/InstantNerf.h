@@ -20,7 +20,7 @@
         }                                                                       \
     } while (0)
 
-#define MAX_HITS 128
+#define MAX_HITS 1024   // per-ray sample cap (= max occupied voxels * samplesPerVoxel)
 
 enum MemoryMode {
     TRAINING,
@@ -37,6 +37,7 @@ struct NerfOptions {
     float3  aabbMax         = make_float3( 1.0f,  1.0f,  1.0f);
     int levelsMipmap = 4;
     int numCascades = 1;
+    int samplesPerVoxel = 1;
 
     int densityHiddenDim = 64;
     int densityNumLayers = 2;
@@ -379,6 +380,7 @@ extern "C" void launchMarchRaysDDA(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
     uint32_t* packed_coords_out,
     float* t_hits_out,
     uint32_t* num_steps_per_ray,
@@ -398,6 +400,7 @@ extern "C" void processRaysChunk(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
 
     uint32_t* d_sparse_morton,   
     float* d_sparse_ts,          
@@ -428,6 +431,7 @@ extern "C" void processRaysChunkLinear(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
 
     float* d_sparse_ts,
     uint32_t* d_num_steps,
@@ -454,6 +458,7 @@ extern "C" int processRaysHitLinear(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
     const int batchSize,
     uint32_t* totalHits,
     uint32_t* d_active_rays_count,
@@ -508,6 +513,7 @@ extern "C" void processRaysHitData(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
     uint32_t* d_num_steps,
     uint32_t* d_ray_offsets,
     uint32_t* d_block_sums,
@@ -527,6 +533,7 @@ extern "C" int processRaysHitPositions(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
 
     const uint32_t rays_done,
     const int batchSize,

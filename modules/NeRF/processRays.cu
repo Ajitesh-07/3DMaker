@@ -101,12 +101,13 @@ __global__ void march_rays_dda_kernel(
     const float* __restrict__ nears,
     const float* __restrict__ fars,
     const uint8_t* __restrict__ occupancy_grid,
-    const uint3    grid_resolution, // This is the base Level 0 resolution (e.g. 128x128x128)
+    const uint3    grid_resolution,
     const float3   aabb_min,
     const float3   aabb_max,
     const int      num_cascades,
-    const int      levelsMipmap,    // NEW PARAMETER
-    uint32_t* __restrict__ packed_coords_out, 
+    const int      levelsMipmap,
+    const int      samples_per_voxel,
+    uint32_t* __restrict__ packed_coords_out,
     float* __restrict__ t_hits_out,
     uint32_t* __restrict__ num_steps_per_ray
 ) {
@@ -183,22 +184,36 @@ __global__ void march_rays_dda_kernel(
                 current_level--;
                 continue; 
             } else {
+                // Sub-voxel sampling: emit K samples across this finest voxel's span
+                // [current_t, exit_t]. exit_t is recomputed here (== next_t below) so the
+                // sample placement matches the DDA advance exactly.
+                const int K = samples_per_voxel;
+                float ex_bx = c_aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x;
+                float ex_by = c_aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y;
+                float ex_bz = c_aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z;
+                float exit_t = fminf(fminf((ex_bx - o.x) * d_inv.x, (ex_by - o.y) * d_inv.y), (ex_bz - o.z) * d_inv.z);
+                float span = exit_t - current_t;
+                uint32_t vmorton = 0;
                 if constexpr (COMPUTE_MORTON) {
-                    local_coords[local_idx] = morton3d((uint32_t)voxel_index.x, (uint32_t)voxel_index.y, (uint32_t)voxel_index.z);
+                    vmorton = morton3d((uint32_t)voxel_index.x, (uint32_t)voxel_index.y, (uint32_t)voxel_index.z);
                 }
-                local_ts[local_idx] = current_t;
-                local_idx++;
+                for (int k = 0; k < K; ++k) {
+                    if ((hit_count + local_idx) >= MAX_HITS) break;
+                    if constexpr (COMPUTE_MORTON) local_coords[local_idx] = vmorton;
+                    local_ts[local_idx] = current_t + (k + 0.5f) / (float)K * span;
+                    local_idx++;
 
-                if (local_idx == 4) {
-                    if constexpr (COMPUTE_MORTON) {
-                        uint4* out_coords_vec = reinterpret_cast<uint4*>(&packed_coords_out[out_base_idx + hit_count]);
-                        store_uint4(out_coords_vec, local_coords[0], local_coords[1], local_coords[2], local_coords[3]);
+                    if (local_idx == 4) {
+                        if constexpr (COMPUTE_MORTON) {
+                            uint4* out_coords_vec = reinterpret_cast<uint4*>(&packed_coords_out[out_base_idx + hit_count]);
+                            store_uint4(out_coords_vec, local_coords[0], local_coords[1], local_coords[2], local_coords[3]);
+                        }
+                        float4* out_ts_vec = reinterpret_cast<float4*>(&t_hits_out[out_base_idx + hit_count]);
+                        store_float4(out_ts_vec, local_ts[0], local_ts[1], local_ts[2], local_ts[3]);
+
+                        hit_count += 4;
+                        local_idx = 0;
                     }
-                    float4* out_ts_vec = reinterpret_cast<float4*>(&t_hits_out[out_base_idx + hit_count]);
-                    store_float4(out_ts_vec, local_ts[0], local_ts[1], local_ts[2], local_ts[3]);
-
-                    hit_count += 4;
-                    local_idx = 0;
                 }
             }
         }
@@ -247,6 +262,7 @@ void launchMarchRaysDDA(
     const float3 aabb_max,
     const int      numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
     uint32_t* packed_coords_out,
     float* t_hits_out,
     uint32_t* num_steps_per_ray,
@@ -270,6 +286,7 @@ void launchMarchRaysDDA(
         aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         packed_coords_out,
         t_hits_out,
         num_steps_per_ray
@@ -350,6 +367,7 @@ void processRaysChunk(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
 
     uint32_t* d_sparse_morton,   
     float* d_sparse_ts,          
@@ -382,6 +400,7 @@ void processRaysChunk(
         aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         d_sparse_morton,
         d_sparse_ts,
         d_num_steps
@@ -542,6 +561,7 @@ void processRaysChunkLinear(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
 
     float* d_sparse_ts,
     uint32_t* d_num_steps,
@@ -566,6 +586,7 @@ void processRaysChunkLinear(
         grid_resolution, aabb_min, aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         nullptr, d_sparse_ts, d_num_steps
     );
 
@@ -615,6 +636,7 @@ __global__ void march_rays_dda_calc_hits(
     const float3   aabb_max,
     const int      num_cascades,
     const int      levelsMipmap,
+    const int      samples_per_voxel,
     uint32_t* __restrict__ num_steps_per_ray
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -684,7 +706,12 @@ __global__ void march_rays_dda_calc_hits(
             if (current_level > 0) {
                 current_level--;
                 continue;
-            } else hit_count++;
+            } else {
+                int n = samples_per_voxel;
+                int remaining = (int)MAX_HITS - (int)hit_count;
+                if (n > remaining) n = remaining;
+                hit_count += n;
+            }
         }
 
         float3 next_boundary = make_float3(
@@ -784,8 +811,9 @@ __global__ void march_rays_dda_offset(
     const float3   aabb_max,
     const int      num_cascades,
     const int      levelsMipmap,
+    const int samples_per_voxel,
     const uint32_t* __restrict__ ray_offsets,
-    const uint32_t   base_offset,   // subtract so writes land batch-local (0-based); pass 0 for a fresh prefix sum
+    const uint32_t   base_offset,
     float* __restrict__ t_hits_out,
     uint32_t* __restrict__ ray_indices_out,
     float* __restrict__ mlp_positions
@@ -858,23 +886,27 @@ __global__ void march_rays_dda_offset(
                 current_level--;
                 continue; 
             } else {
-                uint32_t write_idx = out_base_idx + hit_count;
-                
-                t_hits_out[write_idx] = current_t;
-                ray_indices_out[write_idx] = i; 
-                
-                float3 pos = make_float3(
-                    o.x + current_t * d.x, 
-                    o.y + current_t * d.y, 
-                    o.z + current_t * d.z
-                );
-                
-                pos = contract_pos(pos, aabb_min, aabb_max);
-                
+                const int K = samples_per_voxel;
+                float ex_bx = c_aabb_min.x + (voxel_index.x + (step.x > 0 ? 1.0f : 0.0f)) * voxel_size_l.x;
+                float ex_by = c_aabb_min.y + (voxel_index.y + (step.y > 0 ? 1.0f : 0.0f)) * voxel_size_l.y;
+                float ex_bz = c_aabb_min.z + (voxel_index.z + (step.z > 0 ? 1.0f : 0.0f)) * voxel_size_l.z;
+                float exit_t = fminf(fminf((ex_bx - o.x) * d_inv.x, (ex_by - o.y) * d_inv.y), (ex_bz - o.z) * d_inv.z);
+                float span = exit_t - current_t;
                 float4* mlp_pos_vec = reinterpret_cast<float4*>(mlp_positions);
-                store_float4(&mlp_pos_vec[write_idx], pos.x, pos.y, pos.z, 0.0f);
-                
-                hit_count++;
+                for (int k = 0; k < K; ++k) {
+                    if (hit_count >= MAX_HITS) break;
+                    float t_k = current_t + (k + 0.5f) / (float)K * span;
+                    uint32_t write_idx = out_base_idx + hit_count;
+
+                    t_hits_out[write_idx] = t_k;
+                    ray_indices_out[write_idx] = i;
+
+                    float3 pos = make_float3(o.x + t_k * d.x, o.y + t_k * d.y, o.z + t_k * d.z);
+                    pos = contract_pos(pos, aabb_min, aabb_max);
+                    store_float4(&mlp_pos_vec[write_idx], pos.x, pos.y, pos.z, 0.0f);
+
+                    hit_count++;
+                }
             }
         }
 
@@ -909,6 +941,7 @@ int processRaysHitLinear(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
     const int batchSize,
     uint32_t* totalHits,
     uint32_t* d_active_rays_count,
@@ -937,6 +970,7 @@ int processRaysHitLinear(
         aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         d_num_steps
     );
 
@@ -994,6 +1028,7 @@ int processRaysHitLinear(
         aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         d_ray_offsets,
         0u,
         d_t_sorted,
@@ -1017,6 +1052,7 @@ void processRaysHitData(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
     uint32_t* d_num_steps,
     uint32_t* d_ray_offsets,
     uint32_t* d_block_sums,
@@ -1037,6 +1073,7 @@ void processRaysHitData(
         aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         d_num_steps
     );
 
@@ -1056,6 +1093,7 @@ int processRaysHitPositions(
     const float3 aabb_max,
     const int numCascades,
     const int mipmapLevels,
+    const int samplesPerVoxel,
 
     const uint32_t rays_done,
     const int batchSize,
@@ -1122,6 +1160,7 @@ int processRaysHitPositions(
         aabb_max,
         numCascades,
         mipmapLevels,
+        samplesPerVoxel,
         d_ray_offsets + rays_done,
         base,                   
         d_t_sorted,

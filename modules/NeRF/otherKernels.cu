@@ -199,23 +199,12 @@ __global__ void compute_SH_gather(
     float sh14 =  1.44530572f * z * (x2 - y2);
     float sh15 = -0.59004359f * x * (x2 - 3.0f * y2);
 
-    // Vectorized loads of density outputs (4x float4 = 16 floats)
     const float4* densityOut_vec = reinterpret_cast<const float4*>(densityOut);
     float4 d03   = densityOut_vec[0];
     float4 d47   = densityOut_vec[1];
     float4 d811  = densityOut_vec[2];
     float4 d1215 = densityOut_vec[3];
 
-    // Sanitize the raw density logits before they (a) drive sigma via expf and
-    // (b) get packed into fp16 as the color-MLP input. The clamp band must be
-    // *matmul-safe*, not merely fp16-storable: a feature near the fp16 max
-    // (65504) is representable but, once multiplied by color-MLP weights and
-    // summed across the hidden dim, overflows fp16 -> Inf -> Inf-Inf=NaN ->
-    // sigmoid(NaN)=NaN -> NaN render -> NaN loss -> the density field collapses
-    // and the occupancy grid empties (unrecoverable). Healthy geometry features
-    // are O(1-10), so +/-64 is far above anything legitimate yet leaves ample
-    // headroom under the fp16 overflow point. Density is unaffected: value[0]
-    // feeds expf(fminf(.-bias,8)), which already saturates at +8, and -64 -> ~0.
     auto sanitize_logit = [](float v) -> float {
         v = fmaxf(-64.0f, fminf(64.0f, v));
         return (v != v) ? 0.0f : v;
@@ -714,22 +703,35 @@ __global__ void updateOccupancyGrid(
     float* d_sum,
     int total_cells,
     int cells_per_cascade,          // G  (level-0 cells of one cascade)
-    int pyramid_cells_per_cascade   // S  (level-0 + all mip levels of one cascade)
+    int pyramid_cells_per_cascade,  // S  (level-0 + all mip levels of one cascade)
+    float min_optical_thickness,    // opacity cull bar (NerfOptions.minDensityThreshold, e.g. 0.01)
+    float base_voxel                // base-cascade voxel edge = aabb_extent / gridResolution
 ) {
     int cell_idx = blockIdx.x * blockDim.x + threadIdx.x;  // dense: cascade * G + local
 
     bool is_active = false;
     if (cell_idx < total_cells) {
-        // Mean-density bootstrap, matching instant-ngp's thresh = min(NERF_MIN_OPTICAL_THICKNESS, mean).
-        // d_sum holds the master-grid sum (computeSum() runs just before this kernel); all master
-        // values are >= 0 so sum/N == mean of max(0,.). 0.43 = 0.01 / base-voxel-size, i.e. the
-        // raw-sigma equivalent of instant-ngp's 0.01 optical-thickness threshold for our
-        // one-sample-per-voxel marcher (opacity ~0.01 over a step). Early in training the mean is
-        // tiny so thresh = mean keeps the grid populated; as densities grow the mean rises and
-        // thresh caps at 0.43, pruning the low-density fog. A fixed 0.43 instead empties the grid
-        // at init (initial sigma = exp(-bias) ~ 0.37 < 0.43) -> no hits -> never trains.
-        float mean_density = d_sum[0] / (float)total_cells;
-        float threshold = fminf(0.43f, mean_density);
+        // Per-cascade opacity threshold. The base-cascade raw-sigma cutoff is
+        // min_optical_thickness / base_voxel (instant-ngp's opacity bar in our raw-sigma grid: the
+        // sigma at which one base-voxel step reaches that opacity). A step through cascade c is 2^c
+        // longer, so the same opacity is reached at a 2^c-lower sigma -> halve the density bar per
+        // coarser cascade. One opacity bar, correct for every cascade; a single base cutoff would
+        // over-prune the outer (background) cascades a 360 scene needs. (At +-1.5 / 128^3 with 0.01
+        // this is 0.01/0.0234 ~ 0.43 -- the old constant, now derived so it tracks any AABB / grid.)
+        //
+        // Independent of samplesPerVoxel: K subdivides a *kept* voxel into K MLP queries, but the
+        // whole-voxel opacity sigma*Δt -- which decides skip-vs-keep -- is unchanged by K (the K
+        // sub-samples composite back to the same sigma*Δt).
+        //
+        // We threshold raw sigma per cascade rather than storing sigma*Δt + a flat bar because our
+        // init sigma = exp(-bias) ~ 0.37 puts the base cascade's optical thickness just under the
+        // bar; a global-mean min(bar, mean) would then be pulled above it by the longer-Δt outer
+        // cascades and cull the inner cascade permanently. min(cascade_thresh, mean) keeps the
+        // densest inner-cascade cells alive at init and self-anneals as the field sharpens.
+        float mean_density   = d_sum[0] / (float)total_cells;
+        int   cascade        = cell_idx / cells_per_cascade;
+        float cascade_thresh = (min_optical_thickness / base_voxel) / exp2f((float)cascade);
+        float threshold      = fminf(cascade_thresh, mean_density);
         is_active = (d_master_grid[cell_idx] > threshold);
     }
 

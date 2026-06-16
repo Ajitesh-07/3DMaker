@@ -404,6 +404,7 @@ void InstantNerf::trainWithRaysHit(
             m_opts.aabbMin, m_opts.aabbMax,
             m_opts.numCascades,
             m_opts.levelsMipmap,
+            m_opts.samplesPerVoxel,
             m_opts.batchSize,
             &totalHits,
             m_render_buffers.d_active_rays_count.data(),
@@ -620,6 +621,7 @@ void InstantNerf::renderImage(
                 m_opts.gridResolution,
                 m_opts.aabbMin, m_opts.aabbMax, 
                 m_opts.numCascades, m_opts.levelsMipmap,
+                m_opts.samplesPerVoxel,
                 m_render_buffers.d_sparse_ts.data(), 
                 m_render_buffers.d_num_steps.data(),
                 m_render_buffers.d_ray_offsets.data(),
@@ -743,6 +745,7 @@ void InstantNerf::renderImageHit(
             m_opts.aabbMin, m_opts.aabbMax,
             m_opts.numCascades,
             m_opts.levelsMipmap,
+            m_opts.samplesPerVoxel,
             m_render_buffers.d_num_steps.data(),
             m_render_buffers.d_ray_offsets.data(),
             m_render_buffers.d_block_sums.data(),
@@ -770,6 +773,7 @@ void InstantNerf::renderImageHit(
                 m_opts.aabbMin, m_opts.aabbMax,
                 m_opts.numCascades,
                 m_opts.levelsMipmap,
+                m_opts.samplesPerVoxel,
                 raysDone,
                 hitBatch,
                 &totalHits,
@@ -938,7 +942,9 @@ void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
         d_occupancy_grid_32,
         d_masterOccupancyGrid.data(),
         m_render_buffers.d_sum.data(),
-        N, G, S
+        N, G, S,
+        m_opts.minDensityThreshold,
+        (m_opts.aabbMax.x - m_opts.aabbMin.x) / (float)m_opts.gridResolution.x
     );
     });
 
@@ -1005,7 +1011,9 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
         d_occupancy_grid_32,
         d_masterOccupancyGrid.data(),
         m_render_buffers.d_sum.data(),
-        N, G, S
+        N, G, S,
+        m_opts.minDensityThreshold,
+        (m_opts.aabbMax.x - m_opts.aabbMin.x) / (float)m_opts.gridResolution.x
     );
     });
 
