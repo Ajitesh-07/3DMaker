@@ -91,37 +91,62 @@ __global__ void generate_custom_rays_kernel(
 // Main Execution
 // ------------------------------------------------------------------
 
-void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam, int totalSteps = 0, int numCascades = 0) {
+void run_training_pipeline(
+    const std::string& dataset_path,
+    int totalEpochsParam,
+    int totalSteps,
+    int numCascades,
+    float lambdaDist,
+    int samplesPerVoxel,
+    bool runValidation,
+    bool renderVideo,
+    float maxLR,
+    float minLR
+) {
     std::cout << "Starting NeRF Hit-Centric Training with Streaming DataLoader..." << std::endl;
 
     // ==========================================
-    // 1. Configuration & Setup
+    // 1. Configuration & Setup  (kept in parity with train_hit)
     // ==========================================
 
     NerfOptions opts;
-    opts.densityBias = 1.0f;
-    opts.rayChunkSize = 64 * 1024; // Limit VRAM per training step
+    opts.densityBias = 0.0f;                  // match train_hit
+    opts.rayChunkSize = 64 * 1024;            // Limit VRAM per training step
     opts.colorHiddenDim = 32;
     opts.colorNumLayers = 3;
-    opts.batchSize = 256 * 1024; // Neural Network internal batch size
-    opts.learningRate = 1e-2f;
-    opts.lossScale = 128.0f;     // FP16 Mixed Precision scaling
+    opts.renderBatchSize = 256 * 1024;
+    opts.batchSize = 256 * 1024;              // Neural Network internal batch size
+    opts.samplesPerVoxel = samplesPerVoxel;   // K sub-voxel samples per occupied finest voxel
+    opts.minDensityThreshold = 0.01f;
+    opts.learningRate = maxLR;                // cosine-schedule start (max_lr)
+    opts.lossScale = 128.0f;                  // FP16 Mixed Precision scaling
     opts.epsilon = 1e-8f;
     opts.isProfiling = false;
+    opts.legacyRenderFlag = false;
+    opts.lambdaDist = lambdaDist;
     opts.aabbMin = make_float3(-1.5f, -1.5f, -1.5f);
     opts.aabbMax = make_float3(1.5f, 1.5f, 1.5f);
 
     std::cout << "\nLoading training dataset..." << std::endl;
-    DataLoader dataset(dataset_path, opts.rayChunkSize); 
+    DataLoader dataset(dataset_path, opts.rayChunkSize);
 
-    std::cout << "\nLoading test dataset for rendering..." << std::endl;
-    DataLoader test_dataset(dataset_path, opts.rayChunkSize, false); // Pass false to load transforms_test.json
+    // Reuse the train loader for between-epoch + validation rendering. A separate test loader
+    // needs transforms_test.json (the COLMAP path does NOT produce one) and maps a second full-res
+    // zero-copy image buffer that OOMs 8GB cards -- reuse keeps one frame + one mapping.
+    DataLoader& test_dataset = dataset;
+    std::cout << "\nReusing train dataset for rendering (no separate test load)." << std::endl;
 
     // Use the cascade count estimated by colmap2nerf for this scene (defaults to 1 for
     // bounded/legacy datasets). This drives the occupancy-grid extent and ray AABB scale.
     opts.numCascades = dataset.getNumCascades();
     if (numCascades != 0 ) opts.numCascades = numCascades;
     std::cout << "Using numCascades = " << opts.numCascades << " (from dataset)" << std::endl;
+
+    const int HOLDOUT_EVERY = 8;   // mip-360 protocol: every 8th image held out for validation
+    int holdoutEvery = runValidation ? HOLDOUT_EVERY : 0;
+    std::cout << "lambdaDist=" << lambdaDist << " K=" << samplesPerVoxel << " steps=" << totalSteps
+              << " validate=" << runValidation << " video=" << renderVideo
+              << " maxLR=" << maxLR << " minLR=" << minLR << std::endl;
 
     std::cout << "\nInitializing NeRF Model..." << std::endl;
     InstantNerf nerf;
@@ -145,8 +170,8 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
     // constant 1e-2 LR is a major instability source late in training â€” exactly
     // when the hash grid has learned large features and gradients spike â€” so we
     // decay down to a small floor to keep late-stage updates stable.
-    float max_lr = opts.learningRate;
-    float min_lr = 1e-4f;
+    float max_lr = opts.learningRate;   // = maxLR
+    float min_lr = minLR;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -182,7 +207,12 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
             if (totalSteps > 0 && trainSteps >= totalSteps) break;
             
             // 3.1 Cosine Annealing Learning Rate Update
-            float progress = (float)current_chunk / (float)total_chunks;
+            // Drive the cosine by trainSteps/totalSteps so the LR truly sweeps max->min on a
+            // step-capped run (current_chunk/total_chunks barely advances and pins LR near max,
+            // the late-training divergence source).
+            float progress = (totalSteps > 0)
+                ? fminf((float)trainSteps / (float)totalSteps, 1.0f)
+                : (float)current_chunk / (float)total_chunks;
             float current_lr = min_lr + 0.5f * (max_lr - min_lr) * (1.0f + cosf(3.14159265359f * progress));
             nerf.setLearningRate(current_lr);
             current_chunk++;
@@ -195,8 +225,9 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
             float3 random_bg = make_float3(dist(rng), dist(rng), dist(rng));
             nerf.setBgColor(random_bg);
             
-            // Fetch streaming data from host RAM -> GPU over PCIe using the zero-copy dataloader
-            dataset.fetchRayChunk(offset, chunkSize, epoch_seed, random_bg);
+            // Fetch streaming data from host RAM -> GPU over PCIe using the zero-copy dataloader.
+            // holdoutEvery (>=2 when validating) keeps every Nth image out of the randomized draw.
+            dataset.fetchRayChunk(offset, chunkSize, epoch_seed, random_bg, 0, false, holdoutEvery);
             CUDA_CHECK(cudaDeviceSynchronize());
             
             bool should_print = (current_chunk % 10 == 0) || (offset + opts.rayChunkSize >= total_rays);
@@ -285,16 +316,18 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
 
         // Just test on the first 3 images in the dataset
         int num_test_frames = std::min(3, (int)(test_dataset.getTotalRays() / pixels));
+        // The (reused) train loader sizes its ray buffers to rayChunkSize, so a full image does NOT
+        // fit one fetch -- render each image tile-by-tile into its slice of d_render_out.
+        int render_tile = (int)opts.rayChunkSize;
         for (int i = 0; i < num_test_frames; ++i) {
-            
-            // Stream the ray data to the GPU (offset perfectly matches image boundaries)
-            test_dataset.fetchRayChunk(i * pixels, pixels, 0, make_float3(1.0f, 1.0f, 1.0f));
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Execute the highly parallel rendering pipeline
-            nerf.renderImage(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), pixels, d_render_out);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
+            for (int off = 0; off < pixels; off += render_tile) {
+                int count = std::min(render_tile, pixels - off);
+                test_dataset.fetchRayChunk(i * pixels + off, count, 0, make_float3(1.0f, 1.0f, 1.0f), 0, /*forceSequential=*/true);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                nerf.renderImageHit(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(), count, d_render_out + (size_t)off * 3, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+
             // Convert HDR float to LDR byte and save
             int blocks = (pixels + 255) / 256;
             float_to_byte_kernel<<<blocks, 256>>>(d_render_out, d_render_byte, pixels);
@@ -318,10 +351,57 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
     }
 
     // ==========================================
+    // 4.5 Held-out Validation PSNR (every Nth image is never trained on)
+    // ==========================================
+    if (runValidation) {
+        std::cout << "\nComputing held-out validation PSNR (every " << HOLDOUT_EVERY
+                  << "th image, excluded from training)..." << std::endl;
+        nerf.setMemoryMode(INFERENCE);
+        float3 valBg = make_float3(1.0f, 1.0f, 1.0f);   // fixed white bg: render + GT both over it
+        nerf.setBgColor(valBg);
+
+        int valW = test_dataset.getWidth();
+        int valH = test_dataset.getHeight();
+        int valPixels = valW * valH;
+        int numImgs = (int)(test_dataset.getTotalRays() / (uint32_t)valPixels);
+        int renderTile = (int)opts.rayChunkSize;
+
+        CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
+        long long totalValPixels = 0;
+        int numValImgs = 0;
+        for (int i = 0; i < numImgs; ++i) {
+            if (i % HOLDOUT_EVERY != 0) continue;       // only the held-out images
+            for (int off = 0; off < valPixels; off += renderTile) {
+                int count = std::min(renderTile, valPixels - off);
+                test_dataset.fetchRayChunk(i * valPixels + off, count, 0, valBg, 0, /*forceSequential=*/true);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                nerf.renderImageHit(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(),
+                                    count, d_chunk_rgb_out, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                int threads = 256, blocks = (count + threads - 1) / threads;
+                mse_kernel<<<blocks, threads>>>(d_chunk_rgb_out, test_dataset.getChunkRgbTrue(), d_loss, count);
+                totalValPixels += count;
+            }
+            numValImgs++;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        float h_loss = 0.0f;
+        CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
+        float valMse  = h_loss / (float)std::max(1LL, totalValPixels);
+        float valPsnr = -10.0f * log10f(fmaxf(valMse, 1e-8f));
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "  HELD-OUT VALIDATION PSNR: " << std::fixed << std::setprecision(2)
+                  << valPsnr << " dB" << std::endl;
+        std::cout << "  (" << numValImgs << " held-out images, " << totalValPixels << " pixels)" << std::endl;
+        std::cout << "========================================" << std::endl;
+    }
+
+    // ==========================================
     // 5. Export 360-Degree Novel View Synthesis
     // ==========================================
+    if (renderVideo) {
     std::cout << "\nGenerating 360 degree video frames..." << std::endl;
-    int video_w = 800; 
+    int video_w = 800;
     int video_h = 800;
     int video_pixels = video_w * video_h;
     
@@ -399,7 +479,7 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
             (float3*)d_video_rays_o, (float3*)d_video_rays_d
         );        CUDA_CHECK(cudaDeviceSynchronize());
 
-        nerf.renderImage((float3*)d_video_rays_o, (float3*)d_video_rays_d, video_pixels, d_video_out);
+        nerf.renderImageHit((float3*)d_video_rays_o, (float3*)d_video_rays_d, video_pixels, d_video_out, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
         
         float_to_byte_kernel<<<blocks, 256>>>(d_video_out, d_video_byte, video_pixels);
@@ -418,6 +498,7 @@ void run_training_pipeline(const std::string& dataset_path, int totalEpochsParam
 
     std::cout << "Creating MP4 with FFmpeg..." << std::endl;
     system("ffmpeg -y -framerate 30 -i ../benchmarks/frames/video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p ../benchmarks/nerf_360.mp4");
+    } // end if (renderVideo)
 
     std::cout << "\nSaving trained NeRF to ../benchmarks/saved/model.inerf..." << std::endl;
     std::filesystem::create_directories("../benchmarks/saved");
