@@ -452,15 +452,35 @@ __global__ void fetchRayChunkStreamingKernel(
     const float* d_transforms,
     const uint8_t* d_images_rgba,
     float3* d_chunk_rays_o, float3* d_chunk_rays_d, float* d_chunk_rgb,
-    float3 bg_color
+    float3 bg_color, int holdout_every
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    
+
     uint32_t global_idx;
     if (randomize) {
         uint32_t rand_val = pcg_hash(offset + idx + seed);
-        global_idx = rand_val % total_rays;
+        if (holdout_every >= 2) {
+            // Validation: keep held-out images (img % holdout_every == 0) out of training.
+            // Draw uniformly over the TRAIN images only, then a uniform pixel within the image.
+            int pixels    = width * height;
+            int num_imgs  = total_rays / pixels;
+            int num_test  = (num_imgs + holdout_every - 1) / holdout_every; // # multiples of N in [0,num_imgs)
+            int num_train = num_imgs - num_test;
+            if (num_train < 1) {
+                global_idx = rand_val % total_rays;            // degenerate (too few images): no exclusion
+            } else {
+                int train_slot = (int)(rand_val % (uint32_t)num_train);
+                int block   = train_slot / (holdout_every - 1); // (N-1) train images per N-image block
+                int within  = train_slot % (holdout_every - 1);
+                int img_idx = block * holdout_every + within + 1; // +1 skips the held-out block start (b*N)
+                uint32_t r2 = pcg_hash(rand_val);              // decorrelate pixel choice from image choice
+                int pixel_idx = (int)(r2 % (uint32_t)pixels);
+                global_idx = (uint32_t)img_idx * (uint32_t)pixels + (uint32_t)pixel_idx;
+            }
+        } else {
+            global_idx = rand_val % total_rays;
+        }
     } else {
         global_idx = (offset + idx) % total_rays;
     }
@@ -511,7 +531,7 @@ __global__ void fetchRayChunkStreamingKernel(
     d_chunk_rgb[idx * 3 + 2] = fb;
 }
 
-void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color, cudaStream_t stream, bool forceSequential) {
+void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color, cudaStream_t stream, bool forceSequential, int holdout_every) {
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
     // Training fetches randomize rays for SGD; renders must fetch image-coherent (sequential) rays
@@ -522,7 +542,7 @@ void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_co
         width, height, focal_length,
         d_transforms, d_images_rgba,
         d_chunk_rays_o, d_chunk_rays_d, d_chunk_rgb_true,
-        bg_color
+        bg_color, holdout_every
     );
 }
 

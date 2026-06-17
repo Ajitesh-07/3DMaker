@@ -22,7 +22,9 @@ public:
     const float* getChunkRgbTrue() const { return d_chunk_rgb_true; }
 
     void loadDataToGPU();
-    void fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0, bool forceSequential = false);
+    // holdout_every (>=2): exclude every Nth image (img % N == 0) from the randomized training
+    // draw, so those images stay a clean held-out test set. 0 = no exclusion (default).
+    void fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color = make_float3(1.0f, 1.0f, 1.0f), cudaStream_t stream = 0, bool forceSequential = false, int holdout_every = 0);
     void freeVRAM();
 
     uint32_t getTotalRays() const { return total_rays; }

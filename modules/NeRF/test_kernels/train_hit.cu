@@ -99,17 +99,25 @@ int main(int argc, char** argv) {
             std::cout <<
                 "train_hit -- from-scratch CUDA NeRF trainer (hit-centric path)\n\n"
                 "Usage:\n"
-                "  train_hit [dataset] [lambdaDist] [K] [maxSteps] [numCascades] [profiling]\n\n"
+                "  train_hit [dataset] [lambdaDist] [K] [maxSteps] [numCascades] [profiling] [validate] [video] [maxLR] [minLR]\n\n"
                 "Positional args (all optional, parsed left-to-right):\n"
                 "  dataset      dataset dir with transforms_train.json + images   (default ../../data/nerf_synthetic/lego)\n"
                 "  lambdaDist   distortion-loss weight, 0 = off                    (default 0)\n"
                 "  K            samplesPerVoxel: sub-voxel samples / occupied voxel (default 1)\n"
                 "  maxSteps     training-step cap, <=0 = run all epochs            (default 15000)\n"
                 "  numCascades  occupancy cascades: 1 bounded, 2-4 for 360 scenes  (default 2)\n"
-                "  profiling    1 = enable per-stage GPU timers                    (default 0)\n\n"
+                "  profiling    1 = enable per-stage GPU timers                    (default 0)\n"
+                "  validate     1 = hold out every 8th image, report test PSNR;\n"
+                "               0 = train on every image (no held-out set)         (default 0)\n"
+                "  video        1 = render 360 orbit mp4 after training;\n"
+                "               0 = skip (faster sweeps)                           (default 0)\n"
+                "  maxLR        cosine-schedule start (max) learning rate          (default 0.01)\n"
+                "  minLR        cosine-schedule floor (annealed-to) learning rate  (default 0.0001)\n\n"
                 "Examples:\n"
                 "  train_hit ../../data/nerf_synthetic/lego\n"
                 "  train_hit ../../data/mip_nerf360/bicycle 0.0362781 8 100000 2 0\n"
+                "  train_hit ../../data/mip_nerf360/bicycle 0.1 1 100000 4 0 1 0   # validate, no video\n"
+                "  train_hit ../../data/mip_nerf360/bicycle 0.1 1 100000 4 0 1 0 0.02 0.0005   # custom LR band\n"
                 "  train_hit --help\n";
             return 0;
         }
@@ -164,6 +172,24 @@ int main(int argc, char** argv) {
     std::cout << "[TRAIN] K=" << opts.samplesPerVoxel << " maxSteps=" << maxSteps
               << " numCascades=" << opts.numCascades << " profiling=" << opts.isProfiling << std::endl;
 
+    // argv[7]=runValidation(0/1): hold out every Nth image, report test PSNR after training.
+    // argv[8]=renderVideo(0/1):   render the 360 orbit mp4 (slow; off by default for fast sweeps).
+    const int HOLDOUT_EVERY = 8;   // mip-360 protocol: every 8th image is the held-out test set
+    bool runValidation = false;
+    bool renderVideo   = false;
+    if (argc > 7) runValidation = (atoi(argv[7]) != 0);
+    if (argc > 8) renderVideo   = (atoi(argv[8]) != 0);
+    int holdoutEvery = runValidation ? HOLDOUT_EVERY : 0;   // 0 = train on every image (no held-out set)
+    std::cout << "[TRAIN] validation=" << runValidation << " (holdout every " << HOLDOUT_EVERY
+              << " imgs) renderVideo=" << renderVideo << std::endl;
+
+    // argv[9]=maxLR  argv[10]=minLR : cosine-anneal LR bounds (sweeps max_lr -> min_lr over the run).
+    // maxLR feeds opts.learningRate (== max_lr below); minLR overrides the schedule floor.
+    if (argc > 9) opts.learningRate = (float)atof(argv[9]);
+    float minLrArg = 1e-4f;
+    if (argc > 10) minLrArg = (float)atof(argv[10]);
+    std::cout << "[TRAIN] maxLR=" << opts.learningRate << " minLR=" << minLrArg << std::endl;
+
     std::cout << "\nLoading training dataset..." << std::endl;
     DataLoader dataset(dataset_path, opts.rayChunkSize, true, false);
 
@@ -212,9 +238,9 @@ int main(int argc, char** argv) {
     int total_chunks = totalEpochs * chunks_per_epoch;
     int current_chunk = 0;
     
-    // Cosine Annealing Learning Rate limits
+    // Cosine Annealing Learning Rate limits (overridable via argv[9]=maxLR, argv[10]=minLR)
     float max_lr = opts.learningRate;
-    float min_lr = 1e-4f;
+    float min_lr = minLrArg;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -271,8 +297,9 @@ int main(int argc, char** argv) {
             float3 random_bg = make_float3(dist(rng), dist(rng), dist(rng));
             nerf.setBgColor(random_bg);
             
-            // Fetch streaming data from host RAM -> GPU over PCIe using the zero-copy dataloader
-            dataset.fetchRayChunk(offset, chunkSize, epoch_seed, random_bg);
+            // Fetch streaming data from host RAM -> GPU over PCIe using the zero-copy dataloader.
+            // holdoutEvery (>=2 when validating) keeps every Nth image out of the randomized draw.
+            dataset.fetchRayChunk(offset, chunkSize, epoch_seed, random_bg, 0, false, holdoutEvery);
             CUDA_CHECK(cudaDeviceSynchronize());
             
             bool should_print = (current_chunk % 10 == 0) || (offset + opts.rayChunkSize >= total_rays);
@@ -400,8 +427,56 @@ int main(int argc, char** argv) {
     }
 
     // ==========================================
+    // 4.5 Held-out Validation PSNR (mip-360 protocol: every Nth image is never trained on)
+    // ==========================================
+    if (runValidation) {
+        std::cout << "\nComputing held-out validation PSNR (every " << HOLDOUT_EVERY
+                  << "th image, excluded from training)..." << std::endl;
+        nerf.setMemoryMode(INFERENCE);
+        float3 valBg = make_float3(1.0f, 1.0f, 1.0f);   // fixed white bg: render and GT both composited over it
+        nerf.setBgColor(valBg);
+
+        int valW = test_dataset.getWidth();
+        int valH = test_dataset.getHeight();
+        int valPixels = valW * valH;
+        int numImgs = (int)(test_dataset.getTotalRays() / (uint32_t)valPixels);
+        int renderTile = (int)opts.rayChunkSize;
+
+        CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
+        long long totalValPixels = 0;
+        int numValImgs = 0;
+        for (int i = 0; i < numImgs; ++i) {
+            if (i % HOLDOUT_EVERY != 0) continue;       // only the held-out images
+            for (int off = 0; off < valPixels; off += renderTile) {
+                int count = std::min(renderTile, valPixels - off);
+                // Sequential fetch: rays + ground-truth pixels for this held-out image tile.
+                test_dataset.fetchRayChunk(i * valPixels + off, count, 0, valBg, 0, /*forceSequential=*/true);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                nerf.renderImageHit(test_dataset.getChunkRaysO(), test_dataset.getChunkRaysD(),
+                                    count, d_chunk_rgb_out, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                int threads = 256, blocks = (count + threads - 1) / threads;
+                mse_kernel<<<blocks, threads>>>(d_chunk_rgb_out, test_dataset.getChunkRgbTrue(), d_loss, count);
+                totalValPixels += count;
+            }
+            numValImgs++;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        float h_loss = 0.0f;
+        CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
+        float valMse  = h_loss / (float)std::max(1LL, totalValPixels);
+        float valPsnr = -10.0f * log10f(fmaxf(valMse, 1e-8f));
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "  HELD-OUT VALIDATION PSNR: " << std::fixed << std::setprecision(2)
+                  << valPsnr << " dB" << std::endl;
+        std::cout << "  (" << numValImgs << " held-out images, " << totalValPixels << " pixels)" << std::endl;
+        std::cout << "========================================" << std::endl;
+    }
+
+    // ==========================================
     // 5. Export 360-Degree Novel View Synthesis
     // ==========================================
+    if (renderVideo) {
     std::cout << "\nGenerating 360 degree video frames..." << std::endl;
     int video_w = 800; 
     int video_h = 800;
@@ -477,6 +552,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Creating MP4 with FFmpeg..." << std::endl;
     system("ffmpeg -y -framerate 30 -i ../benchmarks/frames/video_frame_%03d.png -c:v libx264 -pix_fmt yuv420p ../benchmarks/nerf_360.mp4");
+    } // end if (renderVideo)
 
     std::cout << "\nSaving trained NeRF to ../benchmarks/saved/model.inerf..." << std::endl;
     std::filesystem::create_directories("../benchmarks/saved");
