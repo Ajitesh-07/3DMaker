@@ -1107,14 +1107,19 @@ void InstantNerf::save(const std::string& filename) {
     out.write(reinterpret_cast<const char*>(h_color_w.data()), c_total_weights * sizeof(float));
     out.write(reinterpret_cast<const char*>(h_color_b.data()), c_total_biases * sizeof(float));
 
-    uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
+    // Cascade-aware sizing: must match init() exactly. The occupancy grids span all
+    // numCascades cascades; sizing by a single cascade silently drops the outer ones
+    // (background renders empty after a reload).
     int occupancyGridCells = 0;
-    for (int i = 0; i < m_opts.levelsMipmap; i++) {
-        occupancyGridCells += res.x * res.y * res.z;
-        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    for (int j = 0; j < m_opts.numCascades; j++) {
+        uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
+        for (int i = 0; i < m_opts.levelsMipmap; i++) {
+            occupancyGridCells += res.x * res.y * res.z;
+            res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+        }
     }
     int occupancyGridBytes = (occupancyGridCells + 7)/ 8;
-    int masterGridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    int masterGridCells = m_opts.numCascades * (m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
 
     std::vector<float> h_masterOccupancyGrid(masterGridCells);
     d_masterOccupancyGrid.copyHost(h_masterOccupancyGrid.data(), masterGridCells);
@@ -1179,14 +1184,18 @@ void InstantNerf::load(const std::string& filename) {
     in.read(reinterpret_cast<char*>(h_color_b.data()), c_total_biases * sizeof(float));
     m_colorMLP->loadWeights(h_color_w.data(), h_color_b.data());
 
-    uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
+    // Cascade-aware sizing: must match init()/save() exactly, or the outer cascades'
+    // occupancy grids are read short and left empty (blank background on reload).
     int occupancyGridCells = 0;
-    for (int i = 0; i < m_opts.levelsMipmap; i++) {
-        occupancyGridCells += res.x * res.y * res.z;
-        res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+    for (int j = 0; j < m_opts.numCascades; j++) {
+        uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
+        for (int i = 0; i < m_opts.levelsMipmap; i++) {
+            occupancyGridCells += res.x * res.y * res.z;
+            res = make_uint3(res.x / 2, res.y / 2, res.z / 2);
+        }
     }
     int occupancyGridBytes = (occupancyGridCells + 7)/ 8;
-    int masterGridCells = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    int masterGridCells = m_opts.numCascades * (m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z);
 
     std::vector<float> h_masterOccupancyGrid(masterGridCells);
     in.read(reinterpret_cast<char*>(h_masterOccupancyGrid.data()), masterGridCells * sizeof(float));
