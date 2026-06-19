@@ -71,6 +71,15 @@ public:
         scale  = m_scene_scale;
     }
 
+    // Number of registered images in the dataset.
+    int getNumImages() const { return (int)frames.size(); }
+
+    // Copy frame i's camera-to-world (row-major 4x4, normalized frame) into out[16].
+    void getFramePose(int i, float out[16]) const {
+        if (i < 0 || i >= (int)frames.size()) { for (int k = 0; k < 16; ++k) out[k] = 0.0f; return; }
+        for (int k = 0; k < 16; ++k) out[k] = frames[i].transform_matrix[k];
+    }
+
 private:
     std::string dataset_path;
     bool m_is_training;

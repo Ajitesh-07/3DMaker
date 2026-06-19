@@ -342,6 +342,7 @@ void InstantNerf::init(const NerfOptions& opts, MemoryMode memMode) {
 void InstantNerf::setMemoryMode(MemoryMode mode) {
     if (!m_traininit) return;
     if (m_memMode == mode) return;
+    if (m_opts.renderBatchSize == m_opts.batchSize && !m_opts.legacyRenderFlag) return;
 
     m_memMode = mode;
 
