@@ -37,6 +37,7 @@ benchmarks/
 data/
 assets/
 third_party/colmap
+docs/
 
 # TinyMLP Outputs
 modules/TinyMLP/images/
