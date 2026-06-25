@@ -44,7 +44,7 @@ int main() {
     int step = 0;
     std::vector<uint32_t> hitCounts(1, 0);
     std::cout << "Training briefly to mutate the model state..." << std::endl;
-    nerf1.trainWithRaysHit(d_rays_o, d_rays_d, d_rgb_true, numRays, step, hitCounts.data(), d_rgb_out, 0);
+    nerf1.trainWithRaysHit(d_rays_o, d_rays_d, nullptr, nullptr, d_rgb_true, numRays, step, hitCounts.data(), d_rgb_out, 0);
     cudaDeviceSynchronize();
     
     std::string testFile = "test.inerf";

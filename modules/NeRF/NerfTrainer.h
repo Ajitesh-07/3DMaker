@@ -25,12 +25,14 @@ struct TrainStats {
 };
 
 struct NerfConfig {
+    float lambdaDepth         = 0.01f;
     float lambdaDist          = 0.1f;
     int   numCascades         = 0;
     float minDensityThreshold = 0.01f;
     int   sampleK             = 1;
     int   batchSize           = 256 * 1024;
     int   renderBatchSize     = 256 * 1024;
+    float depthFraction       = 12.5f / 100.0f;
     bool  shouldValidate      = false;
 
     float maxLR      = 1e-2f;

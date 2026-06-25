@@ -7,6 +7,8 @@ import shutil
 import struct
 import numpy as np
 
+from colmap_depth import extract_sparse_depth, write_depth_bin
+
 def qvec2rotmat(qw, qx, qy, qz):
     return [
         [1 - 2 * qy**2 - 2 * qz**2, 2 * qx * qy - 2 * qw * qz, 2 * qz * qx + 2 * qw * qy],
@@ -32,7 +34,12 @@ def main():
     parser = argparse.ArgumentParser(description="Convert COLMAP or Video to NeRF format")
     parser.add_argument("dataset_path", help="Path to images directory or a video file")
     parser.add_argument("--video_fps", type=int, default=8, help="FPS to extract from video")
-    
+    parser.add_argument("--depth_sigma", type=float, default=0.02,
+                        help="Base Gaussian width (normalized units) for sparse depth priors; 0 disables")
+    parser.add_argument("--depth_max_radius", type=float, default=0.0,
+                        help="Cull depth priors farther than this (normalized units) from the scene "
+                             "center; 0 = auto (outermost cascade box = 1.5 * 2^(num_cascades-1))")
+
     args = parser.parse_args()
     
     dataset_path = os.path.abspath(args.dataset_path)
@@ -137,12 +144,15 @@ def main():
     print("--- 5. Parsing TXT to transforms.json ---")
     # Read cameras.txt
     camera_angle_x = 0.69 # Default fallback
+    img_w, img_h = 0, 0   # native COLMAP image dims, for the depth sidecar's (u,v) grid
     with open(os.path.join(sparse_txt_path, "cameras.txt"), "r") as f:
         for line in f:
             if line.startswith("#"): continue
             parts = line.split()
             if len(parts) >= 5: # ID MODEL WIDTH HEIGHT PARAMS...
                 width = float(parts[2])
+                img_w = int(float(parts[2]))
+                img_h = int(float(parts[3]))
                 focal_length = float(parts[4])
                 camera_angle_x = 2.0 * math.atan(width / (2.0 * focal_length))
                 break
@@ -257,7 +267,7 @@ def main():
         P = np.eye(3) - np.outer(f, f)
         A += P; b += P @ c
     lookat, inward, cond = None, 0.0, float('inf')
-    if len(cam_C) >= 8:
+    if len(cam_C) >= 3:
         try:
             lookat = np.linalg.solve(A, b)
             cond = float(np.linalg.cond(A))
@@ -271,6 +281,7 @@ def main():
     center = None
     obj_radius = None
     scale = None
+    BASE_HALF_EXTENT = 1.5  # engine base AABB half-width (NerfOptions init in NerfTrainer.cu)
 
     # PREFERRED: object-orbit with a well-conditioned look-at -> center on the subject directly.
     if lookat is not None and inward > 0.3 and cond < 1e4 and len(all_aligned) > 0:
@@ -310,7 +321,6 @@ def main():
         # Cascade 0 is the engine's base AABB (~1.5x the unit subject radius); only background
         # BEYOND that needs extra cascades, so divide out the base-box headroom before log2.
         # ratio <= 1.5 -> everything fits in cascade 0 -> num_cascades = 1.
-        BASE_HALF_EXTENT = 1.5  # must match NerfOptions aabb half-width set in NerfTrainer.cu (init)
         needed = max(ratio / BASE_HALF_EXTENT, 1e-6)
         num_cascades = max(1, min(6, int(math.ceil(math.log2(needed))) + 1))
         print(f"Scene radius: {scene_radius:.2f} (ratio {ratio:.2f}) -> num_cascades = {num_cascades}")
@@ -323,16 +333,48 @@ def main():
         c2w[1][3] = (c2w[1][3] - center[1]) * scale
         c2w[2][3] = (c2w[2][3] - center[2]) * scale
 
+    # Sparse depth priors (DS-NeRF-style): per-keypoint [u, v, D, sigma] attached to
+    # each frame. D uses the SAME `scale` as the poses, so it lands in the normalized
+    # frame the renderer marches in. See scripts/colmap_depth.py + docs/depth_*.md.
+    depth_file_name = None
+    if args.depth_sigma > 0.0:
+        try:
+            if img_w <= 0 or img_h <= 0:
+                raise ValueError("image width/height not found in cameras.txt")
+            # Drop priors outside the renderer's outermost cascade box. Auto-bound =
+            # base AABB half-extent * 2^(num_cascades-1) (the cube the engine marches);
+            # --depth_max_radius overrides. align_pt + center put the cull in the same
+            # normalized frame the poses were baked into.
+            depth_max_radius = (args.depth_max_radius if args.depth_max_radius > 0.0
+                                else BASE_HALF_EXTENT * (2 ** (num_cascades - 1)))
+            depth_map = extract_sparse_depth(sparse_txt_path, scale, sigma_base=args.depth_sigma,
+                                             align_pt=align_pt, center=center,
+                                             max_radius=depth_max_radius)
+            # Pack into a binary sidecar (colmap_depth.write_depth_bin): per-frame blocks
+            # in frames[] order, records sorted by v*width+u for byte-offset (u,v) lookup.
+            frame_names = [fr["file_path"].split("/", 1)[1] for fr in frames]
+            write_depth_bin(os.path.join(dataset_path, "depth_train.bin"),
+                            depth_map, frame_names, img_w, img_h)
+            depth_file_name = "depth_train.bin"
+        except Exception as e:
+            print(f"Warning: sparse depth extraction failed ({e}); continuing without depth priors.")
+
     transforms = {
         "camera_angle_x": camera_angle_x,
         "num_cascades": num_cascades,
+        "depth_sigma_base": args.depth_sigma,
         "frames": frames
     }
 
+    # Train references the depth sidecar; test is held out (no supervision) so it omits it.
+    train_transforms = dict(transforms)
+    if depth_file_name:
+        train_transforms["depth_file"] = depth_file_name
+
     out_file = os.path.join(dataset_path, "transforms_train.json")
     with open(out_file, "w") as f:
-        json.dump(transforms, f, indent=4)
-        
+        json.dump(train_transforms, f, indent=4)
+
     # Also write a transforms_test.json for our test renderer
     out_file_test = os.path.join(dataset_path, "transforms_test.json")
     with open(out_file_test, "w") as f:

@@ -72,7 +72,7 @@ int main() {
         
         CUDA_CHECK(cudaEventRecord(start));
         // Train and capture the network's volume rendering output
-        nerf.trainWithRaysHit(d_rays_o, d_rays_d, d_rgb_true, numRays, trainSteps, nullptr, d_rgb_out, 0);
+        nerf.trainWithRaysHit(d_rays_o, d_rays_d, nullptr, nullptr, d_rgb_true, numRays, trainSteps, nullptr, d_rgb_out, 0);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
 

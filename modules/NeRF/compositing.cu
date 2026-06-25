@@ -87,6 +87,8 @@ __global__ void render_rays_distortion_kernel(
     const uint32_t* __restrict__ num_steps,
     const float* __restrict__ t_sorted,
     const float* __restrict__ density_sigma,
+    const float* __restrict__ depth_chunk,
+    const float* __restrict__ sigma_chunk,
     const float* __restrict__ rgb_output,
     const float* __restrict__ rgb_true,
     float* __restrict__ final_rgb,   
@@ -95,6 +97,7 @@ __global__ void render_rays_distortion_kernel(
     float* __restrict__ dw_out,
     float* __restrict weight_sum,
     float lambda_dist,
+    float lambda_depth,
     float3 bg_color
 ) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -102,6 +105,11 @@ __global__ void render_rays_distortion_kernel(
 
     uint32_t offset = ray_offsets[r];
     uint32_t count = num_steps[r];
+    float d_prior     = depth_chunk ? depth_chunk[r] : -1.0f;   // null = depth supervision off -> gated out below
+    float sigma_prior = sigma_chunk ? sigma_chunk[r] : -1.0f;
+
+    float depth_weight_loss = (d_prior >= 0) ? lambda_depth : 0.0f; 
+
     float t_near    = (count > 0) ? fmaxf(t_sorted[offset], 1e-4f) : 1.0f;
     float t_far_ray = (count > 0) ? t_sorted[offset + count - 1] : 1.0f;
     float g_far = 1.0f - t_near / fmaxf(t_far_ray, t_near + 1e-4f);
@@ -118,6 +126,7 @@ __global__ void render_rays_distortion_kernel(
 
     float dw_sum = 0.0f;
     float dwm_sum = 0.0f;
+    float depth_loss_sum = 0.0f;
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t idx = offset + i;
@@ -145,8 +154,14 @@ __global__ void render_rays_distortion_kernel(
         dw_global_sum += weight;
         dwm_global_sum += weight*m;
 
+        float tx = (t - d_prior) / sigma_prior;
+        float depthWeight = expf(-0.5f * tx*tx)*delta_t;
+        depth_loss_sum += depthWeight;
+
         dw_out[idx] = weight;
     }
+
+    depth_loss_sum = 1.0f / fmaxf(depth_loss_sum, 1e-8f);
 
     float weight_g_sum = 0.0f;
     for (uint32_t i = 0; i < count; i++) {
@@ -165,9 +180,13 @@ __global__ void render_rays_distortion_kernel(
 
         float crrWeight = dw_out[idx];
 
+        float tx = (t - d_prior) / sigma_prior;
+        float depthWeight = expf(-0.5f * tx*tx)*delta_t * depth_loss_sum;
+        float depthLoss = -depthWeight * (1.0f / fmaxf(crrWeight, 1e-6)); 
+
         float dl_bilinear = m * (2 * dw_sum - dw_global_sum) + (dwm_global_sum - 2*dwm_sum);
-        dw_out[idx] = lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_s);
-        weight_g_sum += crrWeight*lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_s);
+        dw_out[idx] = lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_s) + depth_weight_loss*depthLoss;
+        weight_g_sum += crrWeight*(lambda_dist*(2*(dl_bilinear) + c * crrWeight * delta_s) + depth_weight_loss*depthLoss);
 
         dw_sum += crrWeight;
         dwm_sum += crrWeight * m;
@@ -199,6 +218,8 @@ extern "C" void launchVolumeRendering(
     const uint32_t* d_num_steps,
     const float* d_t_sorted,
     const float* d_density_sigma,
+    const float* d_depth_chunk,
+    const float* d_sigma_chunk,
     const float* d_rgb_output,
     const float* d_rgb_true,
     float* d_render_rgb,
@@ -207,6 +228,7 @@ extern "C" void launchVolumeRendering(
     float* d_dw_out,
     float* d_weight_sum,
     float lambda_dist,
+    float lambda_depth,
     float3 bg_color,
     uint32_t base,
     uint32_t raysDone,
@@ -240,6 +262,8 @@ extern "C" void launchVolumeRendering(
             d_num_steps,
             d_t_sorted,
             d_density_sigma,
+            d_depth_chunk,
+            d_sigma_chunk,
             d_rgb_output,
             d_rgb_true,
             d_render_rgb,
@@ -248,6 +272,7 @@ extern "C" void launchVolumeRendering(
             d_dw_out,
             d_weight_sum,
             lambda_dist,
+            lambda_depth,
             bg_color
         );
     }

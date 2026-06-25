@@ -24,12 +24,13 @@ using json = nlohmann::json;
 
 
 DataLoader::DataLoader(const std::string& dataset_path, uint32_t ray_chunk_size, bool is_training,
-                       bool derive_bounds)
+                       bool derive_bounds, float dense_fraction)
         : dataset_path(dataset_path), m_is_training(is_training) {
     int width = 0;
     int height = 0;
     m_ray_chunk_size = ray_chunk_size;
     m_derive_bounds = derive_bounds;
+    m_dense_fraction = dense_fraction;
 
     parseTransformsJson();
     loadImages();          // sets width/height (needed for the vertical FOV / aspect)
@@ -63,6 +64,13 @@ void DataLoader::freeVRAM() {
     if (d_chunk_rays_o) cudaFree(d_chunk_rays_o);
     if (d_chunk_rays_d) cudaFree(d_chunk_rays_d);
     if (d_chunk_rgb_true) cudaFree(d_chunk_rgb_true);
+    if (d_chunk_rays_dense) cudaFree(d_chunk_rays_dense);
+    if (d_chunk_rays_sigma) cudaFree(d_chunk_rays_sigma);
+    if (d_rec_frame) cudaFree(d_rec_frame);
+    if (d_rec_u) cudaFree(d_rec_u);
+    if (d_rec_v) cudaFree(d_rec_v);
+    if (d_rec_D) cudaFree(d_rec_D);
+    if (d_rec_sigma) cudaFree(d_rec_sigma);
 }
 
 
@@ -86,6 +94,11 @@ void DataLoader::parseTransformsJson() {
         num_cascades = j["num_cascades"];
         if (num_cascades < 1) num_cascades = 1;
         m_num_cascades_from_json = true;
+    }
+
+    // Optional sparse depth-prior sidecar (binary). Present only in transforms_train.json.
+    if (j.contains("depth_file")) {
+        m_depth_file = j["depth_file"].get<std::string>();
     }
 
     for (auto& frame : j["frames"]) {
@@ -438,6 +451,92 @@ void DataLoader::loadDataToGPU() {
     CUDA_CHECK(cudaMalloc(&d_chunk_rays_o, m_ray_chunk_size * sizeof(float3)));
     CUDA_CHECK(cudaMalloc(&d_chunk_rays_d, m_ray_chunk_size * sizeof(float3)));
     CUDA_CHECK(cudaMalloc(&d_chunk_rgb_true, m_ray_chunk_size * 3 * sizeof(float)));
+    // Per-ray depth-prior outputs (always allocated; kernel writes -1/0 when no prior).
+    CUDA_CHECK(cudaMalloc(&d_chunk_rays_dense, m_ray_chunk_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_chunk_rays_sigma, m_ray_chunk_size * sizeof(float)));
+
+    if (m_is_training && !m_depth_file.empty()) {
+        loadDepthBin();
+    }
+}
+
+// Parse the binary depth-prior sidecar (scripts/colmap_depth.py write_depth_bin) into device
+// record arrays. Layout: header 'DPT1'|version|num_frames|width|height (20B), then
+// (num_frames+1) u32 record-offsets, then records {u:u16, v:u16, D:f32, sigma:f32} (12B each)
+// sorted per frame. We expand the offset table into a per-record frame index so a sampled
+// record yields (frame, u, v, D, sigma) in O(1).
+void DataLoader::loadDepthBin() {
+    std::string bin_path = dataset_path + "/" + m_depth_file;
+    std::ifstream f(bin_path, std::ios::binary);
+    if (!f.is_open()) {
+        std::cerr << "[Depth] Could not open " << bin_path << "; depth supervision disabled." << std::endl;
+        return;
+    }
+
+    char magic[4];
+    uint32_t version = 0, num_frames_bin = 0, w = 0, h = 0;
+    f.read(magic, 4);
+    f.read(reinterpret_cast<char*>(&version), 4);
+    f.read(reinterpret_cast<char*>(&num_frames_bin), 4);
+    f.read(reinterpret_cast<char*>(&w), 4);
+    f.read(reinterpret_cast<char*>(&h), 4);
+    if (!f || std::string(magic, 4) != "DPT1") {
+        std::cerr << "[Depth] Bad/short header in " << bin_path << " (expected magic DPT1); skipping." << std::endl;
+        return;
+    }
+    m_depth_width  = (int)w;
+    m_depth_height = (int)h;
+
+    std::vector<uint32_t> offsets(num_frames_bin + 1);
+    f.read(reinterpret_cast<char*>(offsets.data()), (std::streamsize)(num_frames_bin + 1) * sizeof(uint32_t));
+    uint32_t total = offsets.back();
+    if (!f || total == 0) {
+        std::cerr << "[Depth] " << bin_path << " has 0 records; depth supervision disabled." << std::endl;
+        return;
+    }
+    if (num_frames_bin != frames.size()) {
+        std::cerr << "[Depth] WARNING: depth_file has " << num_frames_bin << " frames but transforms has "
+                  << frames.size() << "; record frame ids assume the bin's order." << std::endl;
+    }
+
+    std::vector<uint8_t> raw((size_t)total * 12);
+    f.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)total * 12);
+    if (!f) {
+        std::cerr << "[Depth] Truncated record block in " << bin_path << "; skipping." << std::endl;
+        return;
+    }
+    f.close();
+
+    std::vector<int>   h_frame(total);
+    std::vector<float> h_u(total), h_v(total), h_D(total), h_sigma(total);
+    for (uint32_t fr = 0; fr < num_frames_bin; ++fr) {
+        for (uint32_t r = offsets[fr]; r < offsets[fr + 1]; ++r) h_frame[r] = (int)fr;
+    }
+    for (uint32_t r = 0; r < total; ++r) {
+        const uint8_t* p = raw.data() + (size_t)r * 12;  // little-endian, matches x86 host
+        uint16_t u, v; float D, sg;
+        std::memcpy(&u,  p + 0, 2);
+        std::memcpy(&v,  p + 2, 2);
+        std::memcpy(&D,  p + 4, 4);
+        std::memcpy(&sg, p + 8, 4);
+        h_u[r] = (float)u; h_v[r] = (float)v; h_D[r] = D; h_sigma[r] = sg;
+    }
+
+    m_num_records = total;
+    CUDA_CHECK(cudaMalloc(&d_rec_frame, total * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_rec_u,     total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rec_v,     total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rec_D,     total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rec_sigma, total * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_rec_frame, h_frame.data(), total * sizeof(int),   cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rec_u,     h_u.data(),     total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rec_v,     h_v.data(),     total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rec_D,     h_D.data(),     total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rec_sigma, h_sigma.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+
+    std::cout << "[Depth] Loaded " << total << " priors from " << m_depth_file
+              << " (" << m_depth_width << "x" << m_depth_height << "), "
+              << num_frames_bin << " frames, dense_fraction=" << m_dense_fraction << "." << std::endl;
 }
 
 __device__ uint32_t pcg_hash(uint32_t input) {
@@ -452,6 +551,10 @@ __global__ void fetchRayChunkStreamingKernel(
     const float* d_transforms,
     const uint8_t* d_images_rgba,
     float3* d_chunk_rays_o, float3* d_chunk_rays_d, float* d_chunk_rgb,
+    float* d_chunk_dense, float* d_chunk_sigma,
+    const int* rec_frame, const float* rec_u, const float* rec_v,
+    const float* rec_D, const float* rec_sigma, uint32_t num_records,
+    float dense_fraction, float uv_scale_x, float uv_scale_y,
     float3 bg_color, int holdout_every
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -461,14 +564,12 @@ __global__ void fetchRayChunkStreamingKernel(
     if (randomize) {
         uint32_t rand_val = pcg_hash(offset + idx + seed);
         if (holdout_every >= 2) {
-            // Validation: keep held-out images (img % holdout_every == 0) out of training.
-            // Draw uniformly over the TRAIN images only, then a uniform pixel within the image.
             int pixels    = width * height;
             int num_imgs  = total_rays / pixels;
-            int num_test  = (num_imgs + holdout_every - 1) / holdout_every; // # multiples of N in [0,num_imgs)
+            int num_test  = (num_imgs + holdout_every - 1) / holdout_every;
             int num_train = num_imgs - num_test;
             if (num_train < 1) {
-                global_idx = rand_val % total_rays;            // degenerate (too few images): no exclusion
+                global_idx = rand_val % total_rays; 
             } else {
                 int train_slot = (int)(rand_val % (uint32_t)num_train);
                 int block   = train_slot / (holdout_every - 1); // (N-1) train images per N-image block
@@ -485,10 +586,36 @@ __global__ void fetchRayChunkStreamingKernel(
         global_idx = (offset + idx) % total_rays;
     }
 
-    int img_idx = global_idx / (width * height);
-    int pixel_idx = global_idx % (width * height);
-    int px = pixel_idx % width;
-    int py = pixel_idx / width;
+    int pixels = width * height;
+    int img_idx = global_idx / pixels;
+    int pixel_idx = global_idx % pixels;
+    float px = (float)(pixel_idx % width);
+    float py = (float)(pixel_idx / width);
+
+    // Dense (depth-prior) ray override: with probability dense_fraction, replace this
+    // uniform-random RGB ray with a ray generated AT a COLMAP keypoint, so the depth loss
+    // actually fires (priors are far too sparse to ever hit by random pixel sampling).
+    // Decided per slot via an independent hash -> re-randomized every step and evenly spread
+    // across the 256Ki hit-batches (hence every per-batch SGD step). RGB rays keep dense=-1.
+    float out_D = -1.0f, out_sigma = -1.0f;
+    if (randomize && dense_fraction > 0.0f && num_records > 0) {
+        uint32_t hsel = pcg_hash((uint32_t)(idx + 0x9E3779B9u) ^ (seed * 2654435761u));
+        if (hsel * (1.0f / 4294967296.0f) < dense_fraction) {
+            uint32_t r = pcg_hash(hsel) % num_records;
+            int f = rec_frame[r];
+            // Skip priors on held-out images during validation (would leak test geometry).
+            if (!(holdout_every >= 2 && (f % holdout_every == 0))) {
+                img_idx = f;
+                px = rec_u[r] * uv_scale_x;
+                py = rec_v[r] * uv_scale_y;
+                out_D = rec_D[r];
+                out_sigma = rec_sigma[r];
+                int px_i = min(max((int)(px + 0.5f), 0), width - 1);
+                int py_i = min(max((int)(py + 0.5f), 0), height - 1);
+                global_idx = (uint32_t)img_idx * (uint32_t)pixels + (uint32_t)(py_i * width + px_i);
+            }
+        }
+    }
 
     float dir_x = (px - width * 0.5f) / focal_length;
     float dir_y = -(py - height * 0.5f) / focal_length;
@@ -529,19 +656,25 @@ __global__ void fetchRayChunkStreamingKernel(
     d_chunk_rgb[idx * 3 + 0] = fr;
     d_chunk_rgb[idx * 3 + 1] = fg;
     d_chunk_rgb[idx * 3 + 2] = fb;
+
+    d_chunk_dense[idx] = out_D;
+    d_chunk_sigma[idx] = out_sigma;
 }
 
 void DataLoader::fetchRayChunk(int offset, int size, uint32_t seed, float3 bg_color, cudaStream_t stream, bool forceSequential, int holdout_every) {
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
-    // Training fetches randomize rays for SGD; renders must fetch image-coherent (sequential) rays
-    // -- otherwise the preview is a scatter of random pixels from across all images (pure noise).
     bool randomize = m_is_training && !forceSequential;
+    float uv_scale_x = (m_depth_width  > 0) ? (float)width  / (float)m_depth_width  : 1.0f;
+    float uv_scale_y = (m_depth_height > 0) ? (float)height / (float)m_depth_height : 1.0f;
     fetchRayChunkStreamingKernel<<<gridSize, blockSize, 0, stream>>>(
         offset, size, total_rays, seed, randomize,
         width, height, focal_length,
         d_transforms, d_images_rgba,
         d_chunk_rays_o, d_chunk_rays_d, d_chunk_rgb_true,
+        d_chunk_rays_dense, d_chunk_rays_sigma,
+        d_rec_frame, d_rec_u, d_rec_v, d_rec_D, d_rec_sigma, m_num_records,
+        m_dense_fraction, uv_scale_x, uv_scale_y,
         bg_color, holdout_every
     );
 }

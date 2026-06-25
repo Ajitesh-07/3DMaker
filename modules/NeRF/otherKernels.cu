@@ -393,7 +393,7 @@ __global__ void compute_color_grad(
         float ds_b = currentT * c_b * (1.0f - alpha) - suff_b;
 
         float g_i = dw_out[i];
-        currentWeightG += weight * g_i;                          // include sample i -> suffix = sum_{k>i} g_k w_k
+        currentWeightG += weight * g_i;                         
         float suffix_weight = crrWeightGSum - currentWeightG;
         float d_sigma_i = delta_t * (ds_r * phi_r + ds_g * phi_g + ds_b * phi_b);
         d_sigma_i += delta_t * (g_i * currentT * (1.0f - alpha) - suffix_weight);

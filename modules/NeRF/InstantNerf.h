@@ -57,6 +57,7 @@ struct NerfOptions {
     int rayChunkSize = 256 * 1024;
 
     // Optimization hyperparameters
+    float lambdaDepth = 0.02882f;
     float lambdaDist = 0.0362781f;
     float learningRate = 1e-3f;
     float beta1 = 0.9f;
@@ -295,6 +296,8 @@ public:
     void trainWithRaysHit(
         const float3* d_rays_o,
         const float3* d_rays_d,
+        const float* d_rays_depth,
+        const float* d_rays_sigma,
         const float* d_rgb_true,
         uint32_t numRays,
         int& trainStepCount,
@@ -487,6 +490,8 @@ extern "C" void launchVolumeRendering(
     const uint32_t* d_num_steps,
     const float* d_t_sorted,
     const float* d_density_sigma,
+    const float* d_depth_chunk,
+    const float* d_sigma_chunk,
     const float* d_rgb_output,
     const float* d_rgb_true,
     float* d_render_rgb,
@@ -495,6 +500,7 @@ extern "C" void launchVolumeRendering(
     float* d_dw_out,
     float* d_weight_sum,
     float lambda_dist,
+    float lambda_depth,
     float3 bg_color = make_float3(1.0f, 1.0f, 1.0f),
     uint32_t base = 0,
     uint32_t raysDone = 0,

@@ -9,8 +9,10 @@ class DataLoader {
 public:
     // derive_bounds: when true, run the ray-convergence center + recenter/scale + per-axis AABB
     // derivation. When false, process the dataset exactly as authored (no recenter/scale, cube +/-1.5).
+    // dense_fraction in [0,1]: fraction of each training ray chunk drawn as depth-prior ("dense")
+    // rays instead of uniform-random pixels (0 = depth supervision off). See fetchRayChunk.
     DataLoader(const std::string& dataset_path, uint32_t ray_chunk_size, bool is_training = true,
-               bool derive_bounds = true);
+               bool derive_bounds = true, float dense_fraction = 0.0f);
     // Reuse a scene transform derived by another loader (e.g. test loader matching the
     // training loader) instead of deriving its own — keeps both in the same normalized frame.
     DataLoader(const std::string& dataset_path, uint32_t ray_chunk_size, bool is_training,
@@ -20,6 +22,15 @@ public:
     const float3* getChunkRaysO() const { return d_chunk_rays_o; }
     const float3* getChunkRaysD() const { return d_chunk_rays_d; }
     const float* getChunkRgbTrue() const { return d_chunk_rgb_true; }
+    // Per-ray depth prior for the current chunk: D (along-ray, normalized units) and its
+    // Gaussian sigma. For non-depth (RGB) rays, dense = -1 (sentinel "no prior") and sigma = 0.
+    const float* getChunkRaysDense() const { return d_chunk_rays_dense; }
+    const float* getChunkRaysSigma() const { return d_chunk_rays_sigma; }
+
+    void  setDenseRaysFraction(float f) { m_dense_fraction = f; }
+    float getDenseRaysFraction() const { return m_dense_fraction; }
+    // # of depth priors loaded (0 if none / not a training loader with a depth_file).
+    uint32_t getNumDepthRecords() const { return m_num_records; }
 
     void loadDataToGPU();
     // holdout_every (>=2): exclude every Nth image (img % N == 0) from the randomized training
@@ -123,11 +134,28 @@ private:
     float3* d_chunk_rays_o = nullptr;
     float3* d_chunk_rays_d = nullptr;
     float* d_chunk_rgb_true = nullptr;
+    float* d_chunk_rays_dense = nullptr;   // per-ray depth prior D (-1 = no prior)
+    float* d_chunk_rays_sigma = nullptr;   // per-ray Gaussian sigma (0 = no prior)
+
+    // Sparse depth priors loaded from depth_file (DS-NeRF-style). One record per kept
+    // COLMAP keypoint; rays are generated from these for the "dense" fraction of a chunk.
+    // See scripts/colmap_depth.py (writer) and docs/depth_supervision.md.
+    std::string m_depth_file;              // from transforms.json "depth_file" (empty = none)
+    float    m_dense_fraction = 0.0f;      // fraction of a chunk drawn as depth rays
+    uint32_t m_num_records = 0;
+    int      m_depth_width = 0;            // native (u,v) resolution of the priors
+    int      m_depth_height = 0;
+    int*   d_rec_frame = nullptr;          // per-record frame index (offset-table expanded)
+    float* d_rec_u = nullptr;              // per-record pixel u, v (native depth resolution)
+    float* d_rec_v = nullptr;
+    float* d_rec_D = nullptr;
+    float* d_rec_sigma = nullptr;
 
     uint32_t total_rays;
 
 
     void parseTransformsJson();
     void loadImages();
+    void loadDepthBin();         // parse depth_file -> device record arrays (training only)
     void computeSceneBounds();   // ray-convergence center + regime-gated per-axis AABB
 };

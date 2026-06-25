@@ -169,9 +169,40 @@ int main(int argc, char** argv) {
             if (g_pitch > 1.5f) g_pitch = 1.5f;
             if (g_pitch < -1.5f) g_pitch = -1.5f;
 
+            // Start the orbit AT a real training camera (frame 0) so the first view is guaranteed
+            // framed. The auto-pivot above (ray-convergence center + average radius/pitch) can land
+            // in empty space for handheld / non-orbit captures -> the orbit then looks at a void ->
+            // white screen. Decompose frame 0's camera position into the SAME (yaw,pitch,radius)
+            // orbit basis the render loop builds from g_world_up, so the initial pose sits exactly
+            // on frame 0 looking at the center -- i.e. reproduces renderTrainView(0).
+            if (!data["frames"].empty()) {
+                auto m0 = data["frames"][0]["transform_matrix"];
+                float dx = (float)m0[0][3] - g_scene_center[0];
+                float dy = (float)m0[1][3] - g_scene_center[1];
+                float dz = (float)m0[2][3] - g_scene_center[2];
+                float rad = sqrtf(dx*dx + dy*dy + dz*dz);
+                if (rad > 1e-4f) {
+                    float Ou[3] = { g_world_up[0], g_world_up[1], g_world_up[2] };
+                    float Of[3] = { 1.0f, 0.0f, 0.0f };
+                    if (fabsf(Ou[0]) > 0.9f) { Of[0] = 0.0f; Of[1] = 1.0f; Of[2] = 0.0f; }
+                    float duf = Ou[0]*Of[0] + Ou[1]*Of[1] + Ou[2]*Of[2];
+                    Of[0] -= duf*Ou[0]; Of[1] -= duf*Ou[1]; Of[2] -= duf*Ou[2];
+                    float lf = sqrtf(Of[0]*Of[0] + Of[1]*Of[1] + Of[2]*Of[2]);
+                    if (lf > 0) { Of[0]/=lf; Of[1]/=lf; Of[2]/=lf; }
+                    float Or[3] = { Ou[1]*Of[2]-Ou[2]*Of[1], Ou[2]*Of[0]-Ou[0]*Of[2], Ou[0]*Of[1]-Ou[1]*Of[0] };
+                    float lz = dx*Ou[0] + dy*Ou[1] + dz*Ou[2];   // component along up
+                    float lx = dx*Of[0] + dy*Of[1] + dz*Of[2];   // along forward
+                    float ly = dx*Or[0] + dy*Or[1] + dz*Or[2];   // along right
+                    g_radius = rad;
+                    g_pitch  = asinf(fmaxf(-1.0f, fminf(1.0f, lz / rad)));
+                    g_yaw    = atan2f(ly, lx);
+                }
+            }
+
             std::cout << "[viewer] center=(" << g_scene_center[0] << "," << g_scene_center[1] << ","
                       << g_scene_center[2] << ") radius=" << g_radius
-                      << " pitch=" << (g_pitch * 57.2958f) << " deg" << std::endl;
+                      << " pitch=" << (g_pitch * 57.2958f) << " deg"
+                      << " yaw=" << (g_yaw * 57.2958f) << " deg (start @ frame 0)" << std::endl;
         }
     } catch (std::exception& e) {
         std::cerr << "Warning: Failed to parse from " << transforms_path << ". Using defaults." << std::endl;
@@ -292,7 +323,7 @@ int main(int argc, char** argv) {
         // Orbit basis
         float O_up[3] = {g_world_up[0], g_world_up[1], g_world_up[2]};
         float O_forward[3] = {1.0f, 0.0f, 0.0f};
-        if (abs(O_up[0]) > 0.9f) { O_forward[0] = 0.0f; O_forward[1] = 1.0f; O_forward[2] = 0.0f; }
+        if (fabsf(O_up[0]) > 0.9f) { O_forward[0] = 0.0f; O_forward[1] = 1.0f; O_forward[2] = 0.0f; }
         
         float dot_uf = O_up[0]*O_forward[0] + O_up[1]*O_forward[1] + O_up[2]*O_forward[2];
         O_forward[0] -= dot_uf * O_up[0]; 

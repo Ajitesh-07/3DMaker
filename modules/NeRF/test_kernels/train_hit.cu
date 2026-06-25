@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
+#include <unordered_map>
+#include <unordered_set>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../../third_party/stb_image_write.h"
@@ -26,57 +28,94 @@ static void saveImagePNG(const Image& img, const std::string& path) {
     stbi_write_png(path.c_str(), img.width, img.height, 3, bytes.data(), img.width * 3);
 }
 
+static const char* HELP =
+    "train_hit -- thin CLI over the INerfTrainer facade\n\n"
+    "Usage:\n"
+    "  train_hit <dataset> [--flag value ...]\n\n"
+    "dataset is positional; everything else is a named flag (override only what you\n"
+    "need, any order). Booleans (--validate/--video) work bare or with 0/1. Defaults\n"
+    "come from NerfConfig:\n"
+    "  --lambda-dist V     distortion-loss weight (pair ~0.1/K)         (0.1)\n"
+    "  --k N               samplesPerVoxel: sub-voxel samples / voxel   (1)\n"
+    "  --max-steps N       training-step cap                           (15000)\n"
+    "  --cascades N        occupancy cascades; 0 = dataset estimate     (0 = auto)\n"
+    "  --validate          hold out every 8th image, report test PSNR   (off)\n"
+    "  --video             render a 360 orbit mp4 after training        (off)\n"
+    "  --max-lr V          anneal-and-hold schedule start LR            (0.01)\n"
+    "  --min-lr V          anneal-and-hold schedule floor LR            (0.001)\n"
+    "  --min-density V     per-cascade opacity cull bar; raise to prune (0.01)\n"
+    "  --lambda-depth V    DS-NeRF depth-supervision weight; 0 = off     (0.01)\n"
+    "  --depth-fraction V  frac of each chunk drawn as depth rays [0..1] (0.125)\n"
+    "  dataset             dir with transforms_train.json + images       (../../data/nerf_synthetic/lego)\n\n"
+    "Examples:\n"
+    "  train_hit ../../data/video --k 2 --validate --lambda-depth 0.02\n"
+    "  train_hit ../../data/video --k 4 --cascades 1 --validate --min-density 0.03\n"
+    "  train_hit --help\n";
+
 int main(int argc, char** argv) {
+    // ----- Named-flag CLI. dataset positional; `--key value` for the rest. Defaults
+    //       live in NerfConfig, so each flag falls back to cfg's own field value. -----
+    NerfConfig cfg;
+    int  maxSteps    = 15000;
+    bool renderVideo = false;
+    std::string dataset = "../../data/nerf_synthetic/lego";
+
+    static const std::unordered_set<std::string> KNOWN = {
+        "lambda-dist", "k", "max-steps", "cascades", "validate", "video",
+        "max-lr", "min-lr", "min-density", "lambda-depth", "depth-fraction"
+    };
+    static const std::unordered_set<std::string> BOOLS = { "validate", "video" };
+
+    std::unordered_map<std::string, std::string> flags;
     for (int a = 1; a < argc; ++a) {
         std::string arg = argv[a];
-        if (arg == "--help" || arg == "-h") {
-            std::cout <<
-                "train_hit -- thin CLI over the INerfTrainer facade\n\n"
-                "Usage:\n"
-                "  train_hit [dataset] [lambdaDist] [K] [maxSteps] [numCascades] [profiling] [validate] [video] [maxLR] [minLR] [minDensity]\n\n"
-                "Positional args (all optional, parsed left-to-right):\n"
-                "  dataset      dataset dir with transforms_train.json + images   (default ../../data/nerf_synthetic/lego)\n"
-                "  lambdaDist   distortion-loss weight (pair ~0.1/K)               (default 0.1)\n"
-                "  K            samplesPerVoxel: sub-voxel samples / occupied voxel (default 1)\n"
-                "  maxSteps     training-step cap                                  (default 15000)\n"
-                "  numCascades  occupancy cascades; 0 = take the dataset estimate  (default 0 = auto)\n"
-                "  profiling    (ignored; not exposed by the facade yet)           (default 0)\n"
-                "  validate     1 = hold out every 8th image, report test PSNR     (default 0)\n"
-                "  video        1 = render a 360 orbit mp4 after training          (default 0)\n"
-                "  maxLR        anneal-and-hold schedule start LR                  (default 0.01)\n"
-                "  minLR        anneal-and-hold schedule floor LR                  (default 0.001)\n"
-                "  minDensity   per-cascade opacity cull bar; raise to prune fog   (default 0.01)\n\n"
-                "Examples:\n"
-                "  train_hit ../../data/video_chair 0.05 2 20000 0 0 1 0          # K=2 + paired lambda, validate\n"
-                "  train_hit ../../data/video 0.1 4 20000 1 0 1 0 1e-3 1e-4 0.03  # prune floaters\n"
-                "  train_hit --help\n";
-            return 0;
+        if (arg == "--help" || arg == "-h") { std::cout << HELP; return 0; }
+
+        if (arg.rfind("--", 0) == 0) {
+            std::string key = arg.substr(2);
+            if (!KNOWN.count(key)) {
+                std::cerr << "[train_hit] unknown flag '" << arg << "' (try --help)\n";
+                return 1;
+            }
+            if (BOOLS.count(key)) {
+                // bare --flag = true; only swallow the next token if it's an explicit 0/1
+                std::string nxt = (a + 1 < argc) ? argv[a + 1] : "";
+                flags[key] = (nxt == "0" || nxt == "1") ? (++a, nxt) : "1";
+            } else if (a + 1 < argc && std::string(argv[a + 1]).rfind("--", 0) != 0) {
+                flags[key] = argv[++a];
+            } else {
+                std::cerr << "[train_hit] flag '" << arg << "' needs a value (try --help)\n";
+                return 1;
+            }
+        } else {
+            dataset = arg;   // the one positional
         }
     }
 
-    // ----- Parse positional args into a NerfConfig (defaults are the parity config) -----
-    std::string dataset = (argc > 1) ? argv[1] : "../../data/nerf_synthetic/lego";
-    NerfConfig cfg;                       // lambdaDist=0.1, sampleK=1, numCascades=0(auto),
-    int  maxSteps    = 15000;             // maxLR=0.01, minLR=0.001, minDensity=0.01
-    bool renderVideo = false;
+    auto getf = [&](const char* k, float d){ auto it = flags.find(k); return it != flags.end() ? (float)atof(it->second.c_str()) : d; };
+    auto geti = [&](const char* k, int   d){ auto it = flags.find(k); return it != flags.end() ? atoi(it->second.c_str())       : d; };
+    auto getb = [&](const char* k, bool  d){ auto it = flags.find(k); return it != flags.end() ? (atoi(it->second.c_str()) != 0) : d; };
 
-    if (argc >  2) cfg.lambdaDist          = (float)atof(argv[2]);
-    if (argc >  3) cfg.sampleK             = atoi(argv[3]);
-    if (argc >  4) maxSteps                = atoi(argv[4]);
-    if (argc >  5) cfg.numCascades         = atoi(argv[5]);   // 0 = auto from dataset
-    // argv[6] (profiling) is parsed historically but the facade doesn't expose it -> ignored.
-    if (argc >  7) cfg.shouldValidate      = (atoi(argv[7]) != 0);
-    if (argc >  8) renderVideo             = (atoi(argv[8]) != 0);
-    if (argc >  9) cfg.maxLR               = (float)atof(argv[9]);
-    if (argc > 10) cfg.minLR               = (float)atof(argv[10]);
-    if (argc > 11) cfg.minDensityThreshold = (float)atof(argv[11]);
+    cfg.lambdaDist          = getf("lambda-dist",    cfg.lambdaDist);
+    cfg.sampleK             = geti("k",              cfg.sampleK);
+    maxSteps                = geti("max-steps",      maxSteps);
+    cfg.numCascades         = geti("cascades",       cfg.numCascades);
+    cfg.shouldValidate      = getb("validate",       cfg.shouldValidate);
+    renderVideo             = getb("video",          renderVideo);
+    cfg.maxLR               = getf("max-lr",         cfg.maxLR);
+    cfg.minLR               = getf("min-lr",         cfg.minLR);
+    cfg.minDensityThreshold = getf("min-density",    cfg.minDensityThreshold);
+    cfg.lambdaDepth         = getf("lambda-depth",   cfg.lambdaDepth);
+    cfg.depthFraction       = getf("depth-fraction", cfg.depthFraction);
 
     std::cout << "[train_hit] dataset=" << dataset
-              << " lambda=" << cfg.lambdaDist << " K=" << cfg.sampleK
+              << " lambdaDist=" << cfg.lambdaDist << " K=" << cfg.sampleK
               << " maxSteps=" << maxSteps << " cascades=" << cfg.numCascades
               << " validate=" << cfg.shouldValidate << " video=" << renderVideo
               << " maxLR=" << cfg.maxLR << " minLR=" << cfg.minLR
-              << " minDensity=" << cfg.minDensityThreshold << std::endl;
+              << " minDensity=" << cfg.minDensityThreshold
+              << " lambdaDepth=" << cfg.lambdaDepth
+              << " depthFraction=" << cfg.depthFraction << std::endl;
 
     // ----- Drive the facade -----
     INerfTrainer trainer;

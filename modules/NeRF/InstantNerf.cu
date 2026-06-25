@@ -360,6 +360,8 @@ void InstantNerf::setMemoryMode(MemoryMode mode) {
 void InstantNerf::trainWithRaysHit(
     const float3* d_rays_o,
     const float3* d_rays_d,
+    const float* d_rays_depth,
+    const float* d_rays_sigma,
     const float* d_rgb_true,
     uint32_t numRays,
     int& trainStepCount,
@@ -379,6 +381,8 @@ void InstantNerf::trainWithRaysHit(
         uint32_t currentChunkRaysUpperBound = min(m_opts.rayChunkSize, numRays - raysDone);
         const float3* chunk_o = d_rays_o + raysDone;
         const float3* chunk_d = d_rays_d + raysDone;
+        const float* chunk_depth = d_rays_depth + raysDone;
+        const float* chunk_sigma = d_rays_sigma + raysDone;
 
         int currentChunkRays;
         uint32_t totalHits;
@@ -421,7 +425,7 @@ void InstantNerf::trainWithRaysHit(
 
         if (currentChunkRays == 0) {
             fprintf(stderr, "Error: Batch size is too small to fit even a single ray! Increase batchSize.\n");
-            return; // Or throw an exception to escape the infinite loop
+            return;
         }
 
         if (hitCounts != nullptr) {
@@ -463,6 +467,7 @@ void InstantNerf::trainWithRaysHit(
             m_render_buffers.d_num_steps.data(),
             m_render_buffers.d_t_sorted.data(),
             m_render_buffers.d_density_sigma.data(),
+            chunk_depth, chunk_sigma,
             m_render_buffers.d_rgb_output.data(),
             d_rgb_true ? (d_rgb_true + raysDone * 3) : nullptr,
             m_render_buffers.d_render_rgb_chunk.data(),
@@ -471,6 +476,7 @@ void InstantNerf::trainWithRaysHit(
             m_render_buffers.d_dw_out.data(),
             m_render_buffers.d_weight_sum.data(),
             m_opts.lambdaDist,
+            m_opts.lambdaDepth,
             m_opts.bgColor, 0, 0,
             stream
         );
@@ -683,12 +689,13 @@ void InstantNerf::renderImage(
             m_render_buffers.d_num_steps.data(),
             m_render_buffers.d_t_sorted.data(),
             m_render_buffers.d_density_sigma.data(),
+            nullptr, nullptr,
             m_render_buffers.d_rgb_output.data(),
             nullptr,
             m_render_buffers.d_render_rgb_chunk.data(),
             m_render_buffers.d_render_depth_chunk.data(),
             m_render_buffers.d_phi_chunk.data(),
-            nullptr, nullptr, 0,
+            nullptr, nullptr, 0, 0,
             m_opts.bgColor, 0, 0,
             stream
         );
@@ -830,12 +837,13 @@ void InstantNerf::renderImageHit(
                     m_render_buffers.d_num_steps.data() + raysDone,
                     m_render_buffers.d_t_sorted.data(),
                     m_render_buffers.d_density_sigma.data(),
+                    nullptr, nullptr,
                     m_render_buffers.d_rgb_output.data(),
                     nullptr,
                     m_render_buffers.d_render_rgb_chunk.data(),
                     m_render_buffers.d_render_depth_chunk.data(),
                     m_render_buffers.d_phi_chunk.data(),
-                    nullptr, nullptr, 0,
+                    nullptr, nullptr, 0, 0,
                     m_opts.bgColor,
                     outBase, raysDone,
                     stream

@@ -72,6 +72,7 @@ void INerfTrainer::init(const NerfConfig& config) {
     opts.batchSize       = config.batchSize;
     opts.rayChunkSize    = config.batchSize / 4;
 
+    opts.lambdaDepth  = config.lambdaDepth;
     opts.lambdaDist   = config.lambdaDist;
     opts.learningRate = config.maxLR;
     opts.beta1 = 0.9f; opts.beta2 = 0.999f; opts.epsilon = 1e-8f;
@@ -106,7 +107,7 @@ void INerfTrainer::buildModel() {
 
 void INerfTrainer::loadDataset(const std::string& path) {
     delete m_dataloader;
-    m_dataloader = new DataLoader(path, m_masterConfig.rayChunkSize, true, false);
+    m_dataloader = new DataLoader(path, m_masterConfig.rayChunkSize, true, false, m_config.depthFraction);
     m_total_rays = m_dataloader->getTotalRays();
 
     if (m_config.numCascades <= 0)
@@ -156,6 +157,8 @@ float INerfTrainer::trainOneChunk(bool computeLoss) {
     m_nerf->trainWithRaysHit(
         m_dataloader->getChunkRaysO(),
         m_dataloader->getChunkRaysD(),
+        m_dataloader->getChunkRaysDense(),
+        m_dataloader->getChunkRaysSigma(),
         m_dataloader->getChunkRgbTrue(),
         (uint32_t)chunkSize,
         m_globalStep,
