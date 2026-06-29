@@ -32,6 +32,8 @@ add_library(NeRFModule STATIC
     RenderKernels.h
     NerfTrainer.h
     NerfTrainer.cu
+    BakedNerf.h
+    BakedNerf.cu
 )
 
 # Headers from TinyMLP module
@@ -188,4 +190,15 @@ if(NERF_BUILD_TESTS)
         )
     endif()
     target_link_libraries(test_scene_footer PRIVATE NeRFModule)
+
+    add_executable(test_baking test_kernels/test_baking.cu)
+    if(MSVC)
+        target_compile_options(test_baking PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
+        )
+        target_compile_definitions(test_baking PRIVATE
+            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+        )
+    endif()
+    target_link_libraries(test_baking PRIVATE NeRFModule)
 endif()

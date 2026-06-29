@@ -322,6 +322,14 @@ public:
         cudaStream_t stream
     );
 
+    void queryOccupancyGrid(const float* d_pos, int n, uint32_t* d_data_out, float minOpticalThreshold, cudaStream_t stream = 0);
+    void queryDensityLogit(const float* d_pos, int n, float* d_logit_out, cudaStream_t stream = 0);
+    void queryRadiance(const float* d_pos, int n, float3 viewDir, float* d_rgb_out, cudaStream_t stream = 0);
+    void buildOccupancyBitgrid(uint8_t* d_out, float minDensityThreshold, cudaStream_t stream = 0);
+    const NerfOptions& options() const { return m_opts; }
+    const uint8_t* occupancyGrid() { return d_occupancyGrid.data(); }
+    size_t         occupancyBytes() { return d_occupancyGrid.size(); }
+    
     void save(const std::string& filename);
     void load(const std::string& filename);
 
@@ -331,6 +339,7 @@ private:
     void earlyOccupancyGridUpdate(cudaStream_t stream = 0);
     void lateOccupancyGridUpdate(cudaStream_t stream = 0);
     void buildMipmaps(cudaStream_t stream, int level0_cells);
+    void buildMipmaps(uint8_t* d_grid, cudaStream_t stream, int level0_cells);
 
     NerfOptions m_opts;
     RenderingBuffers m_render_buffers;
@@ -340,7 +349,9 @@ private:
     MemoryMode m_memMode; 
 
     DeviceBuffer<uint8_t> d_occupancyGrid{0};
-    DeviceBuffer<float> d_masterOccupancyGrid{0}; 
+    DeviceBuffer<float> d_masterOccupancyGrid{0};
+
+    DeviceBuffer<float3> d_query_dir{0};
 
     bool m_traininit = false;
     bool m_renderinit = false;

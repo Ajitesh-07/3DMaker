@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <unordered_set>
 #include <algorithm>
 
 #include <NeRF/NerfTrainer.h>
@@ -13,6 +14,20 @@
 #include "../third_party/stb_image_write.h"
 
 namespace fs = std::filesystem;
+
+void printPrimeFactors(int n) {
+    std::unordered_set<int> factors;
+
+    while(n > 1) {
+        for (int i = 2; i <= n; i++) {
+            if(n % i == 0) {
+                factors.insert(i);
+                n /= i;
+                break;
+            }
+        }
+    }
+}
 
 static void saveImagePNG(const Image& img, const fs::path& path) {
     if (img.width <= 0 || img.height <= 0) return;

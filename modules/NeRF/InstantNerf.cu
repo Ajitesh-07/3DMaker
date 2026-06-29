@@ -7,8 +7,6 @@
 #include <fstream>
 #include <chrono>
 
-// Total cells of one cascade's pyramid (level-0 + every mip level) = the per-cascade
-// stride 'S' used by the bitgrid layout the marcher reads (cascade*S + level_offset + voxel).
 static inline int pyramidCellsPerCascade(uint3 res, int levels) {
     int s = 0;
     for (int l = 0; l < levels; ++l) {
@@ -187,6 +185,7 @@ void InstantNerf::initRenderBuffers()
     m_render_buffers.d_occupancy_samples = DeviceBuffer<float>(4 * gridCells); // one cascade chunk
     m_render_buffers.d_tmp_grid = DeviceBuffer<float>(masterGridCells);
     m_render_buffers.d_sum = DeviceBuffer<float>(1);
+    d_query_dir = DeviceBuffer<float3>(1);
     
     m_render_buffers.d_numActiveCells = DeviceBuffer<int>(1);
     m_render_buffers.d_activeCellIndices = DeviceBuffer<int>(masterGridCells);
@@ -864,6 +863,149 @@ void InstantNerf::renderImageHit(
 
 }
 
+__global__ void k_extractDensityLogit(const float* __restrict__ dens, float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = dens[(size_t)i * 16];
+}
+
+__device__ __forceinline__ int get_cascade(float3 pos, float3 aabb_min, float3 aabb_max, int num_cascades) {
+    float rx = fmaxf(pos.x / aabb_max.x, pos.x / aabb_min.x);
+    float ry = fmaxf(pos.y / aabb_max.y, pos.y / aabb_min.y);
+    float rz = fmaxf(pos.z / aabb_max.z, pos.z / aabb_min.z);
+    float max_scale = fmaxf(rx, fmaxf(ry, rz));
+    if (max_scale <= 1.0f) return 0;
+    int cascade = (int)ceilf(log2f(max_scale));
+    return max(0, min(cascade, num_cascades - 1));
+}
+
+__global__ void extractOccupancyGrid(
+    const float* __restrict__ masterGrid, 
+    const float* __restrict__ in_pos, 
+    uint32_t* __restrict__ out_data, 
+    uint3 grid_resolution,
+    float3 aabb_min,
+    float3 aabb_max,
+    float min_optical_threshold,
+    int num_cascades,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    bool isActive = false;
+
+    if (i < n) {
+        float3 current_pos = make_float3(in_pos[i*3 + 0], in_pos[i*3 + 1], in_pos[i*3 + 2]);
+        int cascade = get_cascade(current_pos, aabb_min, aabb_max, num_cascades);
+        float cascade_scale = exp2f((float)cascade);
+        
+        float3 aabb_extent = make_float3(aabb_max.x - aabb_min.x, aabb_max.y - aabb_min.y, aabb_max.z - aabb_min.z);
+        float3 c_aabb_min = make_float3(aabb_min.x * cascade_scale, aabb_min.y * cascade_scale, aabb_min.z * cascade_scale);
+        float3 c_aabb_extent = make_float3(aabb_extent.x * cascade_scale, aabb_extent.y * cascade_scale, aabb_extent.z * cascade_scale);
+        
+        float3 rel_pos = make_float3(
+            (current_pos.x - c_aabb_min.x) / c_aabb_extent.x,
+            (current_pos.y - c_aabb_min.y) / c_aabb_extent.y,
+            (current_pos.z - c_aabb_min.z) / c_aabb_extent.z
+        );
+        
+        int3 voxel_index = make_int3(
+            max(0, min((int)floorf(rel_pos.x * grid_resolution.x), (int)grid_resolution.x - 1)),
+            max(0, min((int)floorf(rel_pos.y * grid_resolution.y), (int)grid_resolution.y - 1)),
+            max(0, min((int)floorf(rel_pos.z * grid_resolution.z), (int)grid_resolution.z - 1))
+        );
+
+        uint32_t flatIdx = cascade * (grid_resolution.x * grid_resolution.y * grid_resolution.z)
+                     + voxel_index.z * (grid_resolution.x * grid_resolution.y)
+                     + voxel_index.y *  grid_resolution.x
+                     + voxel_index.x;
+        
+        float gridValue = masterGrid[flatIdx];
+        float baseVoxel = (aabb_max.x - aabb_min.x) / grid_resolution.x;
+        float thresh = (min_optical_threshold / baseVoxel) / cascade_scale;
+        
+        isActive = gridValue > thresh;
+    }
+
+    unsigned int warp_mask = __ballot_sync(0xFFFFFFFF, isActive);
+    
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0 && i < n) {
+        out_data[i / 32] = warp_mask;
+    }
+}
+
+void InstantNerf::queryOccupancyGrid(const float* d_pos, int n, uint32_t* d_data_out, float minOpticalThreshold, cudaStream_t stream) {
+
+    constexpr int BS = 256;
+    int gs = (n + BS - 1) / BS;
+    extractOccupancyGrid<<<gs, BS, 0, stream>>>(d_masterOccupancyGrid.data(), d_pos, d_data_out, m_opts.gridResolution, m_opts.aabbMin, m_opts.aabbMax, minOpticalThreshold, m_opts.numCascades, n);
+}
+
+void InstantNerf::queryDensityLogit(const float* d_pos, int n, float* d_logit_out, cudaStream_t stream) {
+    if (n <= 0) return;
+    if (n % 16 != 0) throw std::runtime_error("queryDensityLogit: n must be a multiple of 16 (caller pads)");
+    if (!m_traininit) { fprintf(stderr, "[InstantNerf] query before init()\n"); return; }
+    int cap = (m_memMode == INFERENCE) ? m_opts.renderBatchSize : m_opts.batchSize;
+    cap -= cap % 16;
+    constexpr int BS = 256;
+    for (int off = 0; off < n; off += cap) {
+        int cn = std::min(cap, n - off);
+        m_densityMLP->inference(d_pos + (size_t)off * 3, m_render_buffers.d_density_out.data(), cn, stream);
+        int gs = (cn + BS - 1) / BS;
+        k_extractDensityLogit<<<gs, BS, 0, stream>>>(m_render_buffers.d_density_out.data(), d_logit_out + off, cn);
+    }
+}
+
+void InstantNerf::queryRadiance(const float* d_pos, int n, float3 viewDir, float* d_rgb_out, cudaStream_t stream) {
+    if (n <= 0) return;
+    if (n % 16 != 0) throw std::runtime_error("queryRadiance: n must be a multiple of 16 (caller pads)");
+    if (!m_traininit) { fprintf(stderr, "[InstantNerf] query before init()\n"); return; }
+    int cap = (m_memMode == INFERENCE) ? m_opts.renderBatchSize : m_opts.batchSize;
+    cap -= cap % 16;
+    constexpr int BS = 256;
+
+    if (d_query_dir.size() < 1) d_query_dir = DeviceBuffer<float3>(1);
+    CUDA_CHECK(cudaMemcpy(d_query_dir.data(), &viewDir, sizeof(float3), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemsetAsync(m_render_buffers.d_ray_indices.data(), 0,
+                               (size_t)std::min(cap, n) * sizeof(uint32_t), stream));
+
+    for (int off = 0; off < n; off += cap) {
+        int cn = std::min(cap, n - off);
+        m_densityMLP->inference(d_pos + (size_t)off * 3, m_render_buffers.d_density_out.data(), cn, stream);
+        int gs = (cn + BS - 1) / BS;
+        compute_SH_gather<<<gs, BS, 0, stream>>>(
+            d_query_dir.data(), m_render_buffers.d_ray_indices.data(), 0, cn, m_opts.densityBias,
+            m_render_buffers.d_density_out.data(), m_render_buffers.d_color_input.data(),
+            m_render_buffers.d_density_sigma.data());
+        m_colorMLP->inference(m_render_buffers.d_color_input.data(), d_rgb_out + (size_t)off * 3, cn, stream);
+    }
+}
+
+void InstantNerf::buildOccupancyBitgrid(uint8_t* d_out, float minDensityThreshold, cudaStream_t stream) {
+    if (!m_traininit) { fprintf(stderr, "[InstantNerf] buildOccupancyBitgrid before init()\n"); return; }
+
+    const int G = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
+    const int N = m_opts.numCascades * G;
+    const int S = pyramidCellsPerCascade(m_opts.gridResolution, m_opts.levelsMipmap);
+    constexpr int BS = 256;
+    const int gs = (N + BS - 1) / BS;
+
+    const float kNoFloor = 1e30f;
+    cudaMemcpy(m_render_buffers.d_sum.data(), &kNoFloor, sizeof(float), cudaMemcpyHostToDevice);
+
+    updateOccupancyGrid<<<gs, BS, 0, stream>>>(
+        reinterpret_cast<uint32_t*>(d_out),
+        d_masterOccupancyGrid.data(),
+        m_render_buffers.d_sum.data(),
+        N, G, S,
+        minDensityThreshold,
+        (m_opts.aabbMax.x - m_opts.aabbMin.x) / (float)m_opts.gridResolution.x
+    );
+
+    buildMipmaps(d_out, stream, N);
+}
+
 void InstantNerf::lateOccupancyGridUpdate(cudaStream_t stream) {
     int G = m_opts.gridResolution.x * m_opts.gridResolution.y * m_opts.gridResolution.z;
     int N = m_opts.numCascades * G;
@@ -972,9 +1114,6 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
 
     cudaMemsetAsync(m_render_buffers.d_tmp_grid.data(), 0, N * sizeof(float), stream);
 
-    // Sample + evaluate density one cascade at a time so the transient buffers stay sized for a
-    // single cascade (G cells). Each cascade deterministically covers its own G level-0 cells
-    // (dense range [c*G, c*G + G)); cell ranges are disjoint so the shared tmp grid is safe.
     int cgs = (G + BS - 1) / BS;
     int paddedBatchSize = (G + 15) & ~15;
     for (int c = 0; c < m_opts.numCascades; ++c) {
@@ -1032,16 +1171,15 @@ void InstantNerf::earlyOccupancyGridUpdate(cudaStream_t stream) {
 }
 
 void InstantNerf::buildMipmaps(cudaStream_t stream, int level0_cells) {
-    // Each cascade owns a contiguous per-cascade pyramid region [c*S, c*S + S) in the bitgrid,
-    // where S = level-0 + all mip levels of one cascade. updateOccupancyGrid has already written
-    // every cascade's level-0 bits; here we build the higher mip levels independently per cascade.
-    // No pre-zeroing is needed: every mip word is fully overwritten by bitfield_max_pool, since
-    // each level's cell count is a multiple of 32 for the supported resolutions.
+    buildMipmaps(d_occupancyGrid.data(), stream, level0_cells);
+}
+
+void InstantNerf::buildMipmaps(uint8_t* d_grid, cudaStream_t stream, int level0_cells) {
     int S = pyramidCellsPerCascade(m_opts.gridResolution, m_opts.levelsMipmap);  // cells per cascade pyramid
     size_t cascade_stride_bytes = (size_t)S / 8;  // S is a multiple of 32 -> exact
 
     for (int c = 0; c < m_opts.numCascades; ++c) {
-        uint8_t* current_level_ptr = d_occupancyGrid.data() + c * cascade_stride_bytes;
+        uint8_t* current_level_ptr = d_grid + c * cascade_stride_bytes;
         uint3 current_res = m_opts.gridResolution;
 
         for (int l = 0; l < m_opts.levelsMipmap - 1; ++l) {
@@ -1193,8 +1331,6 @@ void InstantNerf::load(const std::string& filename) {
     in.read(reinterpret_cast<char*>(h_color_b.data()), c_total_biases * sizeof(float));
     m_colorMLP->loadWeights(h_color_w.data(), h_color_b.data());
 
-    // Cascade-aware sizing: must match init()/save() exactly, or the outer cascades'
-    // occupancy grids are read short and left empty (blank background on reload).
     int occupancyGridCells = 0;
     for (int j = 0; j < m_opts.numCascades; j++) {
         uint3 res = make_uint3(m_opts.gridResolution.x, m_opts.gridResolution.y, m_opts.gridResolution.z);
