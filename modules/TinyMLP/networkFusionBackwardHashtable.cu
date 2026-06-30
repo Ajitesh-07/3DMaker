@@ -69,7 +69,7 @@ __device__ __forceinline__ uint32_t dense_index(int cx, int cy, int cz, int N_l)
 
 
 template <int TILE_COUNT_Y, int TILE_COUNT_X, int WARP_FACTOR, int TILE_FACTOR, int FEATURES_LEVEL>
-__global__ void networkFusionMMA_Backward(
+__global__ void __launch_bounds__(256, 3) networkFusionMMA_Backward(
     half* d_dx_out,
     const half* __restrict__ d_loss_output,
     half** d_weights_array,

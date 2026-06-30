@@ -47,7 +47,7 @@ __device__ __forceinline__ void redAddF32(float* __restrict__ addr, float val) {
 }
 
 template <int TILE_COUNT_Y, int TILE_COUNT_X, int WARP_FACTOR, int TILE_FACTOR, int CALC_DX = 0>
-__global__ void networkFusionMMA_Backward(
+__global__ void __launch_bounds__(256, 3) networkFusionMMA_Backward(
     half* d_dx_out,
     const half* __restrict__ d_loss_output,
     half** d_weights_array,
