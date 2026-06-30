@@ -120,7 +120,9 @@ void runVerification() {
     int batchSize = 1 << 13;
     int inputDim  = 64;
     int hiddenDim = 64;
-    int outputDim = 3;
+    int outputDim = 8;   // must be a multiple of 8: the loss tensor is loaded with
+                         // 128-bit cp.async, so the row stride (outputDim) must be
+                         // 16-byte aligned. Real usage pads outputDim (e.g. 3 -> 8).
     int numLayers = 4;
 
     MLPOption opt = {inputDim, hiddenDim, outputDim, numLayers, ACT_RELU};
@@ -191,8 +193,10 @@ void runVerification() {
     CUDA_CHECK(cudaMemcpy(d_gw_arr,  h_d_gw_ptrs.data(),  numLayers * sizeof(float*), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_gb_arr,  h_d_gb_ptrs.data(),  numLayers * sizeof(float*), cudaMemcpyHostToDevice));
 
+    // The launcher enables the CALC_DX path whenever d_dx_out != nullptr, and the kernel
+    // writes the full batch*inputDim dX tensor here — so it must be sized accordingly.
     half* d_dx_out_dummy;
-    CUDA_CHECK(cudaMalloc(&d_dx_out_dummy, sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_dx_out_dummy, batchSize * inputDim * sizeof(half)));
     cudaStream_t stream = 0;
 
     // --- GPU run ---
@@ -315,7 +319,8 @@ void runPerformanceSweep() {
                 half* d_loss = nullptr;
                 half* d_dx   = nullptr;
                 if (cudaMalloc(&d_loss, batchSize * dim * sizeof(half)) != cudaSuccess) oom = true;
-                if (cudaMalloc(&d_dx,   sizeof(half)) != cudaSuccess) oom = true;
+                // CALC_DX writes the full batch*inputDim dX here (d_dx != nullptr enables it).
+                if (cudaMalloc(&d_dx,   batchSize * dim * sizeof(half)) != cudaSuccess) oom = true;
 
                 std::vector<half*>  h_act(numLayers, nullptr);
                 std::vector<half*>  h_wt(numLayers, nullptr);
@@ -344,6 +349,16 @@ void runPerformanceSweep() {
                     cudaMemcpy(d_wt_arr,  h_wt.data(),  numLayers * sizeof(half*),  cudaMemcpyHostToDevice);
                     cudaMemcpy(d_gw_arr,  h_gw.data(),  numLayers * sizeof(float*), cudaMemcpyHostToDevice);
                     cudaMemcpy(d_gb_arr,  h_gb.data(),  numLayers * sizeof(float*), cudaMemcpyHostToDevice);
+
+                    // Fast non-zero device-side fill. (Host RNG over batch*dim halves stalls the
+                    // CPU for seconds per config -> GPU idles & downclocks -> corrupts timing.)
+                    // Byte 0x3C -> fp16 0x3C3C ~= 1.06. For the plain backward the dW/db atomic
+                    // targets are geometry-determined, so timing should match the zero/uninit case.
+                    cudaMemset(d_loss, 0x3C, batchSize * dim * sizeof(half));
+                    for (int l = 0; l < numLayers; ++l) {
+                        cudaMemset(h_act[l], 0x3C, batchSize * dim * sizeof(half));
+                        cudaMemset(h_wt[l],  0x3C, dim * dim * sizeof(half));
+                    }
                 }
 
                 float avgGpuMs = 0.0f;

@@ -335,10 +335,19 @@ float TinyMLPHashGrid::calculate_loss_and_grad(const half* d_unpadded_targets, i
 
 void TinyMLPHashGrid::backward(int batchSize, cudaStream_t stream){
     if (!m_isTraining) throw std::runtime_error("backward called while in inference mode!");
-    launchNetworkFusionHashTableBackwardKernel(
-        &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
-        d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
-        d_hashtable_grads, d_dx_out, batchSize, stream);
+    if (m_useSplitScatter) {
+        // Per-level scatter: MLP backward writes dL/d(encoding) to d_dx_out, then a
+        // dedicated per-level kernel scatters into d_hashtable_grads (faster, L2-resident).
+        launchNetworkFusionScatterBackwardKernel(
+            &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
+            d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
+            d_hashtable_grads, d_dx_out, batchSize, stream);
+    } else {
+        launchNetworkFusionHashTableBackwardKernel(
+            &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
+            d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
+            d_hashtable_grads, d_dx_out, batchSize, stream);
+    }
 }
 
 void TinyMLPHashGrid::backward(const half* custom_loss_grad, int batchSize, cudaStream_t stream){
@@ -350,10 +359,19 @@ void TinyMLPHashGrid::backward(const half* custom_loss_grad, int batchSize, cuda
     } else {
         CUDA_CHECK(cudaMemcpyAsync(d_dLoss_internal, custom_loss_grad, batchSize * hw_opt.outputDim * sizeof(half), cudaMemcpyDeviceToDevice, stream));
     }
-    launchNetworkFusionHashTableBackwardKernel(
-        &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
-        d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
-        d_hashtable_grads, d_dx_out, batchSize, stream);
+    if (m_useSplitScatter) {
+        // Per-level scatter: MLP backward writes dL/d(encoding) to d_dx_out, then a
+        // dedicated per-level kernel scatters into d_hashtable_grads (faster, L2-resident).
+        launchNetworkFusionScatterBackwardKernel(
+            &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
+            d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
+            d_hashtable_grads, d_dx_out, batchSize, stream);
+    } else {
+        launchNetworkFusionHashTableBackwardKernel(
+            &hw_opt, d_dLoss_internal, d_fwd_weights, d_master_biases,
+            d_activations, const_cast<float*>(d_current_inputs_backward), d_w_grad, d_b_grad,
+            d_hashtable_grads, d_dx_out, batchSize, stream);
+    }
 }
 
 void TinyMLPHashGrid::reset_step(){ current_step=0; }

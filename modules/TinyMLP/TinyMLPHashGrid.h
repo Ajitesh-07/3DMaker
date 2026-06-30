@@ -57,6 +57,11 @@ public:
     void backward(int batchSize, cudaStream_t stream = 0);
     void backward(const half* custom_loss_grad, int batchSize, cudaStream_t stream = 0);
 
+    // Hash-grad scatter strategy: true = separate per-level scatter (faster, default),
+    // false = fused inline scatter. Flag-gated for A/B benchmarking.
+    void setSplitScatter(bool enabled) { m_useSplitScatter = enabled; }
+    bool getSplitScatter() const { return m_useSplitScatter; }
+
     // 5. Optimizer Step: Fused Adam step for MLP weights, biases, AND hash grid
     void step(float lr = 3e-4f, float beta1 = 0.9f, float beta2 = 0.999f,
               float epsilon = 1e-8f, float loss_scale = 65536.0f, cudaStream_t stream = 0);
@@ -87,6 +92,7 @@ private:
     int m_inferBatchSize;
     int current_step;
     bool m_isTraining;
+    bool m_useSplitScatter = true;   // per-level hash-grad scatter (faster); false = fused inline
 
     // ==========================================
     // DATA BUFFERS
@@ -193,10 +199,27 @@ extern "C" void launchNetworkFusionHashTableBackwardKernel(
     half**       d_weights_array,
     float**      d_biases_array,
     half**       d_activations,
-    float*       d_inputs,             
+    float*       d_inputs,
     float**      d_grad_weights,
     float**      d_grad_biases,
-    float*       d_hashtable_grads,    
+    float*       d_hashtable_grads,
+    half*        d_dx_out,
+    int          batchSize,
+    cudaStream_t stream
+);
+
+// Split path: MLP backward writes dL/d(encoding) to d_dx_out, then a separate
+// per-level hashTableScatter_Backward kernel scatters into d_hashtable_grads.
+extern "C" void launchNetworkFusionScatterBackwardKernel(
+    MLPGridOptions*  opt,
+    half*        d_loss_output,
+    half**       d_weights_array,
+    float**      d_biases_array,
+    half**       d_activations,
+    float*       d_inputs,
+    float**      d_grad_weights,
+    float**      d_grad_biases,
+    float*       d_hashtable_grads,
     half*        d_dx_out,
     int          batchSize,
     cudaStream_t stream

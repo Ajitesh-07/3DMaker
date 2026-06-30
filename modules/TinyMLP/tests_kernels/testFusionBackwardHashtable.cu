@@ -428,6 +428,55 @@ void runVerification() {
     }
     std::cout << "====================================\n";
 
+    // ============================================================================
+    // SPLIT (per-level) PATH: MLP backward writes dX -> separate per-level scatter.
+    // Verify against the SAME CPU reference, and directly against the fused path.
+    // ============================================================================
+    std::cout << "\n##################  SPLIT (per-level) PATH  ##################\n";
+    std::vector<float> h_fused_hash_grads = h_gpu_hash_grads;   // save fused-path grads (GPU)
+
+    for (int l = 0; l < numLayers; ++l) {
+        int in_d  = (l == 0) ? inputDim : hiddenDim;
+        int out_d = (l == numLayers - 1) ? outputDim : hiddenDim;
+        CUDA_CHECK(cudaMemset(h_d_gw_ptrs[l], 0, out_d * in_d * sizeof(float)));
+        CUDA_CHECK(cudaMemset(h_d_gb_ptrs[l], 0, out_d * sizeof(float)));
+    }
+    CUDA_CHECK(cudaMemset(d_hashtable_grads, 0, h_gpu_hash_grads.size() * sizeof(float)));
+
+    launchNetworkFusionScatterBackwardKernel(
+        &opt, d_loss_output, d_wt_arr, nullptr,
+        d_act_arr, d_inputs, d_gw_arr, d_gb_arr, d_hashtable_grads,
+        d_dx_out, batchSize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    CUDA_CHECK(cudaMemcpy(h_gpu_hash_grads.data(), d_hashtable_grads,
+                          h_gpu_hash_grads.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    {
+        float mse_cpu=0, mx_cpu=0, mx_fused=0;   // split vs CPU ref, and split vs fused path
+        for (size_t i = 0; i < h_gpu_hash_grads.size(); ++i) {
+            float dc = std::abs(h_gpu_hash_grads[i] - h_expected_hash_grads[i]);
+            float df = std::abs(h_gpu_hash_grads[i] - h_fused_hash_grads[i]);
+            mse_cpu += dc*dc; if (dc > mx_cpu) mx_cpu = dc; if (df > mx_fused) mx_fused = df;
+        }
+        mse_cpu /= (float)h_gpu_hash_grads.size();
+        std::cout << "[SPLIT] HASH GRID vs CPU   : MaxDiff=" << mx_cpu << " MSE=" << mse_cpu
+                  << " -> " << ((mx_cpu < 0.5f) ? "[SUCCESS]" : "[FAILED]") << "\n";
+        std::cout << "[SPLIT] HASH GRID vs FUSED : MaxDiff=" << mx_fused
+                  << " -> " << ((mx_fused < 1e-2f) ? "[MATCHES FUSED]" : "[DIFFERS]") << "\n";
+    }
+    for (int l = numLayers - 1; l >= 0; --l) {
+        int in_d  = (l == 0) ? inputDim : hiddenDim;
+        int out_d = (l == numLayers - 1) ? outputDim : hiddenDim;
+        CUDA_CHECK(cudaMemcpy(h_grad_weights[l].data(), h_d_gw_ptrs[l], out_d*in_d*sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_grad_biases[l].data(),  h_d_gb_ptrs[l], out_d*sizeof(float),      cudaMemcpyDeviceToHost));
+        float xw=0, xb=0;
+        for (size_t i=0;i<h_grad_weights[l].size();++i){ float d=std::abs(h_grad_weights[l][i]-h_expected_dw[l][i]); if(d>xw)xw=d; }
+        for (size_t i=0;i<h_grad_biases[l].size();++i){  float d=std::abs(h_grad_biases[l][i]-h_expected_db[l][i]); if(d>xb)xb=d; }
+        std::cout << "[SPLIT] LAYER " << l << "  dW MaxDiff=" << xw << (xw<0.5f?" [OK]":" [FAIL]")
+                  << "   db MaxDiff=" << xb << (xb<0.5f?" [OK]":" [FAIL]") << "\n";
+    }
+    std::cout << "##############################################################\n";
+
     cudaFree(d_loss_output); cudaFree(d_dx_out); cudaFree(d_inputs); cudaFree(d_hashtable_grads);
     cudaFree(d_act_arr); cudaFree(d_wt_arr);
     cudaFree(d_gw_arr); cudaFree(d_gb_arr);
@@ -438,6 +487,29 @@ void runVerification() {
 }
 
 // ---------------------------------------------------------
+// Device-side PCG RNG (host RNG over millions of values stalls the CPU long
+// enough to downclock the GPU and corrupt timing; fill on-device instead).
+// ---------------------------------------------------------
+__device__ __forceinline__ uint32_t pcg_hash(uint32_t input) {
+    uint32_t state = input * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+__device__ __forceinline__ float pcg_uniform(uint32_t idx, uint32_t seed) {
+    uint32_t r = pcg_hash(seed ^ pcg_hash(idx));
+    uint32_t res = (r >> 9) | 0x3f800000u;   // mantissa bits -> [1,2)
+    return __int_as_float(res) - 1.0f;        // -> [0,1)
+}
+__global__ void pcg_fill_f_kernel(float* d, int n, uint32_t seed) {     // [0,1)
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if (i < n) d[i] = pcg_uniform(i, seed);
+}
+__global__ void pcg_fill_h_kernel(half* d, int n, uint32_t seed) {       // [-1,1)
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if (i < n) d[i] = __float2half(pcg_uniform(i, seed)*2.0f - 1.0f);
+}
+static void pcg_fill_f(float* d, int n, uint32_t seed, cudaStream_t s){ pcg_fill_f_kernel<<<(n+255)/256,256,0,s>>>(d,n,seed); }
+static void pcg_fill_h(half*  d, int n, uint32_t seed, cudaStream_t s){ pcg_fill_h_kernel<<<(n+255)/256,256,0,s>>>(d,n,seed); }
+
+// ---------------------------------------------------------
 // Performance Sweep
 // ---------------------------------------------------------
 void runPerformanceSweep() {
@@ -445,15 +517,16 @@ void runPerformanceSweep() {
     std::vector<int> dims       = {32, 64}; 
     std::vector<int> layerCounts= {2, 4, 6, 8};
 
-    std::cout << "\nStarting Performance Sweep (Fused Pipeline)...\n\n";
+    std::cout << "\nStarting Performance Sweep (Fused inline scatter  vs  Split per-level scatter)...\n\n";
     std::cout << std::left
               << std::setw(12) << "BatchSize"
-              << std::setw(8)  << "Dim"
-              << std::setw(10) << "Layers"
-              << std::setw(18) << "Fused Time (ms)"
-              << std::setw(10) << "TFLOPS"
+              << std::setw(7)  << "Dim"
+              << std::setw(8)  << "Layers"
+              << std::setw(14) << "Fused(ms)"
+              << std::setw(14) << "Split(ms)"
+              << std::setw(13) << "Fused/Split"
               << "Status" << "\n";
-    std::cout << std::string(67, '-') << "\n";
+    std::cout << std::string(74, '-') << "\n";
 
     cudaStream_t stream = 0;
 
@@ -501,9 +574,20 @@ void runPerformanceSweep() {
                     cudaMemcpy(d_wt_arr,  h_wt.data(),  numLayers * sizeof(half*),  cudaMemcpyHostToDevice);
                     cudaMemcpy(d_gw_arr,  h_gw.data(),  numLayers * sizeof(float*), cudaMemcpyHostToDevice);
                     cudaMemcpy(d_gb_arr,  h_gb.data(),  numLayers * sizeof(float*), cudaMemcpyHostToDevice);
+
+                    // Device-side PCG init. Positions in [0,1)^3 (diverse buckets, NOT the
+                    // degenerate all-zero -> one-bucket atomic storm); loss/act/weights in [-1,1).
+                    pcg_fill_f(d_inputs, batchSize * 4,   0x1234u ^ (uint32_t)batchSize, stream);
+                    pcg_fill_h(d_loss,   batchSize * dim, 0x5678u, stream);
+                    for (int l = 0; l < numLayers; ++l) {
+                        pcg_fill_h(h_act[l], batchSize * dim, 0xA000u + l, stream);
+                        pcg_fill_h(h_wt[l],  dim * dim,       0xB000u + l, stream);
+                    }
+                    cudaStreamSynchronize(stream);
                 }
 
                 float avgTotalMs = 0.0f;
+                float avgSplitMs = 0.0f;
 
                 if (!oom) {
                     // Warmup
@@ -539,24 +623,38 @@ void runPerformanceSweep() {
                     cudaEventDestroy(e_end);
 
                     avgTotalMs = totalFusedMs / RUNS;
+
+                    // ---- time the SPLIT (per-level) path the same way ----
+                    launchNetworkFusionScatterBackwardKernel(&opt, d_loss, d_wt_arr, nullptr,
+                        d_act_arr, d_inputs, d_gw_arr, d_gb_arr, d_hash_grads, d_dx, batchSize, stream);
+                    cudaStreamSynchronize(stream);
+                    cudaEvent_t s0, s1; cudaEventCreate(&s0); cudaEventCreate(&s1);
+                    float totalSplitMs = 0.0f;
+                    for (int r = 0; r < RUNS; ++r) {
+                        cudaEventRecord(s0, stream);
+                        launchNetworkFusionScatterBackwardKernel(&opt, d_loss, d_wt_arr, nullptr,
+                            d_act_arr, d_inputs, d_gw_arr, d_gb_arr, d_hash_grads, d_dx, batchSize, stream);
+                        cudaEventRecord(s1, stream); cudaEventSynchronize(s1);
+                        float ms = 0; cudaEventElapsedTime(&ms, s0, s1); totalSplitMs += ms;
+                    }
+                    cudaEventDestroy(s0); cudaEventDestroy(s1);
+                    avgSplitMs = totalSplitMs / RUNS;
                 } else {
                     cudaGetLastError(); // Clear OOM error context
                 }
 
-                double flops = computeBackwardFlops(batchSize, dim, dim, dim, numLayers);
-                double tflops = (!oom && avgTotalMs > 0.f) ? (flops / (avgTotalMs * 1e-3)) / 1e12 : 0.0;
-
                 std::cout << std::left
                           << std::setw(12) << batchSize
-                          << std::setw(8)  << dim
-                          << std::setw(10) << numLayers;
-                          
+                          << std::setw(7)  << dim
+                          << std::setw(8)  << numLayers;
+
                 if (oom) {
-                    std::cout << std::setw(18) << "N/A" 
-                              << std::setw(10) << "N/A" << "OOM\n";
+                    std::cout << std::setw(14) << "N/A" << std::setw(14) << "N/A"
+                              << std::setw(13) << "N/A" << "OOM\n";
                 } else {
-                    std::cout << std::setw(18) << std::fixed << std::setprecision(3) << avgTotalMs
-                              << std::setw(10) << std::fixed << std::setprecision(2) << tflops 
+                    std::cout << std::setw(14) << std::fixed << std::setprecision(3) << avgTotalMs
+                              << std::setw(14) << std::fixed << std::setprecision(3) << avgSplitMs
+                              << std::setw(13) << std::fixed << std::setprecision(3) << (avgSplitMs>0?avgTotalMs/avgSplitMs:0.0)
                               << "OK\n";
                 }
 

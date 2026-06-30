@@ -139,4 +139,50 @@ if(TINYMLP_BUILD_TESTS)
     )
     target_include_directories(demo PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(demo PRIVATE TinyMLP cublas)
+
+    # ── JIT (NVRTC) inference experiment ─────────────────────────────────
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test_jit_inference tests_kernels/testJitInference.cu)
+    set_target_properties(test_jit_inference PROPERTIES CUDA_ARCHITECTURES "89")
+    target_compile_options(test_jit_inference PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
+    )
+    # NVRTC needs the toolkit include dir passed as -I at runtime (it doesn't bundle
+    # cuda_fp16.h / mma.h). Hand the main include dir to the test as a macro.
+    list(GET CUDAToolkit_INCLUDE_DIRS 0 CUDA_MAIN_INCLUDE)
+    target_compile_definitions(test_jit_inference PRIVATE CUDA_MAIN_INCLUDE="${CUDA_MAIN_INCLUDE}")
+    # NVRTC for runtime compilation + CUDA driver API for cuModule*/cuLaunchKernel
+    target_link_libraries(test_jit_inference PRIVATE TinyMLP CUDA::nvrtc CUDA::cuda_driver)
+
+    # ── Hash-grid scatter A/B prototype (per-level vs all-levels) ─────────
+    add_executable(test_scatter_ab tests_kernels/testScatterAB.cu)
+    set_target_properties(test_scatter_ab PROPERTIES CUDA_ARCHITECTURES "89")
+    target_compile_options(test_scatter_ab PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 --use_fast_math>
+    )
+
+    # ── Dim-32 forward specialization benchmark (WMMA baseline + roofline) ─
+    add_executable(test_forward_dim32 tests_kernels/testForwardDim32.cu)
+    set_target_properties(test_forward_dim32 PROPERTIES CUDA_ARCHITECTURES "89")
+    target_compile_options(test_forward_dim32 PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 --use_fast_math>
+    )
+    target_link_libraries(test_forward_dim32 PRIVATE TinyMLP)
+
+    add_executable(test_backward_dim32
+        tests_kernels/testBackwardDim32.cu
+        tests_kernels/networkFusionBackward_lb4.cu)   # launch_bounds(256,4) copy for A/B
+    set_target_properties(test_backward_dim32 PROPERTIES CUDA_ARCHITECTURES "89")
+    target_compile_options(test_backward_dim32 PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 --use_fast_math --restrict>
+    )
+    target_link_libraries(test_backward_dim32 PRIVATE TinyMLP)
+
+    # ── TinyMLP vs PyTorch comparison (emits CSV) ────────────────────────
+    add_executable(bench_compare tests_kernels/benchCompare.cu)
+    set_target_properties(bench_compare PROPERTIES CUDA_ARCHITECTURES "89")
+    target_compile_options(bench_compare PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 --use_fast_math>
+    )
+    target_link_libraries(bench_compare PRIVATE TinyMLP)
 endif()
