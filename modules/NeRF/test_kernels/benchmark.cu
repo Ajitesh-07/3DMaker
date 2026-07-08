@@ -44,16 +44,22 @@ int main() {
 
     float3* d_rays_o;
     float3* d_rays_d;
+    float* d_rays_depth;
+    float* d_rays_sigma;
     float* d_rgb_true;
 
     CUDA_CHECK(cudaMalloc(&d_rays_o, maxRays * sizeof(float3)));
     CUDA_CHECK(cudaMalloc(&d_rays_d, maxRays * sizeof(float3)));
+    CUDA_CHECK(cudaMalloc(&d_rays_depth, maxRays * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rays_sigma, maxRays * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_rgb_true, maxRays * 3 * sizeof(float)));
 
     // Initialize with dummy data that guarantees AABB intersection for realistic benchmarking
     int blocks = (maxRays + 255) / 256;
     initRaysKernel<<<blocks, 256>>>(d_rays_o, d_rays_d, maxRays);
     CUDA_CHECK(cudaMemset(d_rgb_true, 0, maxRays * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_rays_depth, -1, maxRays * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_rays_sigma, -1, maxRays * sizeof(float)));
 
     NerfOptions opts;
     opts.rayChunkSize = 256 * 1024; // Configurable chunk size
@@ -96,7 +102,7 @@ int main() {
     try {
         int chunks = (8192 + opts.rayChunkSize - 1) / opts.rayChunkSize;
         std::vector<uint32_t> dummyHitCounts(chunks, 0);
-        nerf.trainWithRaysHit(d_rays_o, d_rays_d, nullptr, nullptr, d_rgb_true, 8192, dummySteps, nullptr, nullptr, 0);
+        nerf.trainWithRaysHit(d_rays_o, d_rays_d, d_rays_depth, d_rays_sigma, d_rgb_true, 8192, dummySteps, nullptr, nullptr, 0);
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA error after warmup trainWithRays: %s\n", cudaGetErrorString(err));
@@ -121,7 +127,7 @@ int main() {
             
             int chunks = (numRays + opts.rayChunkSize - 1) / opts.rayChunkSize;
             std::vector<uint32_t> dummyHitCounts(chunks, 0);
-            nerf.trainWithRaysHit(d_rays_o, d_rays_d, nullptr, nullptr, d_rgb_true, numRays, trainSteps, nullptr, nullptr, 0);
+            nerf.trainWithRaysHit(d_rays_o, d_rays_d, d_rays_depth, d_rays_sigma, d_rgb_true, numRays, trainSteps, nullptr, nullptr, 0);
             
             CUDA_CHECK(cudaEventRecord(stop));
             CUDA_CHECK(cudaEventSynchronize(stop));
@@ -150,6 +156,8 @@ int main() {
     CUDA_CHECK(cudaFree(d_rays_o));
     CUDA_CHECK(cudaFree(d_rays_d));
     CUDA_CHECK(cudaFree(d_rgb_true));
+    CUDA_CHECK(cudaFree(d_rays_depth));
+    CUDA_CHECK(cudaFree(d_rays_sigma));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 

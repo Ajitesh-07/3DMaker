@@ -6,6 +6,40 @@ end-goal of clean mesh export to FBX.
 
 ---
 
+## ⚡ Status Update (July 2026)
+
+This document was written when the engine was bounded-box/object-centric. Much of it has
+since been **implemented** — kept below as the historical review/plan. What changed:
+
+**§3 Real-World Unbounded Scenes — DONE, quality on real captures is now very good.**
+- **Scene contraction** (mip-NeRF-360 ±2 warp) applied before the hash lookup
+  (`otherKernels.cu: contract_pos`) — went straight to the "quality pass" option rather
+  than cascades-only.
+- **Metric occupancy cascades** with count auto-estimated from the dataset (`--cascades 0`);
+  outer cascades march at coarser voxel steps, bounding background cost.
+- **Distortion loss** (`--lambda`) + **K sub-voxel multisampling** (`--K`); note the
+  coupling: effective floater suppression scales with **λ·K** (λ should scale ~1/K).
+- **DS-NeRF-style depth supervision** on dense rays from the COLMAP sparse cloud
+  (`scripts/colmap_depth.py`, `lambda-depth` in the dev harness; CLI exposure pending).
+- Stale claims fixed since the review: AABB is **parameterized** (no hardcoded ±1.5 box);
+  `MAX_HITS` is **1024** (was 128); backward kernels got `__launch_bounds__`
+  (~1.36× end-to-end, §2.3 item 4); `min_lr` decay restored.
+
+**New active track (not in the original plan): `BakedNerf` — real-time rendering.**
+The trained NeRF is distilled into a two-tier sparse voxel structure (128³ blocks × 4³
+sub-voxels, 13 B/voxel: fp16 σ + uint8 diffuse + 4 fp16 view-features) with MERF/SNeRG-style
+deferred shading. Structure build + diffuse fill + baked renderer are working —
+**200–800× faster than raymarching the MLPs** (~3–20 ms vs ~1.4 s per 800² frame), fits
+4 GB-VRAM laptops. In progress: joint appearance distillation
+(`docs/baking_phase2_joint_training.md`) to close the quality gap to the teacher (target
+≥30 dB student→teacher). This supersedes §4's framing: the bake answers the real-time
+question *without* a 3DGS rewrite, and its σ field feeds the §5 mesh path.
+
+**Revised sequencing:** (A) unbounded ✅ → **BakedNerf appearance fit (current)** →
+(B) SDF retarget → (C) mesh/FBX export.
+
+---
+
 ## Table of Contents
 
 1. [The NaN Training Bug (fixed)](#1-the-nan-training-bug-fixed)
@@ -163,6 +197,10 @@ Left on the table (by likely impact):
 ---
 
 ## 3. Real-World Unbounded Scenes
+
+> **✅ IMPLEMENTED (2026)** — see the Status Update at the top. Contraction + metric
+> cascades + distortion + depth priors landed; real-capture quality is now very good.
+> Kept as the original analysis/plan.
 
 ### 3.1 The core gap
 

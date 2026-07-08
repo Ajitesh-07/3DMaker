@@ -15,10 +15,12 @@ endif()
 add_library(TinyMLP STATIC
     TinyMLP.cu
     TinyMLPHashGrid.cu
+    EmbeddingTable.cu
     mlpKernel.cu
     networkFusion.cu
     networkFusionBackward.cu
     optimizerKernel.cu
+    embeddingOptimizerKernel.cu
     networkFusionHashtable.cu
     networkFusionBackwardHashtable.cu
 )
@@ -32,6 +34,8 @@ add_library(TinyMLP STATIC
 set_target_properties(TinyMLP PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION OFF
+    CXX_STANDARD 17
+    CUDA_STANDARD 17            # CUB/CCCL in CUDA 13 requires C++17
 )
 
 # ── Compile options ───────────────────────────────────────────────────────
@@ -41,6 +45,7 @@ target_compile_options(TinyMLP PRIVATE
         --use_fast_math          # fused mul-add, approx intrinsics, FTZ
         --extra-device-vectorization
         --restrict               # assume __restrict__ on all pointers
+        -Xcompiler /Zc:preprocessor   # conforming MSVC preprocessor, required by CCCL (CUB)
     >
     # Debug: keep line info for Nsight profiling
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:
@@ -177,6 +182,14 @@ if(TINYMLP_BUILD_TESTS)
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 --use_fast_math --restrict>
     )
     target_link_libraries(test_backward_dim32 PRIVATE TinyMLP)
+
+    # ── EmbeddingTable: step-exactness / imbalanced-fit convergence / bench ─
+    add_executable(test_embedding tests_kernels/testEmbeddingTable.cu)
+    set_target_properties(test_embedding PROPERTIES CUDA_ARCHITECTURES "89")
+    target_compile_options(test_embedding PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>
+    )
+    target_link_libraries(test_embedding PRIVATE TinyMLP)
 
     # ── TinyMLP vs PyTorch comparison (emits CSV) ────────────────────────
     add_executable(bench_compare tests_kernels/benchCompare.cu)

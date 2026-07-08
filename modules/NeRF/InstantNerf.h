@@ -324,7 +324,12 @@ public:
 
     void queryOccupancyGrid(const float* d_pos, int n, uint32_t* d_data_out, float minOpticalThreshold, cudaStream_t stream = 0);
     void queryDensityLogit(const float* d_pos, int n, float* d_logit_out, cudaStream_t stream = 0);
+    void queryFullDensity(const float* d_pos, int n, float* d_logit_out, cudaStream_t stream = 0);
     void queryRadiance(const float* d_pos, int n, float3 viewDir, float* d_rgb_out, cudaStream_t stream = 0);
+    // per-sample view directions: sample i uses d_rayDirs[d_rayIndices[i]] (marcher layout)
+    void queryRadiance(const float* d_pos, int n, const float3* d_rayDirs,
+                       const uint32_t* d_rayIndices, float* d_rgb_out, cudaStream_t stream = 0);
+    void queryColor(float* d_density_out, int n, float3 viewDir, float* d_rgb_out, cudaStream_t stream=0);
     void buildOccupancyBitgrid(uint8_t* d_out, float minDensityThreshold, cudaStream_t stream = 0);
     const NerfOptions& options() const { return m_opts; }
     const uint8_t* occupancyGrid() { return d_occupancyGrid.data(); }

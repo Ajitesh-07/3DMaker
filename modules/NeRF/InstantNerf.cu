@@ -319,6 +319,10 @@ void InstantNerf::init(const NerfOptions& opts, MemoryMode memMode) {
 
     int densityInferBatch = std::max((int)(opts.gridResolution.x * opts.gridResolution.y * opts.gridResolution.z), opts.renderBatchSize);
     m_densityMLP = new TinyMLPHashGrid(densityOpts, opts.batchSize, densityInferBatch);
+    if (const char* e = std::getenv("TINYMLP_SPLIT_SCATTER")) {
+        m_densityMLP->setSplitScatter(std::atoi(e) != 0);
+        printf("[InstantNerf] split-scatter = %d\n", std::atoi(e) != 0);
+    }
 
     MLPOption colorOpts;
     colorOpts.inputDim = 32;
@@ -951,9 +955,23 @@ void InstantNerf::queryDensityLogit(const float* d_pos, int n, float* d_logit_ou
     constexpr int BS = 256;
     for (int off = 0; off < n; off += cap) {
         int cn = std::min(cap, n - off);
-        m_densityMLP->inference(d_pos + (size_t)off * 3, m_render_buffers.d_density_out.data(), cn, stream);
+        m_densityMLP->inference(d_pos + (size_t)off * 4, m_render_buffers.d_density_out.data(), cn, stream);
         int gs = (cn + BS - 1) / BS;
         k_extractDensityLogit<<<gs, BS, 0, stream>>>(m_render_buffers.d_density_out.data(), d_logit_out + off, cn);
+    }
+}
+
+void InstantNerf::queryFullDensity(const float* d_pos, int n, float* d_logit_out, cudaStream_t stream) {
+    if (n <= 0) return;
+    if (n % 16 != 0) throw std::runtime_error("queryFullDensity: n must be a multiple of 16 (caller pads)");
+    if (!m_traininit) { fprintf(stderr, "[InstantNerf] query before init()\n"); return; }
+    int cap = (m_memMode == INFERENCE) ? m_opts.renderBatchSize : m_opts.batchSize;
+    cap -= cap % 16;
+    for (int off = 0; off < n; off += cap) {
+        int cn = std::min(cap, n - off);
+        m_densityMLP->inference(d_pos + (size_t)off * 4, m_render_buffers.d_density_out.data(), cn, stream);
+        cudaMemcpyAsync(d_logit_out + (size_t)off * 16, m_render_buffers.d_density_out.data(),
+                        sizeof(float) * (size_t)cn * 16, cudaMemcpyDeviceToDevice, stream);
     }
 }
 
@@ -972,10 +990,56 @@ void InstantNerf::queryRadiance(const float* d_pos, int n, float3 viewDir, float
 
     for (int off = 0; off < n; off += cap) {
         int cn = std::min(cap, n - off);
-        m_densityMLP->inference(d_pos + (size_t)off * 3, m_render_buffers.d_density_out.data(), cn, stream);
+        m_densityMLP->inference(d_pos + (size_t)off * 4, m_render_buffers.d_density_out.data(), cn, stream);
         int gs = (cn + BS - 1) / BS;
         compute_SH_gather<<<gs, BS, 0, stream>>>(
             d_query_dir.data(), m_render_buffers.d_ray_indices.data(), 0, cn, m_opts.densityBias,
+            m_render_buffers.d_density_out.data(), m_render_buffers.d_color_input.data(),
+            m_render_buffers.d_density_sigma.data());
+        m_colorMLP->inference(m_render_buffers.d_color_input.data(), d_rgb_out + (size_t)off * 3, cn, stream);
+    }
+}
+
+void InstantNerf::queryColor(float* d_density_out, int n, float3 viewDir, float* d_rgb_out, cudaStream_t stream) {
+     if (n <= 0) return;
+    if (n % 16 != 0) throw std::runtime_error("queryColor: n must be a multiple of 16 (caller pads)");
+    if (!m_traininit) { fprintf(stderr, "[InstantNerf] query before init()\n"); return; }
+    int cap = (m_memMode == INFERENCE) ? m_opts.renderBatchSize : m_opts.batchSize;
+    cap -= cap % 16;
+    constexpr int BS = 256;
+
+    if (d_query_dir.size() < 1) d_query_dir = DeviceBuffer<float3>(1);
+    CUDA_CHECK(cudaMemcpy(d_query_dir.data(), &viewDir, sizeof(float3), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemsetAsync(m_render_buffers.d_ray_indices.data(), 0,
+                               (size_t)std::min(cap, n) * sizeof(uint32_t), stream));
+
+    for (int off = 0; off < n; off += cap) {
+        int cn = std::min(cap, n - off);
+        int gs = (cn + BS - 1) / BS;
+        compute_SH_gather<<<gs, BS, 0, stream>>>(
+            d_query_dir.data(), m_render_buffers.d_ray_indices.data(), 0, cn, m_opts.densityBias,
+            d_density_out+off*16, m_render_buffers.d_color_input.data(),
+            m_render_buffers.d_density_sigma.data());
+        m_colorMLP->inference(m_render_buffers.d_color_input.data(), d_rgb_out + (size_t)off * 3, cn, stream);
+    }
+
+}
+
+void InstantNerf::queryRadiance(const float* d_pos, int n, const float3* d_rayDirs,
+                                const uint32_t* d_rayIndices, float* d_rgb_out, cudaStream_t stream) {
+    if (n <= 0) return;
+    if (n % 16 != 0) throw std::runtime_error("queryRadiance: n must be a multiple of 16 (caller pads)");
+    if (!m_traininit) { fprintf(stderr, "[InstantNerf] query before init()\n"); return; }
+    int cap = (m_memMode == INFERENCE) ? m_opts.renderBatchSize : m_opts.batchSize;
+    cap -= cap % 16;
+    constexpr int BS = 256;
+
+    for (int off = 0; off < n; off += cap) {
+        int cn = std::min(cap, n - off);
+        m_densityMLP->inference(d_pos + (size_t)off * 4, m_render_buffers.d_density_out.data(), cn, stream);
+        int gs = (cn + BS - 1) / BS;
+        compute_SH_gather<<<gs, BS, 0, stream>>>(
+            d_rayDirs, d_rayIndices, off, cn, m_opts.densityBias,
             m_render_buffers.d_density_out.data(), m_render_buffers.d_color_input.data(),
             m_render_buffers.d_density_sigma.data());
         m_colorMLP->inference(m_render_buffers.d_color_input.data(), d_rgb_out + (size_t)off * 3, cn, stream);

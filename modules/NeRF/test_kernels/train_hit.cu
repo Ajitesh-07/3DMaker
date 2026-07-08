@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../../third_party/stb_image_write.h"
@@ -121,7 +122,15 @@ int main(int argc, char** argv) {
     INerfTrainer trainer;
     trainer.init(cfg);
     trainer.loadDataset(dataset);
+
+    // Time JUST the training loop (excludes dataset load + validation + render).
+    auto train_t0 = std::chrono::high_resolution_clock::now();
     trainer.train(maxSteps);   // blocking train with the live progress bar (rendered by the facade)
+    auto train_t1 = std::chrono::high_resolution_clock::now();
+    double trainSec = std::chrono::duration<double>(train_t1 - train_t0).count();
+    std::cout << "\n[train_hit] TRAIN TIME: " << std::fixed << std::setprecision(3) << trainSec
+              << " s  |  " << std::setprecision(4) << (trainSec * 1000.0 / maxSteps)
+              << " ms/step  (" << maxSteps << " steps)\n";
 
     if (cfg.shouldValidate) {
         float psnr = trainer.validate();

@@ -34,6 +34,7 @@ add_library(NeRFModule STATIC
     NerfTrainer.cu
     BakedNerf.h
     BakedNerf.cu
+    bakedNerfKernels.cu
 )
 
 # Headers from TinyMLP module

@@ -10,9 +10,11 @@ fully-fused **tensor-core MLPs**, and a **hit-centric DDA raymarcher** over a hi
 grid. The neural core (`TinyMLP`) is framework-free and fast enough to train scenes on a single
 consumer GPU in seconds.
 
-> **Scope (honest):** today this is a **bounded-box, object-centric** renderer — superb for turntable
-> objects and front-facing captures. Full unbounded/360-outdoor support and clean mesh→FBX export are
-> the active roadmap (`ROADMAP.md`, `docs/realworld_quality_roadmap.md`).
+> **Scope (honest):** real-world **unbounded / 360° captures are now first-class** — mip-NeRF-360
+> scene contraction in the hash encoding, metric occupancy cascades, distortion regularization, and
+> depth priors together produce very good quality on casual phone captures, not just turntable
+> objects. The active roadmap is **real-time rendering via a sparse-voxel bake** (`BakedNerf`, in
+> progress) and clean mesh→FBX export (`ROADMAP.md`, `docs/`).
 
 > **Headline:** an indoor scene trains in **under 4 minutes** using **under 2 GB of VRAM** on a
 > **laptop RTX 4060** — with zero deep-learning frameworks, the whole stack hand-written in CUDA/C++.
@@ -234,7 +236,13 @@ The scene representation, raymarcher, and training/rendering loops built on top 
   updates** and early/late update schedules.
 - **Spatial cascades.** Nested occupancy grids over powers-of-two AABBs (the Instant-NGP
   `aabb_scale` recipe) to extend reach beyond the unit cube; cascade count auto-estimated from scene
-  radius.
+  radius. Outer cascades march at proportionally coarser steps, so background costs stay bounded.
+- **Scene contraction (mip-NeRF-360).** Positions are warped through the ±2 contraction before the
+  hash lookup, so unbounded backgrounds get finite encoding capacity — the key to real-world 360°
+  captures rather than bounded turntable boxes.
+- **Depth supervision (DS-NeRF-style).** Dense-ray depth priors from the COLMAP sparse cloud
+  (`scripts/colmap_depth.py`) with a `lambda-depth` weight — faster convergence and better geometry
+  on real captures (dev harness; CLI exposure pending).
 - **Morton-ordered samples.** Active samples are Z-order sorted so hash-grid lookups hit coherent
   cache lines.
 - **Two MLP heads.** A hash-grid **density** network (`TinyMLPHashGrid`) and a **color** network
@@ -343,11 +351,21 @@ cmake --build modules/NeRF/build --config Release -j
 
 ## 🧭 Status & roadmap
 
-3DMaker today is a strong **object-centric** NeRF: hash grid, occupancy grid, distortion loss, and a
-COLMAP front-end with smart subject centering. The forward plan is documented in:
+3DMaker today is a **real-world unbounded** NeRF: scene contraction + metric occupancy cascades +
+distortion loss + depth priors on top of the hash-grid engine, with a COLMAP front-end, smart subject
+centering, and a capture-quality gate. Real 360° phone captures train to good quality in minutes on a
+laptop.
 
-- **`ROADMAP.md`** — code review, unbounded-scene plan (cascades + exponential stepping + scene
-  contraction), the 3DGS question, and the **clean mesh → FBX** end goal (SDF surface reconstruction).
+**Active track — real-time rendering (`BakedNerf`, in progress):** the trained NeRF is distilled into
+a two-tier sparse voxel structure (13 B/voxel: fp16 σ + uint8 diffuse + fp16 view-features) rendered
+with MERF/SNeRG-style deferred shading — early results are **200–800× faster than raymarching the
+MLPs** (~3–20 ms vs ~1.4 s per 800² frame), targeting interactive viewing on 4 GB-VRAM laptops. The
+appearance-distillation stage is being built (`docs/baking_phase2_joint_training.md`).
+
+The forward plan is documented in:
+
+- **`ROADMAP.md`** — code review, the (since-implemented) unbounded-scene plan, the 3DGS question,
+  and the **clean mesh → FBX** end goal (SDF surface reconstruction). See the status update at the top.
 - **`docs/realworld_quality_roadmap.md`** — quality/efficiency techniques for real-world captures
   (depth supervision, per-image appearance, Zip-NeRF anti-aliasing, pose refinement), framed as "we've
   independently built ~half of nerfacto."
