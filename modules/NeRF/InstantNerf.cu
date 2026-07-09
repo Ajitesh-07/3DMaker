@@ -1341,7 +1341,7 @@ void InstantNerf::save(const std::string& filename) {
     out.write(reinterpret_cast<const char*>(h_occupancyGrid.data()), occupancyGridBytes * sizeof(uint8_t));
 }
 
-void InstantNerf::load(const std::string& filename) {
+void InstantNerf::load(const std::string& filename, MemoryMode memMode, int targetBatchSize) {
     std::ifstream in(filename, std::ios::binary);
     if (!in.is_open()) throw std::runtime_error("Cannot open file for loading: " + filename);
 
@@ -1351,8 +1351,12 @@ void InstantNerf::load(const std::string& filename) {
 
     NerfOptions loadedOpts;
     in.read(reinterpret_cast<char*>(&loadedOpts), sizeof(NerfOptions));
-    
-    init(loadedOpts);
+    if(memMode == TRAINING) {
+        loadedOpts.batchSize = targetBatchSize;
+    } else {
+        loadedOpts.renderBatchSize = targetBatchSize;
+    }
+    init(loadedOpts, memMode);
     
     int hashGridElements = m_opts.numLevels * m_opts.hashTableSize * m_opts.featuresPerLevel;
     std::vector<float> h_hash(hashGridElements);

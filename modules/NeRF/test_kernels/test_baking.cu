@@ -112,22 +112,25 @@ int main(int argc, char** argv) {
                        (int)ok, ms, peakGB, distilGB, distilU);
             }
 
-            // Independent oracle: diagonstic's bitset gives the true unique-vertex count.
-            long long oracleU = -1;
+            // Independent oracle: diagonstic's bitset gives the true unique-vertex counts.
+            // distil now PRUNES to sigma-surviving vertices -> compare to uniqueSurvivors.
+            long long oracleSurv = -1, oracleAll = -1;
             try {
                 bnerf.diagonstic(nerf);
-                oracleU = bnerf.diagnostics().uniqueSurvivors;
+                oracleSurv = bnerf.diagnostics().uniqueSurvivors;
+                oracleAll  = bnerf.diagnostics().uniqueAll;
             } catch (const std::exception& ex) {
                 printf("  [oracle] diagonstic threw: %s\n", ex.what());
             }
 
-            bool match = doDistil && ok && ((long long)distilU == oracleU);
+            bool match = doDistil && ok && ((long long)distilU == oracleSurv);
             if (doDistil)
-                printf("  [verify] distil deduped=%u   oracle(bitset)=%lld   MATCH=%s\n",
-                       distilU, oracleU, match ? "YES" : "NO  <-- buildGrid dedup mismatch!");
+                printf("  [verify] distil stored=%u   oracle sigma-surviving=%lld   MATCH=%s   (all-unique=%lld, pruned %.2fx)\n",
+                       distilU, oracleSurv, match ? "YES" : "NO  <-- mismatch!",
+                       oracleAll, (double)oracleAll / (double)(oracleSurv > 0 ? oracleSurv : 1));
 
             rows.push_back({ std::filesystem::path(modelPath).filename().string(),
-                             s, bnerf.numBlocks(), distilU, oracleU, peakGB, distilGB, ok, match });
+                             s, bnerf.numBlocks(), distilU, oracleSurv, peakGB, distilGB, ok, match });
         }
     }
 

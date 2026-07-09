@@ -336,9 +336,12 @@ public:
     size_t         occupancyBytes() { return d_occupancyGrid.size(); }
     
     void save(const std::string& filename);
-    void load(const std::string& filename);
+    void load(const std::string& filename, MemoryMode memMode = TRAINING, int targetBatchSize = -1);
 
 private:
+
+    friend class BakedNerf;
+
     void initRenderBuffers();
     void freeBuffers();
     void earlyOccupancyGridUpdate(cudaStream_t stream = 0);
