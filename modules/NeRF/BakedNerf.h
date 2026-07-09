@@ -43,6 +43,7 @@ struct BakeDiagnostics {
 
 struct BakedRenderingBuffer {
     DeviceBuffer<int> d_cellSlots{0};
+
     DeviceBuffer<float3> d_rays_d_inv_chunk{0};
     DeviceBuffer<float> d_nears_chunk{0};
     DeviceBuffer<float> d_fars_chunk{0};
@@ -51,9 +52,27 @@ struct BakedRenderingBuffer {
     DeviceBuffer<uint32_t> d_ray_indices{0};
     DeviceBuffer<uint32_t> d_num_steps{0};
     DeviceBuffer<uint32_t> d_block_sums{0};
-    DeviceBuffer<float>    d_teacher_points_out{0};
+    DeviceBuffer<float>   d_teacher_points_out{0};
     DeviceBuffer<float>  d_student_frac_out{0};
     DeviceBuffer<int>    d_student_rows_out{0};
+
+    DeviceBuffer<float> d_density_out{0};
+    DeviceBuffer<half> d_color_input{0};
+    DeviceBuffer<float> d_density_sigma{0};
+    DeviceBuffer<float> d_rgb_output{0};
+    DeviceBuffer<float> d_t_sorted{0};
+    DeviceBuffer<half> d_student_sigma{0};
+    DeviceBuffer<half> d_student_point_data{0};
+    DeviceBuffer<half> d_deferred_backward{0};
+    DeviceBuffer<float> d_render_rgb_chunk{0};
+    DeviceBuffer<float> d_student_rgb_chunk{0};
+    DeviceBuffer<float> d_student_weights{0};
+    DeviceBuffer<half> d_phi_chunk{0};
+    DeviceBuffer<float> d_ray_color_sum{0};
+    DeviceBuffer<float> d_ray_feat_sum{0};
+    DeviceBuffer<int> d_corner_rowids{0};
+    DeviceBuffer<float> d_diffuse_grads{0};
+    DeviceBuffer<float> d_feature_grads{0};
 };
 
 class BakedNerf {
@@ -66,11 +85,17 @@ public:
 
     void init(const BakeOptions& opts);
     void diagonstic(InstantNerf& teacher);
-    void distil(InstantNerf& teacher,
-                const float3* d_rays_o = nullptr,
-                const float3* d_rays_d = nullptr,
-                int numRays = 0,
-                cudaStream_t stream);
+    void bakeGeometry(InstantNerf& teacher, cudaStream_t stream);
+    void jointFit(
+        InstantNerf& teacher, 
+        const float3* d_rays_o,
+        const float3* d_rays_d,
+        int numRays,
+        int& trainSteps,
+        cudaStream_t stream);
+
+
+    void distil(InstantNerf& teacher, cudaStream_t stream);
 
     // census results from distil: Tier-1 occupied blocks / Tier-2 surviving sub-voxels
     uint32_t numBlocks() const { return m_numBlocks; }
@@ -102,15 +127,11 @@ public:
 private:
     int  K()            const { return m_opts.viewFeatures; }
     int  vecLen()       const { return 4 + m_opts.viewFeatures; }     // sigma(1)+diffuse(3)+feat(K)
-    int  deferredInDim()const { return 3 + m_opts.viewFeatures + 16; }
+    int  deferredInDim()const { return 3 + m_opts.viewFeatures + 16 + m_pad; }
     void allocRenderScratch();
-    void jointFit(
-        InstantNerf& teacher, 
-        const float3* d_rays_o,
-        const float3* d_rays_d,
-        cudaStream_t stream);   // Phase 2: distil view-dependent color -> features + deferred MLP
 
     std::vector<float3> m_viewDirs;
+    int m_pad;
 
     BakeOptions m_opts;
 
@@ -134,4 +155,6 @@ private:
     NerfOptions         m_teacherOpts;
 
     BakedRenderingBuffer m_render_buffers;
+
+    bool m_baked = false;
 };

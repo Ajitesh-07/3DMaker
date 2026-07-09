@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
 
                 auto t0 = std::chrono::steady_clock::now();
                 try {
-                    bnerf.distil(nerf, 0);                       // STANDALONE — no diagonstic first
+                    bnerf.bakeGeometry(nerf, 0);
                     cudaError_t e = cudaDeviceSynchronize();
                     if (e != cudaSuccess) { ok = false; printf("  [distil] CUDA error: %s\n", cudaGetErrorString(e)); }
                 } catch (const std::exception& ex) {

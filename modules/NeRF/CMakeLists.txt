@@ -202,4 +202,15 @@ if(NERF_BUILD_TESTS)
         )
     endif()
     target_link_libraries(test_baking PRIVATE NeRFModule)
+
+    add_executable(bake_teacher test_kernels/bake_teacher.cu)
+    if(MSVC)
+        target_compile_options(bake_teacher PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>
+        )
+        target_compile_definitions(bake_teacher PRIVATE
+            CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING
+        )
+    endif()
+    target_link_libraries(bake_teacher PRIVATE NeRFModule)
 endif()

@@ -2,6 +2,7 @@
 #include "bakedNerfKernels.cu"
 #undef CUDA_CHECK
 #include "../TinyMLP/TinyMLP.h"
+#include "../TinyMLP/TinyMLPHashGrid.h"
 #include "../TinyMLP/EmbeddingTable.h"
 #include <cuda_runtime.h>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
+#include <cassert>
 
 void generateFibonacciSphere(int N, std::vector<float3>& directions) {
     if (N <= 0) return;
@@ -31,6 +33,12 @@ void generateFibonacciSphere(int N, std::vector<float3>& directions) {
     }
 }
 
+inline int calculate_sh_padding(int viewFeatures) {
+    assert(viewFeatures < 10 && "viewFeatures must be less than 10");
+    int initial_offset = 3 + viewFeatures;    
+    int pad = (8 - (initial_offset % 8)) % 8;
+    return pad;
+}
 
 BakedNerf::~BakedNerf() {
     delete m_deferredMLP;
@@ -40,6 +48,7 @@ BakedNerf::~BakedNerf() {
 
 void BakedNerf::init(const BakeOptions& opts) {
     m_opts = opts;
+    m_pad = calculate_sh_padding(m_opts.viewFeatures);
 
     MLPOption deferredOpts;
     deferredOpts.activationType = ACT_RELU;
@@ -236,12 +245,7 @@ void BakedNerf::diagonstic(InstantNerf& teacher) {
 
 }
 
-void BakedNerf::distil(InstantNerf& teacher,
-    const float3* d_rays_o,
-    const float3* d_rays_d,
-    int numRays,
-    cudaStream_t stream
-) {
+void BakedNerf::bakeGeometry(InstantNerf& teacher, cudaStream_t stream) {
     m_teacherOpts = teacher.options();
     m_bakeThreshold = (m_opts.sigmaThreshold >= 0.0f) ? m_opts.sigmaThreshold
                                                       : m_teacherOpts.minDensityThreshold;
@@ -429,8 +433,6 @@ void BakedNerf::distil(InstantNerf& teacher,
         d_globalCounter.copyHost(&lastUniqueVertices, 1);
     }
 
-    
-    // PART 1 DONE
     m_render_buffers.d_cellSlots = std::move(d_cellSlots);
     m_render_buffers.d_rays_d_inv_chunk = DeviceBuffer<float3>(m_teacherOpts.rayChunkSize);
     m_render_buffers.d_nears_chunk = DeviceBuffer<float>(m_teacherOpts.rayChunkSize);
@@ -440,9 +442,44 @@ void BakedNerf::distil(InstantNerf& teacher,
     m_render_buffers.d_num_steps = DeviceBuffer<uint32_t>(m_teacherOpts.rayChunkSize);
     m_render_buffers.d_ray_offsets = DeviceBuffer<uint32_t>(m_teacherOpts.rayChunkSize);
     m_render_buffers.d_ray_indices = DeviceBuffer<uint32_t>(m_opts.jointFitBatch);
-    m_render_buffers.d_teacher_points_out = DeviceBuffer<float>(m_opts.jointFitBatch);
+    m_render_buffers.d_teacher_points_out = DeviceBuffer<float>(m_opts.jointFitBatch * 4);
     m_render_buffers.d_student_frac_out = DeviceBuffer<float>(m_opts.jointFitBatch * 3);
     m_render_buffers.d_student_rows_out = DeviceBuffer<int>(m_opts.jointFitBatch * 8);
+    m_render_buffers.d_density_out = DeviceBuffer<float>(m_opts.jointFitBatch*16);
+    m_render_buffers.d_color_input = DeviceBuffer<half>(32 * m_opts.jointFitBatch);
+    m_render_buffers.d_density_sigma = DeviceBuffer<float>(m_opts.jointFitBatch);
+    m_render_buffers.d_rgb_output = DeviceBuffer<float>(m_opts.jointFitBatch * 3);
+    m_render_buffers.d_t_sorted = DeviceBuffer<float>(m_opts.jointFitBatch);
+    m_render_buffers.d_student_sigma = DeviceBuffer<half>(m_opts.jointFitBatch);
+    m_render_buffers.d_render_rgb_chunk = DeviceBuffer<float>(3 * m_opts.jointFitBatch);
+    m_render_buffers.d_student_rgb_chunk = DeviceBuffer<float>(3 * m_opts.jointFitBatch);
+    m_render_buffers.d_student_point_data = DeviceBuffer<half>(m_opts.jointFitBatch* (19 + m_opts.viewFeatures + m_pad));
+    m_render_buffers.d_deferred_backward = DeviceBuffer<half>(m_opts.jointFitBatch*(19 + m_opts.viewFeatures + m_pad));
+    m_render_buffers.d_student_weights = DeviceBuffer<float>(m_opts.jointFitBatch);
+    m_render_buffers.d_phi_chunk = DeviceBuffer<half>(m_opts.jointFitBatch * 3);
+    m_render_buffers.d_ray_color_sum = DeviceBuffer<float>(m_teacherOpts.rayChunkSize * 3);
+    m_render_buffers.d_ray_feat_sum = DeviceBuffer<float>(m_teacherOpts.rayChunkSize * m_opts.viewFeatures);
+    m_render_buffers.d_corner_rowids = DeviceBuffer<int>(m_opts.jointFitBatch * 8);
+    m_render_buffers.d_diffuse_grads = DeviceBuffer<float>(m_opts.jointFitBatch * 8 * 3);
+    m_render_buffers.d_feature_grads = DeviceBuffer<float>(m_opts.jointFitBatch * 8 * m_opts.viewFeatures);
+    m_render_buffers.d_student_point_data.fill(0);
+
+    m_baked = true;
+}
+
+void BakedNerf::jointFit(
+        InstantNerf& teacher, 
+        const float3* d_rays_o,
+        const float3* d_rays_d,
+        int numRays,
+        int& trainSteps,
+        cudaStream_t stream
+) {
+
+    if (!m_baked) {
+        fprintf(stderr, "Error: jointFit() called before bakeGeometry()!\n");
+        return;
+    }
 
     uint32_t raysDone = 0;
 
@@ -456,7 +493,7 @@ void BakedNerf::distil(InstantNerf& teacher,
 
         constexpr int BS = 256;
         int gs = (currentChunkRaysUpperBound + BS - 1) / BS;
-        compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
+        baked_compute_ray_aabb_inv_kernel<<<gs, BS, 0, stream>>>(
             currentChunkRaysUpperBound,
             chunk_o, chunk_d, m_teacherOpts.aabbMin, m_teacherOpts.aabbMax,
             m_teacherOpts.numCascades,
@@ -487,6 +524,7 @@ void BakedNerf::distil(InstantNerf& teacher,
             m_render_buffers.d_student_rows_out.data(),
             m_render_buffers.d_student_frac_out.data(),
             m_render_buffers.d_ray_indices.data(),
+            m_render_buffers.d_t_sorted.data(),
             m_render_buffers.d_block_sums.data(),
             stream
         );
@@ -497,6 +535,108 @@ void BakedNerf::distil(InstantNerf& teacher,
         }
 
         uint32_t padded_b_size = (totalHits + 15) & ~15;
-        // teacher.m_densityMLP->inference(m_render_buffers.d_teacher_points_out.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
+        teacher.m_densityMLP->inference(m_render_buffers.d_teacher_points_out.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
+
+        baked_compute_SH_gather<<<gs, BS, 0, stream>>>(
+                chunk_d, m_render_buffers.d_ray_indices.data(), 
+                0, totalHits, m_teacherOpts.densityBias,
+                m_render_buffers.d_density_out.data(), 
+                m_render_buffers.d_color_input.data(),
+                m_render_buffers.d_density_sigma.data()
+        );
+
+        teacher.m_colorMLP->inference(
+            m_render_buffers.d_color_input.data(),
+            m_render_buffers.d_rgb_output.data(),
+            padded_b_size,
+            stream
+        );
+
+        launch_interpolate_render_rays(
+            m_opts.viewFeatures,
+            currentChunkRays,
+            0,
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_t_sorted.data(),
+            m_render_buffers.d_density_sigma.data(),
+            m_render_buffers.d_rgb_output.data(),
+            m_voxelSigma.data(),
+            m_voxelDiffuse->masterWeights(),
+            m_voxelFeatures->masterWeights(),
+            m_render_buffers.d_student_frac_out.data(),
+            m_render_buffers.d_student_rows_out.data(),
+            m_render_buffers.d_student_sigma.data(),
+            m_render_buffers.d_student_weights.data(),
+            m_render_buffers.d_student_point_data.data(),
+            m_render_buffers.d_render_rgb_chunk.data(),
+            m_teacherOpts.bgColor,
+            m_pad,
+            stream
+        );
+
+        compute_SH_student_gather<<<gs, BS, 0, stream>>>(
+            chunk_d,
+            m_render_buffers.d_ray_indices.data(),
+            m_render_buffers.d_student_point_data.data(),
+            0, m_opts.viewFeatures, m_pad, totalHits
+        );
+
+        m_deferredMLP->zero_grad(stream);
+
+        m_deferredMLP->forward(m_render_buffers.d_student_point_data.data(), m_render_buffers.d_student_rgb_chunk.data(), padded_b_size, stream);
+
+        launch_compute_residual_and_loss_grad(
+            totalHits, padded_b_size, m_opts.viewFeatures, m_pad,
+            m_render_buffers.d_student_point_data.data(),
+            m_render_buffers.d_render_rgb_chunk.data(),
+            m_render_buffers.d_student_rgb_chunk.data(),
+            m_render_buffers.d_phi_chunk.data(),
+            stream
+        );
+
+        m_deferredMLP->backward(m_render_buffers.d_phi_chunk.data(), m_render_buffers.d_deferred_backward.data(), padded_b_size, stream);
+        
+        int gs_ray = (currentChunkRays + BS - 1) / BS;
+        compute_ray_gradient_sums<<<gs_ray, BS, 0, stream>>>(
+            currentChunkRays,
+            m_opts.viewFeatures,
+            m_pad,
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_phi_chunk.data(),
+            m_render_buffers.d_deferred_backward.data(),
+            m_render_buffers.d_ray_color_sum.data(),
+            m_render_buffers.d_ray_feat_sum.data()
+        );
+
+        launch_scatter_gradients_to_embeddings(
+            currentChunkRays, m_opts.viewFeatures, m_pad,
+            m_render_buffers.d_ray_offsets.data(),
+            m_render_buffers.d_num_steps.data(),
+            m_render_buffers.d_t_sorted.data(),
+            m_render_buffers.d_density_sigma.data(),
+            m_render_buffers.d_phi_chunk.data(),
+            m_render_buffers.d_deferred_backward.data(),
+            m_render_buffers.d_ray_color_sum.data(),
+            m_render_buffers.d_ray_feat_sum.data(),
+            m_render_buffers.d_student_weights.data(),
+            m_render_buffers.d_student_rows_out.data(),
+            m_render_buffers.d_student_frac_out.data(),
+            m_render_buffers.d_corner_rowids.data(),
+            m_render_buffers.d_diffuse_grads.data(),
+            m_render_buffers.d_feature_grads.data(),
+            stream
+        );
+
+        m_voxelDiffuse->tableStep(m_render_buffers.d_corner_rowids.data(), m_render_buffers.d_diffuse_grads.data(), totalHits * 8, stream);
+        m_voxelFeatures->tableStep(m_render_buffers.d_corner_rowids.data(), m_render_buffers.d_feature_grads.data(), totalHits * 8, stream);
+
+        m_deferredMLP->step(m_opts.mlpLearningRate, m_teacherOpts.beta1, m_teacherOpts.beta2, m_teacherOpts.epsilon, m_teacherOpts.lossScale, stream);
+        
+        trainSteps++;
+        raysDone += currentChunkRays;
     }
 }
+
+
