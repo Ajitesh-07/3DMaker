@@ -2,41 +2,7 @@
 #include <cuda_fp16.h>
 #include <iostream>
 #include "BakedNerf.h"
-
-__device__ __forceinline__ int clamp_int(int val, int min_val, int max_val) {
-    return min(max(val, min_val), max_val);
-}
-
-__device__ __forceinline__ void store_float4(float4* addr, float x, float y, float z, float w) {
-    #ifndef __INTELLISENSE__
-    asm volatile(
-        "st.global.cs.v4.f32 [%0], {%1, %2, %3, %4};"
-        :
-        : "l"(addr), "f"(x), "f"(y), "f"(z), "f"(w)
-        : "memory"
-    );
-    #endif
-}
-
-__device__ __forceinline__ void loadVec4(const int* __restrict__ ptr, int dst[4]) {
-    #ifndef __INTELLISENSE__
-    asm volatile(
-        "ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
-        : "l"(ptr)
-    );
-    #endif
-}
-
-__device__ __forceinline__ void loadVec4f(const float* __restrict__ ptr, float dst[4]) {
-    #ifndef __INTELLISENSE__
-    asm volatile(
-        "ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])
-        : "l"(ptr)
-    );
-    #endif
-}
+#include "bakedNerfKernelDef.cuh"
 
 __global__ void baked_compute_ray_aabb_inv_kernel(
     const uint32_t num_rays,
@@ -299,18 +265,95 @@ __global__ void compute_SH_student_gather(
     store_float4(&dest[1], packed8_15.x, packed8_15.y, packed8_15.z, packed8_15.w);
 }
 
-static __device__ __forceinline__ float3 bake_contract_pos(float3 pos, float3 aabb_min, float3 aabb_max) {
-    float3 ext = make_float3(aabb_max.x - aabb_min.x, aabb_max.y - aabb_min.y, aabb_max.z - aabb_min.z);
-    float3 rel = make_float3((pos.x - aabb_min.x) / ext.x, (pos.y - aabb_min.y) / ext.y, (pos.z - aabb_min.z) / ext.z);
-    float3 n   = make_float3(rel.x * 2.0f - 1.0f, rel.y * 2.0f - 1.0f, rel.z * 2.0f - 1.0f);
-    float3 c;
-    c.x = fabsf(n.x) <= 1.0f ? n.x : (2.0f - 1.0f / fabsf(n.x)) * copysignf(1.0f, n.x);
-    c.y = fabsf(n.y) <= 1.0f ? n.y : (2.0f - 1.0f / fabsf(n.y)) * copysignf(1.0f, n.y);
-    c.z = fabsf(n.z) <= 1.0f ? n.z : (2.0f - 1.0f / fabsf(n.z)) * copysignf(1.0f, n.z);
-    return make_float3(
-        fmaxf(0.0f, fminf((c.x + 2.0f) * 0.25f, 1.0f)),
-        fmaxf(0.0f, fminf((c.y + 2.0f) * 0.25f, 1.0f)),
-        fmaxf(0.0f, fminf((c.z + 2.0f) * 0.25f, 1.0f)));
+
+
+__global__ void compute_SH_student_deferred(
+    const float3* __restrict__ d_chunk_d,
+    half* __restrict__ d_student_point_data,
+    const int viewFeatures,
+    const int pad,
+    const int numRays
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numRays) return;
+
+    int total = 3 + viewFeatures + pad + 16;
+    int sh_offset = (idx * total) + 3 + viewFeatures + pad; 
+    
+    float3 d = d_chunk_d[idx];
+
+    float x = d.x;
+    float y = d.y;
+    float z = d.z;
+
+    float x2 = x * x;
+    float y2 = y * y;
+    float z2 = z * z;
+
+    float sh0  =  0.28209479f;
+    float sh1  = -0.48860251f * y;
+    float sh2  =  0.48860251f * z;
+    float sh3  = -0.48860251f * x;
+
+    float sh4  =  1.09254843f * x * y;
+    float sh5  = -1.09254843f * y * z;
+    float sh6  =  0.31539156f * (3.0f * z2 - 1.0f);
+    float sh7  = -1.09254843f * x * z;
+
+    float sh8  =  0.54627421f * (x2 - y2);
+    float sh9  = -0.59004359f * y * (3.0f * x2 - y2);
+    float sh10 =  2.89061144f * x * y * z;
+    float sh11 = -0.45704580f * y * (5.0f * z2 - 1.0f);
+     
+    float sh12 =  0.37317633f * z * (5.0f * z2 - 3.0f);
+    float sh13 = -0.45704580f * x * (5.0f * z2 - 1.0f);
+    float sh14 =  1.44530572f * z * (x2 - y2);
+    float sh15 = -0.59004359f * x * (x2 - 3.0f * y2);
+
+    __half2 hs01 = __floats2half2_rn(sh0, sh1);
+    __half2 hs23 = __floats2half2_rn(sh2, sh3);
+    __half2 hs45 = __floats2half2_rn(sh4, sh5);
+    __half2 hs67 = __floats2half2_rn(sh6, sh7);
+    
+    float4 packed0_7 = make_float4(
+        __int_as_float(*(uint32_t*)&hs01),
+        __int_as_float(*(uint32_t*)&hs23),
+        __int_as_float(*(uint32_t*)&hs45),
+        __int_as_float(*(uint32_t*)&hs67)
+    );
+
+    __half2 hs89 = __floats2half2_rn(sh8, sh9);
+    __half2 hs1011 = __floats2half2_rn(sh10, sh11);
+    __half2 hs1213 = __floats2half2_rn(sh12, sh13);
+    __half2 hs1415 = __floats2half2_rn(sh14, sh15);
+    
+    float4 packed8_15 = make_float4(
+        __int_as_float(*(uint32_t*)&hs89),
+        __int_as_float(*(uint32_t*)&hs1011),
+        __int_as_float(*(uint32_t*)&hs1213),
+        __int_as_float(*(uint32_t*)&hs1415)
+    );
+
+    float4* dest = reinterpret_cast<float4*>(&d_student_point_data[sh_offset]);
+    
+    store_float4(&dest[0], packed0_7.x, packed0_7.y, packed0_7.z, packed0_7.w);
+    store_float4(&dest[1], packed8_15.x, packed8_15.y, packed8_15.z, packed8_15.w);
+}
+
+void launch_compute_SH_student_deferred(
+    const float3* d_chunk_d,
+    half* d_student_point_data,
+    const int viewFeatures,
+    const int pad,
+    const int numRays,
+    cudaStream_t stream
+) {
+    if (numRays <= 0) return;
+    constexpr int BS = 256;
+    int gs = (numRays + BS - 1) / BS;
+    compute_SH_student_deferred<<<gs, BS, 0, stream>>>(
+        d_chunk_d, d_student_point_data, viewFeatures, pad, numRays
+    );
 }
 
 __global__ void buildInvCellMap(
@@ -636,536 +679,6 @@ __global__ void buildGrid(
     }
 }
 
-// ============================================================================
-// Phase-2 student/teacher ray marcher (analogue of processRaysHitLinear).
-//
-// For each ray: outer DDA over the occupancy grid (mipmap, per-cascade pyramid) to
-// find occupied finest-level voxels; then an inner 3^3 = (B-1)^3 sub-cube DDA within
-// each occupied voxel (skipping sub-cubes whose 27-bit mask bit is 0). For every
-// occupied sub-cube the ray traverses we emit ONE sample at the mid-t of the segment:
-//   - teacher: the contracted landing position (stride-4, ready for queryRadiance)
-//   - student: the 8 corner vertex ROWS of that sub-cube (from blockIdx; -1 = pruned)
-//              and the 3 trilinear fractions (fx,fy,fz) of the sample within the sub-cube
-//              (the gather kernel expands them into the 8 corner weights).
-//
-// Two passes, like processRaysHitLinear: (A) count samples/ray, prefix-sum, find the
-// cutoff ray so total samples <= batchSize, (B) re-march the fitted rays and emit.
-// Returns how many rays fit. Needs a persistent dense-cell -> block-index reverseMap
-// (== distil's d_cellSlots, which must be kept instead of freed).
-// ============================================================================
-
-__device__ __forceinline__ int bake_get_cascade(float3 pos, float3 aabb_min, float3 aabb_max, int num_cascades) {
-    float rx = fmaxf(pos.x / aabb_max.x, pos.x / aabb_min.x);
-    float ry = fmaxf(pos.y / aabb_max.y, pos.y / aabb_min.y);
-    float rz = fmaxf(pos.z / aabb_max.z, pos.z / aabb_min.z);
-    float max_scale = fmaxf(rx, fmaxf(ry, rz));
-    if (max_scale <= 1.0f) return 0;
-    int cascade = (int)ceilf(log2f(max_scale));
-    return max(0, min(cascade, num_cascades - 1));
-}
-
-__device__ __forceinline__ uint32_t bake_mipmap_offset(uint3 base_res, int target_level) {
-    uint32_t offset = 0;
-    uint3 res = base_res;
-    for (int l = 0; l < target_level; ++l) {
-        offset += res.x * res.y * res.z;
-        res.x >>= 1; res.y >>= 1; res.z >>= 1;
-    }
-    return offset;
-}
-
-template<bool EMIT>
-__global__ void bakedMarchRays(
-    uint32_t num_rays,
-    const float3* __restrict__ rays_o,
-    const float3* __restrict__ rays_d,
-    const float3* __restrict__ rays_d_inv,
-    const float* __restrict__ nears,
-    const float* __restrict__ fars,
-    const uint8_t*  __restrict__ occupancy_grid,
-    const uint32_t* __restrict__ voxelMask27,   // per-block 27-bit sub-cube occupancy (m_voxelMask)
-    const uint32_t* __restrict__ vertexRows,    // per-block * B^3 vertex row map (m_blockIdx), 0xFFFFFFFF = pruned
-    const int*      __restrict__ reverseMap,    // dense cell (cascade*G+local) -> block index, -1 = empty
-    uint3  gridRes, float3 aabbMin, float3 aabbMax,
-    int numCascades, int levelsMipmap, int B,
-    // EMIT-only outputs:
-    const uint32_t* __restrict__ ray_offsets, uint32_t base_offset,
-    float* __restrict__ teacher_points_out,     // batchSize*4 (contracted, stride-4)
-    int*   __restrict__ student_rows_out,       // batchSize*8 (corner rows, -1 = pruned)
-    float* __restrict__ student_frac_out,       // batchSize*3 (fx,fy,fz; expand to 8 weights at gather time)
-    uint32_t* __restrict__ ray_indices_out,     // batchSize
-    float* __restrict__ t_hits_out,
-    // count-only output:
-    uint32_t* __restrict__ num_steps_per_ray)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_rays) return;
-
-    float3 o = rays_o[i];
-    float3 d = rays_d[i];
-    float3 d_inv = rays_d_inv[i];
-    float t_min = nears[i];
-    float t_max_ray = fars[i];
-
-    float3 aabb_extent = make_float3(aabbMax.x - aabbMin.x, aabbMax.y - aabbMin.y, aabbMax.z - aabbMin.z);
-    int3 step = make_int3((d.x >= 0.0f) ? 1 : -1, (d.y >= 0.0f) ? 1 : -1, (d.z >= 0.0f) ? 1 : -1);
-
-    const int G       = gridRes.x * gridRes.y * gridRes.z;
-    const int per     = B * B * B;          // 64
-    const int subRes  = B - 1;              // 3 sub-cubes / axis
-    const uint32_t total_mipmap_cells = bake_mipmap_offset(gridRes, levelsMipmap);
-
-    uint32_t hit_count = 0;
-    uint32_t out_base  = EMIT ? (ray_offsets[i] - base_offset) : 0u;
-
-    float current_t = t_min;
-    int current_level = levelsMipmap - 1;
-
-    while (current_t < t_max_ray && hit_count < MAX_HITS) {
-        float3 cp = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
-        int cascade = bake_get_cascade(cp, aabbMin, aabbMax, numCascades);
-        float cs = exp2f((float)cascade);
-
-        float3 caMin = make_float3(aabbMin.x * cs, aabbMin.y * cs, aabbMin.z * cs);
-        float3 caExt = make_float3(aabb_extent.x * cs, aabb_extent.y * cs, aabb_extent.z * cs);
-        uint3  res_l = make_uint3(gridRes.x >> current_level, gridRes.y >> current_level, gridRes.z >> current_level);
-        float3 vsz   = make_float3(caExt.x / res_l.x, caExt.y / res_l.y, caExt.z / res_l.z);
-        float3 rp    = make_float3((cp.x - caMin.x) / caExt.x, (cp.y - caMin.y) / caExt.y, (cp.z - caMin.z) / caExt.z);
-        int3 vi = make_int3(
-            max(0, min((int)floorf(rp.x * res_l.x), (int)res_l.x - 1)),
-            max(0, min((int)floorf(rp.y * res_l.y), (int)res_l.y - 1)),
-            max(0, min((int)floorf(rp.z * res_l.z), (int)res_l.z - 1)));
-
-        uint32_t lvl_off  = bake_mipmap_offset(gridRes, current_level);
-        uint32_t casc_off = cascade * total_mipmap_cells;
-        uint32_t flat = casc_off + lvl_off + vi.z * (res_l.x * res_l.y) + vi.y * res_l.x + vi.x;
-        bool occ = (occupancy_grid[flat >> 3] >> (flat & 7)) & 1;
-
-        // exit-t of the current (level) voxel
-        float3 nb = make_float3(
-            caMin.x + (vi.x + (step.x > 0 ? 1.0f : 0.0f)) * vsz.x,
-            caMin.y + (vi.y + (step.y > 0 ? 1.0f : 0.0f)) * vsz.y,
-            caMin.z + (vi.z + (step.z > 0 ? 1.0f : 0.0f)) * vsz.z);
-        float3 tmax = make_float3((nb.x - o.x) * d_inv.x, (nb.y - o.y) * d_inv.y, (nb.z - o.z) * d_inv.z);
-        float next_t = fminf(fminf(tmax.x, tmax.y), tmax.z);
-
-        if (occ) {
-            if (current_level > 0) {
-                current_level--;   // refine, do NOT advance current_t
-                continue;
-            }
-            // ---- finest occupied voxel: inner 3^3 sub-cube DDA ----
-            int local = vi.z * (gridRes.x * gridRes.y) + vi.y * gridRes.x + vi.x;
-            int bi = reverseMap[cascade * G + local];
-            if (bi >= 0) {
-                uint32_t subMask = voxelMask27[bi];
-                float3 vmin = make_float3(caMin.x + vi.x * vsz.x, caMin.y + vi.y * vsz.y, caMin.z + vi.z * vsz.z);
-                float3 ssz  = make_float3(vsz.x / subRes, vsz.y / subRes, vsz.z / subRes);
-                float voxel_exit = next_t;
-
-                float sub_t = fmaxf(current_t, t_min);
-                int guard = 0;
-                while (sub_t < voxel_exit && hit_count < MAX_HITS && guard < 3 * subRes) {
-                    guard++;
-                    float3 sp = make_float3(o.x + sub_t * d.x, o.y + sub_t * d.y, o.z + sub_t * d.z);
-                    // sub-cube index from the segment-entry point
-                    int si = max(0, min((int)floorf((sp.x - vmin.x) / ssz.x), subRes - 1));
-                    int sj = max(0, min((int)floorf((sp.y - vmin.y) / ssz.y), subRes - 1));
-                    int sk = max(0, min((int)floorf((sp.z - vmin.z) / ssz.z), subRes - 1));
-
-                    float sbx = vmin.x + (si + (step.x > 0 ? 1.0f : 0.0f)) * ssz.x;
-                    float sby = vmin.y + (sj + (step.y > 0 ? 1.0f : 0.0f)) * ssz.y;
-                    float sbz = vmin.z + (sk + (step.z > 0 ? 1.0f : 0.0f)) * ssz.z;
-                    float sub_next = fminf(fminf((sbx - o.x) * d_inv.x, (sby - o.y) * d_inv.y), (sbz - o.z) * d_inv.z);
-                    float seg_exit = fminf(sub_next, voxel_exit);
-
-                    int cubeIdx = si + sj * subRes + sk * subRes * subRes;   // 0..26
-                    if ((subMask >> cubeIdx) & 1u) {
-                        if (EMIT) {
-                            uint32_t w = out_base + hit_count;
-                            float t_mid = 0.5f * (sub_t + seg_exit);
-                            float3 mp = make_float3(o.x + t_mid * d.x, o.y + t_mid * d.y, o.z + t_mid * d.z);
-
-                            float3 cpos = bake_contract_pos(mp, aabbMin, aabbMax);
-                            float4* tp = reinterpret_cast<float4*>(teacher_points_out);
-                            store_float4(&tp[w], cpos.x, cpos.y, cpos.z, 0.0f);
-                            ray_indices_out[w] = i;
-                            t_hits_out[w] = t_mid;
-
-                            // trilinear fraction of the sample within its sub-cube (si,sj,sk);
-                            // the gather kernel expands these 3 into the 8 corner weights.
-                            student_frac_out[w * 3 + 0] = fminf(fmaxf((mp.x - vmin.x) / ssz.x - (float)si, 0.0f), 1.0f);
-                            student_frac_out[w * 3 + 1] = fminf(fmaxf((mp.y - vmin.y) / ssz.y - (float)sj, 0.0f), 1.0f);
-                            student_frac_out[w * 3 + 2] = fminf(fmaxf((mp.z - vmin.z) / ssz.z - (float)sk, 0.0f), 1.0f);
-
-                            #pragma unroll
-                            for (int c = 0; c < 8; ++c) {
-                                int di = c & 1, dj = (c >> 1) & 1, dk = (c >> 2) & 1;
-                                int vsub = (si + di) + (sj + dj) * B + (sk + dk) * B * B;   // corner vertex, 0..63
-                                student_rows_out[w * 8 + c] = (int)vertexRows[bi * per + vsub];  // 0xFFFFFFFF -> -1
-                            }
-                        }
-                        hit_count++;
-                    }
-                    sub_t = fmaxf(sub_t + 1e-6f, sub_next + 1e-6f);
-                }
-            }
-        }
-
-        current_t = fmaxf(current_t + 1e-5f, next_t + 1e-6f);
-        current_level = levelsMipmap - 1;
-    }
-
-    if (!EMIT) num_steps_per_ray[i] = hit_count;
-}
-
-void custom_exclusive_sum(const uint32_t* d_in, uint32_t* d_out, uint32_t* d_block_sums, int num_items, cudaStream_t stream);
-__global__ void find_cutoff_ray_kernel(
-    const uint32_t* __restrict__ ray_offsets, const uint32_t* __restrict__ num_steps,
-    uint32_t num_rays, uint32_t batch_size, uint32_t* __restrict__ active_rays_count);
-
-// Returns how many rays fit (their total sample count <= batchSize).
-int processBakedRaysLinear(
-    uint32_t num_rays,
-    const float3* rays_o, const float3* rays_d, const float3* rays_d_inv,
-    const float* nears, const float* fars,
-    const uint8_t*  occupancy_grid,
-    const uint32_t* voxelMask27,
-    const uint32_t* vertexRows,
-    const int*      reverseMap,
-    uint3 gridRes, float3 aabbMin, float3 aabbMax,
-    int numCascades, int mipmapLevels, int B,
-    int batchSize,
-    uint32_t* totalSamples,
-    uint32_t* d_active_rays_count,
-    uint32_t* d_num_steps,
-    uint32_t* d_ray_offsets,
-    float*    d_teacher_points_out,   // batchSize*4
-    int*      d_student_rows_out,     // batchSize*8
-    float*    d_student_frac_out,     // batchSize*3
-    uint32_t* d_ray_indices,          // batchSize
-    float* d_t_sorted,
-    uint32_t* d_block_sums,
-    cudaStream_t stream)
-{
-    constexpr int BS = 256;
-    const int gs = (num_rays + BS - 1) / BS;
-
-    // Pass A: count samples per ray.
-    bakedMarchRays<false><<<gs, BS, 0, stream>>>(
-        num_rays, rays_o, rays_d, rays_d_inv, nears, fars,
-        occupancy_grid, voxelMask27, vertexRows, reverseMap,
-        gridRes, aabbMin, aabbMax, numCascades, mipmapLevels, B,
-        nullptr, 0u, nullptr, nullptr, nullptr, nullptr, nullptr,
-        d_num_steps);
-
-    custom_exclusive_sum(d_num_steps, d_ray_offsets, d_block_sums, num_rays, stream);
-
-    uint32_t last_offset = 0, last_count = 0;
-    cudaMemcpyAsync(&last_offset, &d_ray_offsets[num_rays - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&last_count,  &d_num_steps[num_rays - 1],   sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    if (last_offset + last_count == 0) { *totalSamples = 0; return num_rays; }
-
-    // Find the cutoff ray so the fitted total sample count <= batchSize.
-    cudaMemsetAsync(d_active_rays_count, 0, sizeof(uint32_t), stream);
-    find_cutoff_ray_kernel<<<gs, BS, 0, stream>>>(d_ray_offsets, d_num_steps, num_rays, (uint32_t)batchSize, d_active_rays_count);
-
-    uint32_t raysFit = 0;
-    cudaMemcpyAsync(&raysFit, d_active_rays_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    if (raysFit == 0) { *totalSamples = 0; return 0; }
-
-    uint32_t tot_off = 0, tot_cnt = 0;
-    cudaMemcpyAsync(&tot_off, &d_ray_offsets[raysFit - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&tot_cnt, &d_num_steps[raysFit - 1],   sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    *totalSamples = tot_off + tot_cnt;
-
-    // Pass B: re-march the fitted rays and emit at their dense offsets.
-    const int gs2 = (raysFit + BS - 1) / BS;
-    bakedMarchRays<true><<<gs2, BS, 0, stream>>>(
-        raysFit, rays_o, rays_d, rays_d_inv, nears, fars,
-        occupancy_grid, voxelMask27, vertexRows, reverseMap,
-        gridRes, aabbMin, aabbMax, numCascades, mipmapLevels, B,
-        d_ray_offsets, 0u,
-        d_teacher_points_out, d_student_rows_out, d_student_frac_out, d_ray_indices,
-        d_t_sorted, nullptr);
-
-    return (int)raysFit;
-}
-
-__device__ __forceinline__ float4 lerp_arrays(const float a[4], const float b[4], float t) {
-    return make_float4(
-        fmaf(t, b[0] - a[0], a[0]),
-        fmaf(t, b[1] - a[1], a[1]),
-        fmaf(t, b[2] - a[2], a[2]),
-        fmaf(t, b[3] - a[3], a[3])
-    );
-}
-
-__device__ __forceinline__ float4 lerp_float4(float4 a, float4 b, float t) {
-    return make_float4(
-        fmaf(t, b.x - a.x, a.x),
-        fmaf(t, b.y - a.y, a.y),
-        fmaf(t, b.z - a.z, a.z),
-        fmaf(t, b.w - a.w, a.w)
-    );
-}
-
-__device__ __forceinline__ float3 lerp_float3(float3 a, float3 b, float t) {
-    return make_float3(
-        fmaf(t, b.x - a.x, a.x),
-        fmaf(t, b.y - a.y, a.y),
-        fmaf(t, b.z - a.z, a.z)
-    );
-}
-template <int VIEW_FEATURES>
-__global__ void interpolateRenderRays(
-    const int numRays,
-    const uint32_t raysDone,
-    const uint32_t* __restrict__ ray_offsets,
-    const uint32_t* __restrict__ num_steps,
-    const float* __restrict__ t_sorted,
-    const float* __restrict__ density_sigma,
-    const float* __restrict__ rgb_output,
-    const half* __restrict__  sigma_master,
-    const float* __restrict__ diffuse_master,
-    const float* __restrict__ features_master,
-    const float* __restrict__ student_frac,
-    int* __restrict__ student_rows_out,
-    half* __restrict__ student_sigma,
-    float* __restrict__ student_weights,
-    half* __restrict__ student_point_data,
-    float* __restrict__ point_teacher_rgb,
-    float3 bg_color,
-    int m_pad
-){
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= numRays) return;
-
-    const float3* diffuse_master_v3 = reinterpret_cast<const float3*>(diffuse_master);
-    uint32_t offset = ray_offsets[r + raysDone];
-    uint32_t count = num_steps[r];
-
-    float T = 1.0f;
-    float r_c = 0.0f, g_c = 0.0f, b_c = 0.0f;
-    float depth = 0.0f;
-
-    float sT = 1.0f;
-    float sr_c = 0.0f, sg_c = 0.0f, sb_c = 0.0f;
-
-    int student_rows_idx[8];
-    float3 frac;
-    float interpolated_features[VIEW_FEATURES];
-    float sf_acc[VIEW_FEATURES];
-    #pragma unroll
-    for (int j = 0; j < VIEW_FEATURES; j++) sf_acc[j] = 0.0f;
-
-    for(uint32_t i = 0; i < count; i++) {
-        uint32_t idx = offset + i;
-        float t = t_sorted[idx];
-
-        loadVec4(&student_rows_out[idx*8], student_rows_idx);
-        loadVec4(&student_rows_out[idx*8 + 4], student_rows_idx + 4);
-
-        frac.x = student_frac[idx*3 + 0];
-        frac.y = student_frac[idx*3 + 1];
-        frac.z = student_frac[idx*3 + 2];
-
-        float3 d000 = diffuse_master_v3[student_rows_idx[0]];
-        float3 d100 = diffuse_master_v3[student_rows_idx[1]];
-        float3 c00  = lerp_float3(d000, d100, frac.x);
-
-        float3 d010 = diffuse_master_v3[student_rows_idx[2]];
-        float3 d110 = diffuse_master_v3[student_rows_idx[3]];
-        float3 c10  = lerp_float3(d010, d110, frac.x);
-
-        float3 c0 = lerp_float3(c00, c10, frac.y);
-
-        float3 d001 = diffuse_master_v3[student_rows_idx[4]];
-        float3 d101 = diffuse_master_v3[student_rows_idx[5]];
-        float3 c01  = lerp_float3(d001, d101, frac.x);
-
-        float3 d011 = diffuse_master_v3[student_rows_idx[6]];
-        float3 d111 = diffuse_master_v3[student_rows_idx[7]];
-        float3 c11  = lerp_float3(d011, d111, frac.x);
-
-        float3 c1 = lerp_float3(c01, c11, frac.y);
-        float3 final_diffuse = lerp_float3(c0, c1, frac.z);
-
-        if constexpr (VIEW_FEATURES == 4) {
-            float vA[4], vB[4]; 
-            
-            loadVec4f(&features_master[student_rows_idx[0]*4], vA);
-            loadVec4f(&features_master[student_rows_idx[1]*4], vB);
-            float4 c00_f = lerp_arrays(vA, vB, frac.x);
-
-            loadVec4f(&features_master[student_rows_idx[2]*4], vA);
-            loadVec4f(&features_master[student_rows_idx[3]*4], vB);
-            float4 c10_f = lerp_arrays(vA, vB, frac.x);
-
-            float4 c0_f = lerp_float4(c00_f, c10_f, frac.y);
-
-            loadVec4f(&features_master[student_rows_idx[4]*4], vA);
-            loadVec4f(&features_master[student_rows_idx[5]*4], vB);
-            float4 c01_f = lerp_arrays(vA, vB, frac.x);
-
-            loadVec4f(&features_master[student_rows_idx[6]*4], vA);
-            loadVec4f(&features_master[student_rows_idx[7]*4], vB);
-            float4 c11_f = lerp_arrays(vA, vB, frac.x);
-
-            float4 c1_f = lerp_float4(c01_f, c11_f, frac.y);
-
-            float4 final_res = lerp_float4(c0_f, c1_f, frac.z);
-            
-            interpolated_features[0] = final_res.x;
-            interpolated_features[1] = final_res.y;
-            interpolated_features[2] = final_res.z;
-            interpolated_features[3] = final_res.w;
-        } else {
-            #pragma unroll
-            for(int j = 0; j < VIEW_FEATURES; j++) {
-                float v000 = features_master[student_rows_idx[0]*VIEW_FEATURES + j];
-                float v100 = features_master[student_rows_idx[1]*VIEW_FEATURES + j];
-                float v010 = features_master[student_rows_idx[2]*VIEW_FEATURES + j];
-                float v110 = features_master[student_rows_idx[3]*VIEW_FEATURES + j];
-                
-                float v001 = features_master[student_rows_idx[4]*VIEW_FEATURES + j];
-                float v101 = features_master[student_rows_idx[5]*VIEW_FEATURES + j];
-                float v011 = features_master[student_rows_idx[6]*VIEW_FEATURES + j];
-                float v111 = features_master[student_rows_idx[7]*VIEW_FEATURES + j];
-
-                float c00_f = fmaf(frac.x, v100 - v000, v000);
-                float c10_f = fmaf(frac.x, v110 - v010, v010);
-                float c01_f = fmaf(frac.x, v101 - v001, v001);
-                float c11_f = fmaf(frac.x, v111 - v011, v011);
-
-                float c0_f = fmaf(frac.y, c10_f - c00_f, c00_f);
-                float c1_f = fmaf(frac.y, c11_f - c01_f, c01_f);
-
-                interpolated_features[j] = fmaf(frac.z, c1_f - c0_f, c0_f);
-            }
-        }
-
-        float s000 = __half2float(sigma_master[student_rows_idx[0]]);
-        float s100 = __half2float(sigma_master[student_rows_idx[1]]);
-        float s010 = __half2float(sigma_master[student_rows_idx[2]]);
-        float s110 = __half2float(sigma_master[student_rows_idx[3]]);
-
-        float s001 = __half2float(sigma_master[student_rows_idx[4]]);
-        float s101 = __half2float(sigma_master[student_rows_idx[5]]);
-        float s011 = __half2float(sigma_master[student_rows_idx[6]]);
-        float s111 = __half2float(sigma_master[student_rows_idx[7]]);
-
-        float c00_s = fmaf(frac.x, s100 - s000, s000);
-        float c10_s = fmaf(frac.x, s110 - s010, s010);
-        float c01_s = fmaf(frac.x, s101 - s001, s001);
-        float c11_s = fmaf(frac.x, s111 - s011, s011);
-        
-        float c0_s = fmaf(frac.y, c10_s - c00_s, c00_s);
-        float c1_s = fmaf(frac.y, c11_s - c01_s, c01_s);
-        float final_sigma_float = fmaf(frac.z, c1_s - c0_s, c0_s);
-
-        float delta_t = 0.0f;
-        if (i < count - 1) {
-            delta_t = t_sorted[idx + 1] - t;
-        } else {
-            delta_t = 1e-3f; 
-        }
-
-        float t_sigma = density_sigma[idx];
-        float t_alpha = 1.0f - expf(-t_sigma * delta_t);
-        float t_weight = t_alpha * T;
-
-        r_c += t_weight * rgb_output[idx * 3 + 0];
-        g_c += t_weight * rgb_output[idx * 3 + 1];
-        b_c += t_weight * rgb_output[idx * 3 + 2];
-
-        depth += t_weight * t;
-        T *= (1.0f - t_alpha);
-
-        float s_sigma_safe = fmaxf(0.0f, final_sigma_float); 
-        float s_alpha = 1.0f - expf(-s_sigma_safe * delta_t);
-        float s_weight = s_alpha * sT;
-
-        sr_c += s_weight * final_diffuse.x;
-        sg_c += s_weight * final_diffuse.y;
-        sb_c += s_weight * final_diffuse.z;
-        
-        sT *= (1.0f - s_alpha);
-
-
-        student_sigma[idx] = __float2half(final_sigma_float);
-        student_weights[idx] = s_weight;
-
-        uint32_t data_offset = idx * (19 + VIEW_FEATURES + m_pad);
-
-        student_point_data[data_offset + 0] = __float2half(sr_c);
-        student_point_data[data_offset + 1] = __float2half(sg_c);
-        student_point_data[data_offset + 2] = __float2half(sb_c);
-
-        #pragma unroll
-        for(int j = 0; j < VIEW_FEATURES; j++) {
-            sf_acc[j] += s_weight * interpolated_features[j];
-            student_point_data[data_offset + 3 + j] = __float2half(sf_acc[j]);
-        }
-
-        point_teacher_rgb[idx*3 + 0] = r_c;
-        point_teacher_rgb[idx*3 + 1] = g_c;
-        point_teacher_rgb[idx*3 + 2] = b_c;
-    }
-}
-
-void launch_interpolate_render_rays(
-    int view_features,
-    const int numRays,
-    const uint32_t raysDone,
-    const uint32_t* ray_offsets,
-    const uint32_t* num_steps,
-    const float* t_sorted,
-    const float* density_sigma,
-    const float* rgb_output,
-    const half* sigma_master,
-    const float* diffuse_master,
-    const float* features_master,
-    const float* student_frac,
-    int* student_rows_out,
-    half* student_sigma,
-    float* student_weights,
-    half* student_point_data,
-    float* point_teacher_rgb,
-    float3 bg_color,
-    int m_pad,
-    cudaStream_t stream = nullptr
-) {
-    if (numRays <= 0) return;
-
-    constexpr int THREADS_PER_BLOCK = 256;
-    int blocks = (numRays + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-
-    #define LAUNCH_KERNEL(N) \
-        interpolateRenderRays<N><<<blocks, THREADS_PER_BLOCK, 0, stream>>>( \
-            numRays, raysDone, ray_offsets, num_steps, t_sorted, \
-            density_sigma, rgb_output, sigma_master, diffuse_master, \
-            features_master, student_frac, student_rows_out, student_sigma, \
-            student_weights, student_point_data, point_teacher_rgb, bg_color, m_pad \
-        )
-
-    switch (view_features) {
-        case 1: LAUNCH_KERNEL(1); break;
-        case 2: LAUNCH_KERNEL(2); break;
-        case 3: LAUNCH_KERNEL(3); break;
-        case 4: LAUNCH_KERNEL(4); break;
-        case 5: LAUNCH_KERNEL(5); break;
-        case 6: LAUNCH_KERNEL(6); break;
-        default:
-            std::cerr << "Error: VIEW_FEATURES = " << view_features << " is not supported." << std::endl;
-            throw std::runtime_error("Unsupported VIEW_FEATURES dimension.");
-    }
-
-    #undef LAUNCH_KERNEL
-}
 
 __global__ void compute_residual_and_loss_grad(
     int total_hits,
@@ -1211,6 +724,35 @@ __global__ void compute_residual_and_loss_grad(
     phi_chunk[idx * 3 + 0] = __float2half(2.0f * (cr - tr));
     phi_chunk[idx * 3 + 1] = __float2half(2.0f * (cg - tg));
     phi_chunk[idx * 3 + 2] = __float2half(2.0f * (cb - tb));
+}
+
+
+__global__ void compute_residual(
+    int padded_b_size,
+    int view_features,
+    int m_pad,
+    const half* __restrict__ student_point_data,
+    float* __restrict__ student_rgb_chunk
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= padded_b_size) return;
+
+    int data_offset = idx * (19 + view_features + m_pad);
+    float sr = __half2float(student_point_data[data_offset + 0]);
+    float sg = __half2float(student_point_data[data_offset + 1]);
+    float sb = __half2float(student_point_data[data_offset + 2]);
+    
+    float mr = student_rgb_chunk[idx * 3 + 0];
+    float mg = student_rgb_chunk[idx * 3 + 1];
+    float mb = student_rgb_chunk[idx * 3 + 2];
+    
+    float cr = fminf(fmaxf(sr + mr, 0.0f), 1.0f);
+    float cg = fminf(fmaxf(sg + mg, 0.0f), 1.0f);
+    float cb = fminf(fmaxf(sb + mb, 0.0f), 1.0f);
+    
+    student_rgb_chunk[idx * 3 + 0] = cr;
+    student_rgb_chunk[idx * 3 + 1] = cg;
+    student_rgb_chunk[idx * 3 + 2] = cb;
 }
 
 void launch_compute_residual_and_loss_grad(

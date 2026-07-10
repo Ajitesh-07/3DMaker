@@ -10,6 +10,7 @@
 #include "../TinyMLP/EmbeddingTable.h"
 #include "InstantNerf.h"
 #include "DeviceBuffer.h"
+#include "Timers.h"
 
 #define SPARSE_B 4
 
@@ -25,9 +26,10 @@ struct BakeOptions {
     int   fineTuneSteps       = 2000;     // joint-fit steps; 0 = structure + sigma only (census mode)
     float learningRate        = 1e-2f;    // EmbeddingTable row-Adagrad lr (all 7 channels)
     float mlpLearningRate     = 1e-3f;    // Adam lr for the shared deferred MLP g
-    int   fitRaysPerStep      = 1 << 13;  // rays marched per joint-fit step
     int   deferredHidden      = 32;
     int   deferredLayers      = 3;
+
+    bool isProfiling = false;
 };
 
 struct BakeDiagnostics {
@@ -73,6 +75,93 @@ struct BakedRenderingBuffer {
     DeviceBuffer<int> d_corner_rowids{0};
     DeviceBuffer<float> d_diffuse_grads{0};
     DeviceBuffer<float> d_feature_grads{0};
+};
+
+class BakedGPUStats {
+public:
+    MetricTracker processRaysTime;
+    MetricTracker densityInference;
+    MetricTracker teacherSHGather; 
+    MetricTracker colorInference;
+    MetricTracker interpolateRender;
+    MetricTracker studentSHGather;
+    MetricTracker deferredZeroGrad;
+    MetricTracker deferredFwd;
+    MetricTracker residualLossGrad;
+    MetricTracker deferredBwd;
+    MetricTracker gradsSum;
+    MetricTracker embeddingGrads;
+    MetricTracker embeddingTableStep;
+    MetricTracker mlpStep;
+
+    MetricTracker renderGetOffsets;
+
+    MetricTracker renderProcessRay;
+    MetricTracker renderInterpolateRays;
+    MetricTracker renderSHGather;
+    MetricTracker renderDeferredInference;
+    MetricTracker renderGetResidual;
+    MetricTracker renderAsyncCpy;
+
+    MetricGroup renderHotLoop;
+
+
+    int totalEvents = 0;
+    std::vector<PendingTimer> pendingTimers;
+
+    void init() {
+        renderHotLoop.add(renderProcessRay);
+        renderHotLoop.add(renderInterpolateRays);
+        renderHotLoop.add(renderSHGather);
+        renderHotLoop.add(renderDeferredInference);
+        renderHotLoop.add(renderGetResidual);
+        renderHotLoop.add(renderAsyncCpy);
+    }
+
+    void resolvePendingTimers() {
+        if (pendingTimers.empty()) return;
+        totalEvents = pendingTimers.size();
+        cudaEventSynchronize(pendingTimers.back().stop);
+
+        for (auto& timer : pendingTimers) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, timer.start, timer.stop);
+            timer.tracker->update(ms);
+
+            cudaEventDestroy(timer.start);
+            cudaEventDestroy(timer.stop);
+        }
+        pendingTimers.clear();
+    }
+
+    void reset() {
+        processRaysTime.reset();
+        densityInference.reset();
+        teacherSHGather.reset();
+        colorInference.reset();
+        interpolateRender.reset();
+        studentSHGather.reset();
+        deferredZeroGrad.reset();
+        deferredFwd.reset();
+        residualLossGrad.reset();
+        deferredBwd.reset();
+        gradsSum.reset();
+        embeddingGrads.reset();
+        embeddingTableStep.reset();
+        mlpStep.reset();
+
+        renderGetOffsets.reset();
+        renderProcessRay.reset();
+        renderInterpolateRays.reset();
+        renderSHGather.reset();
+        renderDeferredInference.reset();
+        renderGetResidual.reset();
+        renderAsyncCpy.reset();
+
+
+        pendingTimers.clear();
+        totalEvents = 0;
+    }
 };
 
 class BakedNerf {
@@ -121,6 +210,10 @@ public:
         float* d_rgb_out
     );
 
+
+    void resetStats();
+    void printStats();
+
     void save(const std::string& file);
     void load(const std::string& file);
 
@@ -155,6 +248,29 @@ private:
     NerfOptions         m_teacherOpts;
 
     BakedRenderingBuffer m_render_buffers;
+    BakedGPUStats m_profile_stats;
 
     bool m_baked = false;
+
+    template <typename F>
+    __forceinline__ void measure(
+        cudaStream_t stream, 
+        MetricTracker& tracker,
+        F&& func
+    ) {
+    if (!m_opts.isProfiling) {
+        func();
+        return;
+    } else {
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        cudaEventRecord(start, stream);
+        func();
+        cudaEventRecord(stop, stream);
+
+        m_profile_stats.pendingTimers.push_back({start, stop, &tracker});
+    }
+    }
 };
