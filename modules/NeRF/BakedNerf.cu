@@ -112,14 +112,14 @@ void BakedNerf::printStats() {
     printf("-------- RENDER STATS ----------- \n");
 
     printTracker("renderGetOffsets", m_profile_stats.renderGetOffsets, 0);
-    printGroup("renderHotLoop", m_profile_stats.renderHotLoop, 0);
-    printTracker("renderProcessRay", m_profile_stats.renderProcessRay, 1);
-    printTracker("renderInterpolateRays", m_profile_stats.renderInterpolateRays, 1);
-    printTracker("renderSHGather", m_profile_stats.renderSHGather, 1);
-    printTracker("renderDeferredInference", m_profile_stats.renderDeferredInference, 1);
+    // printGroup("renderHotLoop", m_profile_stats.renderHotLoop, 0);
+    printTracker("renderProcessRay", m_profile_stats.renderProcessRay, 0);
+    printTracker("renderInterpolateRays", m_profile_stats.renderInterpolateRays, 0);
+    printTracker("renderSHGather", m_profile_stats.renderSHGather, 0);
+    printTracker("renderDeferredInference", m_profile_stats.renderDeferredInference, 0);
 
-    printTracker("renderGetResidual", m_profile_stats.renderGetResidual, 1);
-    printTracker("renderAsyncCpy", m_profile_stats.renderAsyncCpy, 1);
+    printTracker("renderGetResidual", m_profile_stats.renderGetResidual, 0);
+    printTracker("renderAsyncCpy", m_profile_stats.renderAsyncCpy, 0);
 }
 
 void BakedNerf::diagonstic(InstantNerf& teacher) {
@@ -764,36 +764,12 @@ void BakedNerf::renderImage(
             m_render_buffers.d_fars_chunk.data()
         );
 
-        processBakedRaysHitData(
-            currentChunkRays,
-            chunk_o, chunk_d,
-            m_render_buffers.d_rays_d_inv_chunk.data(),
-            m_render_buffers.d_nears_chunk.data(),
-            m_render_buffers.d_fars_chunk.data(),
-            m_occupancyGrid.data(),
-            m_voxelMask.data(),
-            m_blockIdx.data(),
-            m_render_buffers.d_cellSlots.data(),
-            m_teacherOpts.gridResolution,
-            m_teacherOpts.aabbMin, m_teacherOpts.aabbMax,
-            m_teacherOpts.numCascades,
-            m_teacherOpts.levelsMipmap,
-            SPARSE_B,
-            m_render_buffers.d_num_steps.data(),
-            m_render_buffers.d_ray_offsets.data(),
-            m_render_buffers.d_block_sums.data(),
-            stream
-        );
+
         });
 
-        uint32_t raysDone = 0;
-        while (raysDone < currentChunkRays) {
-            uint32_t totalHits = 0;
-            uint32_t outBase = 0;
-
-            int crrRays = 0;
-            measure(stream, m_profile_stats.renderProcessRay, [&](){
-            crrRays = processBakedRaysHitPositions(
+        measure(stream, m_profile_stats.renderProcessRay, [&](){
+            launch_bakedRenderRaysFused(
+                m_opts.viewFeatures,
                 currentChunkRays,
                 chunk_o, chunk_d,
                 m_render_buffers.d_rays_d_inv_chunk.data(),
@@ -804,99 +780,45 @@ void BakedNerf::renderImage(
                 m_blockIdx.data(),
                 m_render_buffers.d_cellSlots.data(),
                 m_teacherOpts.gridResolution,
-                m_teacherOpts.aabbMin,
-                m_teacherOpts.aabbMax,
-                m_teacherOpts.numCascades,
-                m_teacherOpts.levelsMipmap,
-                SPARSE_B,
-                raysDone,
-                m_opts.jointFitBatch,
-                &totalHits,
-                &outBase,
-                m_render_buffers.d_num_steps.data(),
-                m_render_buffers.d_ray_offsets.data(),
-                m_render_buffers.d_teacher_points_out.data(),
-                m_render_buffers.d_student_rows_out.data(),
-                m_render_buffers.d_student_frac_out.data(),
-                m_render_buffers.d_ray_indices.data(),
-                m_render_buffers.d_active_rays_count.data(),
-                m_render_buffers.d_t_sorted.data(),
-                m_render_buffers.d_block_sums.data(),
-                stream
-            );
-            });
-
-            if (crrRays == 0) {
-                fprintf(stderr, "Error: Batch size is too small to fit even a single ray! Increase batchSize.\n");
-                return; // Or throw an exception to escape the infinite loop
-            }
-            uint32_t padded_crrRays = (crrRays + 15) & ~15;
-
-            measure(stream, m_profile_stats.renderInterpolateRays, [&](){
-            launch_interpolate_render_rays(
-                m_opts.viewFeatures,
-                crrRays,
-                outBase,
-                raysDone,
-                m_render_buffers.d_ray_offsets.data(),
-                m_render_buffers.d_num_steps.data() + raysDone,
-                m_render_buffers.d_t_sorted.data(),
-                m_render_buffers.d_density_sigma.data(),
-                nullptr,
+                m_teacherOpts.aabbMin, m_teacherOpts.aabbMax,
+                m_teacherOpts.numCascades, m_teacherOpts.levelsMipmap, SPARSE_B,
                 m_voxelSigma.data(),
-                m_voxelDiffuse->masterWeights(),
+                reinterpret_cast<const float3*>(m_voxelDiffuse->masterWeights()),
                 m_voxelFeatures->masterWeights(),
-                m_render_buffers.d_student_frac_out.data(),
-                m_render_buffers.d_student_rows_out.data(),
-                m_render_buffers.d_student_sigma.data(),
-                m_render_buffers.d_student_weights.data(),
-                m_render_buffers.d_student_point_data.data(),
-                nullptr,
                 m_teacherOpts.bgColor,
-                m_pad,
-                stream
-            );
-            });
-
-            measure(stream, m_profile_stats.renderSHGather, [&](){
-            launch_compute_SH_student_deferred(
-                chunk_d + raysDone,
                 m_render_buffers.d_student_point_data.data(),
-                m_opts.viewFeatures,
                 m_pad,
-                crrRays,
                 stream
             );
-            });
+        });
 
-            measure(stream, m_profile_stats.renderDeferredInference, [&](){
+        uint32_t padded_crrRays = (currentChunkRays + 15) & ~15;
+
+        measure(stream, m_profile_stats.renderDeferredInference, [&](){
             m_deferredMLP->inference(
                 m_render_buffers.d_student_point_data.data(), 
                 m_render_buffers.d_student_rgb_chunk.data(),
                 padded_crrRays,
                 stream
             );
-            });
+        });
 
-            int gsRay = (crrRays + BS - 1) / BS;
-            measure(stream, m_profile_stats.renderGetResidual, [&](){
+        int gsRay = (currentChunkRays + BS - 1) / BS;
+        measure(stream, m_profile_stats.renderGetResidual, [&](){
             compute_residual<<<gsRay, BS, 0, stream>>>(
-                crrRays,
+                currentChunkRays,
                 m_opts.viewFeatures,
                 m_pad,
                 m_render_buffers.d_student_point_data.data(),
                 m_render_buffers.d_student_rgb_chunk.data() 
             );
-            });
+        });
 
-            measure(stream, m_profile_stats.renderAsyncCpy, [&](){
+        measure(stream, m_profile_stats.renderAsyncCpy, [&](){
             if(d_rgb_out != nullptr) {
-                cudaMemcpyAsync(d_rgb_out + (ray_offset + raysDone) * 3, m_render_buffers.d_student_rgb_chunk.data(), crrRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(d_rgb_out + ray_offset * 3, m_render_buffers.d_student_rgb_chunk.data(), currentChunkRays * 3 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
             }
-            });
-
-            raysDone += crrRays;
-        }
+        });
     }
 
     if (m_opts.isProfiling) {

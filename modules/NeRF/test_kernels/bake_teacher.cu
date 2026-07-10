@@ -5,6 +5,76 @@
 #include "../DataLoader.h"
 #include "../InstantNerf.h"
 #include "../BakedNerf.h"
+#include <filesystem>
+#include <cmath>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../../../third_party/stb_image_write.h"
+
+static void saveImagePNG(const std::vector<float>& rgb, int width, int height, const std::string& path) {
+    if (width <= 0 || height <= 0) return;
+    std::vector<uint8_t> bytes(width * height * 3);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        float v = std::min(1.0f, std::max(0.0f, rgb[i]));
+        bytes[i] = (uint8_t)(v * 255.0f + 0.5f);
+    }
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+    stbi_write_png(path.c_str(), width, height, 3, bytes.data(), width * 3);
+}
+
+static std::string formatETA(float seconds) {
+    if (!(seconds >= 0.0f)) return "--:--";
+    int t = (int)(seconds + 0.5f);
+    int h = t / 3600; t %= 3600;
+    int m = t / 60;   t %= 60;
+    char buf[32];
+    if (h > 0) snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, t);
+    else       snprintf(buf, sizeof(buf), "%02d:%02d", m, t);
+    return buf;
+}
+
+static void renderBakingBar(int step, int targetSteps, double emaMsPerStep) {
+    const int kWidth = 28;
+    float frac = (targetSteps > 0) ? (float)step / (float)targetSteps : 0.0f;
+    frac = std::min(1.0f, std::max(0.0f, frac));
+    int filled = (int)(frac * kWidth + 0.5f);
+    std::string bar(filled, '#');
+    bar.append(kWidth - filled, ' ');
+    
+    float etaSeconds = (float)(emaMsPerStep * std::max(0, targetSteps - step) / 1000.0);
+    printf("\r[%s] %d/%d steps | %.2f ms/step | ETA %s   ",
+           bar.c_str(), step, targetSteps, emaMsPerStep,
+           formatETA(etaSeconds).c_str());
+    fflush(stdout);
+}
+
+void saveStudentImage(BakedNerf& student, DataLoader& dataloader, int img_idx, const std::string& prefix, cudaStream_t stream) {
+    int width = dataloader.getWidth();
+    int height = dataloader.getHeight();
+    int pixels = width * height;
+    
+    std::vector<float> img_student(pixels * 3);
+    float* d_student_rgb;
+    cudaMalloc(&d_student_rgb, pixels * 3 * sizeof(float));
+    
+    int tile = 256 * 1024;
+    float3 bg = make_float3(1.0f, 1.0f, 1.0f);
+    
+    for (int off = 0; off < pixels; off += tile) {
+        int count = std::min(tile, pixels - off);
+        dataloader.fetchRayChunk(img_idx * pixels + off, count, 0, bg, stream, true, 0);
+        
+        student.renderImage(dataloader.getChunkRaysO(), dataloader.getChunkRaysD(), count, d_student_rgb + off * 3, stream);
+    }
+    cudaStreamSynchronize(stream);
+    
+    cudaMemcpy(img_student.data(), d_student_rgb, pixels * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    std::cout << "[" << prefix << "] Saved student image." << std::endl;
+    saveImagePNG(img_student, width, height, "../benchmarks/frames_baked/" + prefix + "_student.png");
+    
+    cudaFree(d_student_rgb);
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -35,7 +105,8 @@ int main(int argc, char** argv) {
     std::cout << "Initializing BakedNerf..." << std::endl;
     const NerfOptions& topts = teacher.options();
     BakeOptions opts;
-    opts.isProfiling = true;
+    opts.isProfiling = false;
+    opts.mlpLearningRate = 1e-2;
     opts.jointFitBatch = batchSize; // Match dataloader chunk
     opts.voxelGridResolution = make_uint3(topts.gridResolution.x * SPARSE_B, topts.gridResolution.y * SPARSE_B, topts.gridResolution.z * SPARSE_B);
     
@@ -57,20 +128,26 @@ int main(int argc, char** argv) {
     std::cout << "Bake Geometry Time: " << diff_bake.count() << " seconds" << std::endl;
     std::cout << "Baked Blocks: " << bakedNerf.numBlocks() << std::endl;
     std::cout << "Baked Voxels: " << bakedNerf.numVoxels() << std::endl;
+
+    std::cout << "\nSaving Student Image (Post-Geometry Bake)..." << std::endl;
+    saveStudentImage(bakedNerf, dataloader, 0, "post_geometry", stream);
     
     // 5. Joint Fit (Distillation Phase 2)
-    int testSteps = 100;
+    int testSteps = 1000;
     std::cout << "Running Joint Fit for " << testSteps << " steps..." << std::endl;
     int trainSteps = 0;
     
     auto start_fit = std::chrono::high_resolution_clock::now();
+    double emaMsPerStep = 0.0;
     
     int i = 0;
     while(trainSteps < testSteps) {
+        auto t0 = std::chrono::high_resolution_clock::now();
         float3 bg = make_float3(0.0f, 0.0f, 0.0f);
         int cursor = (i * rayChunkSize) % std::max((uint32_t)1, dataloader.getTotalRays());
         dataloader.fetchRayChunk(cursor, rayChunkSize, 42 + i, bg, stream, false, 0);
         
+        int prevSteps = trainSteps;
         bakedNerf.jointFit(
             teacher,
             dataloader.getChunkRaysO(),
@@ -79,14 +156,29 @@ int main(int argc, char** argv) {
             trainSteps,
             stream
         );
+        cudaStreamSynchronize(stream);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        
+        int stepsDone = trainSteps - prevSteps;
+        if (stepsDone > 0) {
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double msPerStep = ms / stepsDone;
+            emaMsPerStep = (emaMsPerStep > 0.0) ? (0.70 * emaMsPerStep + 0.30 * msPerStep) : msPerStep;
+        }
+        
+        renderBakingBar(trainSteps, testSteps, emaMsPerStep);
         i++;
     }
+    std::cout << std::endl;
     cudaStreamSynchronize(stream);
     
     auto end_fit = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff_fit = end_fit - start_fit;
     std::cout << "Joint Fit Time (" << trainSteps << " steps): " << diff_fit.count() << " seconds" << std::endl;
     std::cout << "Average time per step: " << (diff_fit.count() / trainSteps) * 1000.0 << " ms" << std::endl;
+
+    std::cout << "\nSaving Student Image (Post-Joint Fit)..." << std::endl;
+    // saveStudentImage(bakedNerf, dataloader, 0, "post_jointfit", stream);
     
     // 6. Benchmark renderImage
     std::cout << "\nBenchmarking renderImage (800x800 = 640000 rays)..." << std::endl;
@@ -110,6 +202,8 @@ int main(int argc, char** argv) {
     // Warmup
     bakedNerf.renderImage(d_test_rays_o, d_test_rays_d, render_rays, d_rgb_out, stream);
     cudaStreamSynchronize(stream);
+
+    bakedNerf.resetStats();
 
     // Timing
     int render_iters = 1;

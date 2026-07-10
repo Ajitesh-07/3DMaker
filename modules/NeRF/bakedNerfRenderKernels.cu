@@ -366,7 +366,9 @@ int processBakedRaysLinear(
         d_t_sorted, nullptr);
 
     return (int)raysFit;
-}template <int VIEW_FEATURES>
+}
+
+template <int VIEW_FEATURES>
 __global__ void bakedRenderRaysFused(
     uint32_t num_rays,
     const float3* __restrict__ rays_o,
@@ -413,10 +415,18 @@ __global__ void bakedRenderRaysFused(
     #pragma unroll
     for (int j = 0; j < VIEW_FEATURES; j++) sf_acc[j] = 0.0f;
 
+    bool has_pending = false;
+    float pending_t_mid = 0.0f;
+    float pending_sigma = 0.0f;
+    float3 pending_color = make_float3(0.0f, 0.0f, 0.0f);
+    float pending_features[VIEW_FEATURES];
+    #pragma unroll
+    for (int j = 0; j < VIEW_FEATURES; j++) pending_features[j] = 0.0f;
+
     while (current_t < t_max_ray && T > 1e-4f) {
         float3 cp = make_float3(o.x + current_t * d.x, o.y + current_t * d.y, o.z + current_t * d.z);
         int cascade = bake_get_cascade(cp, aabbMin, aabbMax, numCascades);
-        float cs = exp2f((float)cascade);
+        float cs = (float)(1 << cascade);
 
         float3 caMin = make_float3(aabbMin.x * cs, aabbMin.y * cs, aabbMin.z * cs);
         float3 caExt = make_float3(aabb_extent.x * cs, aabb_extent.y * cs, aabb_extent.z * cs);
@@ -472,7 +482,6 @@ __global__ void bakedRenderRaysFused(
                     int cubeIdx = si + sj * subRes + sk * subRes * subRes;
                     if ((subMask >> cubeIdx) & 1u) {
                         float t_mid = 0.5f * (sub_t + seg_exit);
-                        float dt = seg_exit - sub_t;
                         
                         float3 mp = make_float3(o.x + t_mid * d.x, o.y + t_mid * d.y, o.z + t_mid * d.z);
                         
@@ -499,44 +508,67 @@ __global__ void bakedRenderRaysFused(
                         float s0  = s00 + fy * (s10 - s00);
                         float s1  = s01 + fy * (s11 - s01);
                         float sigma = s0 + fz * (s1 - s0);
+                        float s_sigma_safe = fmaxf(0.0f, sigma);
 
-                        if (sigma > 0.0f) {
-                            float alpha = 1.0f - expf(-sigma * dt);
+                        if (has_pending) {
+                            float delta_t = t_mid - pending_t_mid;
+                            float alpha = 1.0f - expf(-pending_sigma * delta_t);
                             float weight = alpha * T;
 
-                            float3 c[8];
+                            r_c += weight * pending_color.x;
+                            g_c += weight * pending_color.y;
+                            b_c += weight * pending_color.z;
+
                             #pragma unroll
-                            for(int k=0; k<8; ++k) c[k] = row[k] == -1 ? make_float3(0,0,0) : diffuse_master[row[k]];
-                            
-                            float3 c00 = lerp_float3(c[0], c[1], fx);
-                            float3 c10 = lerp_float3(c[2], c[3], fx);
-                            float3 c01 = lerp_float3(c[4], c[5], fx);
-                            float3 c11 = lerp_float3(c[6], c[7], fx);
-                            float3 cx0 = lerp_float3(c00, c10, fy);
-                            float3 cx1 = lerp_float3(c01, c11, fy);
-                            float3 color = lerp_float3(cx0, cx1, fz);
-
-                            r_c += weight * color.x;
-                            g_c += weight * color.y;
-                            b_c += weight * color.z;
-
-                            float f[8];
                             for (int j = 0; j < VIEW_FEATURES; j++) {
-                                #pragma unroll
-                                for(int k=0; k<8; ++k) f[k] = row[k] == -1 ? 0.0f : features_master[row[k] * VIEW_FEATURES + j];
-                                
-                                float f00 = f[0] + fx * (f[1] - f[0]);
-                                float f10 = f[2] + fx * (f[3] - f[2]);
-                                float f01 = f[4] + fx * (f[5] - f[4]);
-                                float f11 = f[6] + fx * (f[7] - f[6]);
-                                float fx0 = f00 + fy * (f10 - f00);
-                                float fx1 = f01 + fy * (f11 - f01);
-                                float feat = fx0 + fz * (fx1 - fx0);
-                                sf_acc[j] += weight * feat;
+                                sf_acc[j] += weight * pending_features[j];
                             }
                             
                             T *= (1.0f - alpha);
+                            if (T <= 1e-4f) break;
                         }
+
+                        float3 c[8];
+                        #pragma unroll
+                        for(int k=0; k<8; ++k) c[k] = row[k] == -1 ? make_float3(0,0,0) : diffuse_master[row[k]];
+                        
+                        float3 c00 = lerp_float3(c[0], c[1], fx);
+                        float3 c10 = lerp_float3(c[2], c[3], fx);
+                        float3 c01 = lerp_float3(c[4], c[5], fx);
+                        float3 c11 = lerp_float3(c[6], c[7], fx);
+                        float3 cx0 = lerp_float3(c00, c10, fy);
+                        float3 cx1 = lerp_float3(c01, c11, fy);
+                        
+                        pending_color = lerp_float3(cx0, cx1, fz);
+                        pending_t_mid = t_mid;
+                        pending_sigma = s_sigma_safe;
+
+                        float w[8];
+                        w[0] = (1.0f - fx) * (1.0f - fy) * (1.0f - fz);
+                        w[1] = fx * (1.0f - fy) * (1.0f - fz);
+                        w[2] = (1.0f - fx) * fy * (1.0f - fz);
+                        w[3] = fx * fy * (1.0f - fz);
+                        w[4] = (1.0f - fx) * (1.0f - fy) * fz;
+                        w[5] = fx * (1.0f - fy) * fz;
+                        w[6] = (1.0f - fx) * fy * fz;
+                        w[7] = fx * fy * fz;
+
+                        #pragma unroll
+                        for (int j = 0; j < VIEW_FEATURES; j++) pending_features[j] = 0.0f;
+
+                        #pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            if (row[k] != -1) {
+                                float wk = w[k];
+                                int base_idx = row[k] * VIEW_FEATURES;
+                                #pragma unroll
+                                for (int j = 0; j < VIEW_FEATURES; j++) {
+                                    pending_features[j] += wk * features_master[base_idx + j];
+                                }
+                            }
+                        }
+
+                        has_pending = true;
                     }
                     sub_t = fmaxf(sub_t + 1e-6f, sub_next + 1e-6f);
                 }
@@ -544,6 +576,22 @@ __global__ void bakedRenderRaysFused(
         }
         current_t = fmaxf(current_t + 1e-5f, next_t + 1e-6f);
         current_level = levelsMipmap - 1;
+    }
+
+    if (has_pending && T > 1e-4f) {
+        float delta_t = 1e-3f;
+        float alpha = 1.0f - expf(-pending_sigma * delta_t);
+        float weight = alpha * T;
+
+        r_c += weight * pending_color.x;
+        g_c += weight * pending_color.y;
+        b_c += weight * pending_color.z;
+
+        #pragma unroll
+        for (int j = 0; j < VIEW_FEATURES; j++) {
+            sf_acc[j] += weight * pending_features[j];
+        }
+        T *= (1.0f - alpha);
     }
 
     r_c += T * bg_color.x;

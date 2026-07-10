@@ -79,6 +79,14 @@ target_compile_options(NeRFModule PRIVATE
 # ── Optional test / benchmark executable ─────────────────────────────────
 option(NERF_BUILD_TESTS "Build NeRF kernel tests and benchmarks" OFF)
 if(NERF_BUILD_TESTS)
+    add_executable(test_fusedbakerender test_kernels/test_fusedbakerender.cu)
+    set_target_properties(test_fusedbakerender PROPERTIES CUDA_ARCHITECTURES "80;89")
+    if(MSVC)
+        target_compile_options(test_fusedbakerender PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler /Zc:preprocessor>)
+        target_compile_definitions(test_fusedbakerender PRIVATE CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING)
+    endif()
+    target_link_libraries(test_fusedbakerender PRIVATE NeRFModule)
+
     add_executable(test_processrays test_kernels/testProcessRays.cu)
     set_target_properties(test_processrays PROPERTIES
         CUDA_ARCHITECTURES "80;89"
