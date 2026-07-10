@@ -448,7 +448,10 @@ __global__ void bakedRenderRaysFused(
             caMin.x + (vi.x + (step.x > 0 ? 1.0f : 0.0f)) * vsz.x,
             caMin.y + (vi.y + (step.y > 0 ? 1.0f : 0.0f)) * vsz.y,
             caMin.z + (vi.z + (step.z > 0 ? 1.0f : 0.0f)) * vsz.z);
-        float3 tmax = make_float3((nb.x - o.x) * d_inv.x, (nb.y - o.y) * d_inv.y, (nb.z - o.z) * d_inv.z);
+        float3 tmax;
+        tmax.x = (fabsf(d.x) < 1e-8f) ? 1e38f : (nb.x - o.x) * d_inv.x;
+        tmax.y = (fabsf(d.y) < 1e-8f) ? 1e38f : (nb.y - o.y) * d_inv.y;
+        tmax.z = (fabsf(d.z) < 1e-8f) ? 1e38f : (nb.z - o.z) * d_inv.z;
         float next_t = fminf(fminf(tmax.x, tmax.y), tmax.z);
 
         if (occ) {
@@ -574,7 +577,8 @@ __global__ void bakedRenderRaysFused(
                 }
             }
         }
-        current_t = fmaxf(current_t + 1e-5f, next_t + 1e-6f);
+        float t_eps = fmaxf(1e-5f, current_t * 1e-6f); 
+        current_t = fmaxf(current_t + t_eps, next_t + 1e-6f);
         current_level = levelsMipmap - 1;
     }
 
