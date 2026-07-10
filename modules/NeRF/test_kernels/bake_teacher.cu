@@ -57,15 +57,26 @@ void saveStudentImage(BakedNerf& student, DataLoader& dataloader, int img_idx, c
     float* d_student_rgb;
     cudaMalloc(&d_student_rgb, pixels * 3 * sizeof(float));
     
-    int tile = 256 * 1024;
+    int tile = dataloader.getRayChunkSize();
     float3 bg = make_float3(1.0f, 1.0f, 1.0f);
+    
+    // Allocate buffers for all rays of the image
+    float3* d_all_rays_o;
+    float3* d_all_rays_d;
+    cudaMalloc(&d_all_rays_o, pixels * sizeof(float3));
+    cudaMalloc(&d_all_rays_d, pixels * sizeof(float3));
     
     for (int off = 0; off < pixels; off += tile) {
         int count = std::min(tile, pixels - off);
         dataloader.fetchRayChunk(img_idx * pixels + off, count, 0, bg, stream, true, 0);
         
-        student.renderImage(dataloader.getChunkRaysO(), dataloader.getChunkRaysD(), count, d_student_rgb + off * 3, stream);
+        // Copy fetched chunk into the full image buffers
+        cudaMemcpyAsync(d_all_rays_o + off, dataloader.getChunkRaysO(), count * sizeof(float3), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(d_all_rays_d + off, dataloader.getChunkRaysD(), count * sizeof(float3), cudaMemcpyDeviceToDevice, stream);
     }
+    
+    // Call renderImage exactly once on the full image rays
+    student.renderImage(d_all_rays_o, d_all_rays_d, pixels, d_student_rgb, stream);
     cudaStreamSynchronize(stream);
     
     cudaMemcpy(img_student.data(), d_student_rgb, pixels * 3 * sizeof(float), cudaMemcpyDeviceToHost);
@@ -74,6 +85,8 @@ void saveStudentImage(BakedNerf& student, DataLoader& dataloader, int img_idx, c
     saveImagePNG(img_student, width, height, "../benchmarks/frames_baked/" + prefix + "_student.png");
     
     cudaFree(d_student_rgb);
+    cudaFree(d_all_rays_o);
+    cudaFree(d_all_rays_d);
 }
 
 int main(int argc, char** argv) {

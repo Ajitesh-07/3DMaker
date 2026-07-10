@@ -41,6 +41,7 @@ public:
     uint32_t getTotalRays() const { return total_rays; }
     int getWidth() const { return width; }
     int getHeight() const { return height; }
+    uint32_t getRayChunkSize() const { return m_ray_chunk_size; }
 
     void getSceneOrientation(float3& center, float3& up) const {
         if (frames.empty()) {
