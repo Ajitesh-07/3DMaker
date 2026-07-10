@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
     saveStudentImage(bakedNerf, dataloader, 0, "post_geometry", stream);
     
     // 5. Joint Fit (Distillation Phase 2)
-    int testSteps = 1000;
+    int testSteps = 10000;
     std::cout << "Running Joint Fit for " << testSteps << " steps..." << std::endl;
     int trainSteps = 0;
     
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     std::cout << "Average time per step: " << (diff_fit.count() / trainSteps) * 1000.0 << " ms" << std::endl;
 
     std::cout << "\nSaving Student Image (Post-Joint Fit)..." << std::endl;
-    // saveStudentImage(bakedNerf, dataloader, 0, "post_jointfit", stream);
+    saveStudentImage(bakedNerf, dataloader, 0, "post_jointfit", stream);
     
     // 6. Benchmark renderImage
     std::cout << "\nBenchmarking renderImage (800x800 = 640000 rays)..." << std::endl;
