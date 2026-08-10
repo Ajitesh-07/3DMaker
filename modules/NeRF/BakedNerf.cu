@@ -595,12 +595,13 @@ void BakedNerf::jointFit(
         }
 
         uint32_t padded_b_size = (totalHits + 15) & ~15;
+        const int gsHits = (totalHits + BS - 1) / BS;
         measure(stream, m_profile_stats.densityInference, [&](){
         teacher.m_densityMLP->inference(m_render_buffers.d_teacher_points_out.data(), m_render_buffers.d_density_out.data(), padded_b_size, stream);
         });
 
         measure(stream, m_profile_stats.teacherSHGather, [&](){
-        baked_compute_SH_gather<<<gs, BS, 0, stream>>>(
+        baked_compute_SH_gather<<<gsHits, BS, 0, stream>>>(
                 chunk_d, m_render_buffers.d_ray_indices.data(), 
                 0, totalHits, m_teacherOpts.densityBias,
                 m_render_buffers.d_density_out.data(), 
@@ -645,7 +646,7 @@ void BakedNerf::jointFit(
 
 
         measure(stream, m_profile_stats.studentSHGather, [&](){
-        compute_SH_student_gather<<<gs, BS, 0, stream>>>(
+        compute_SH_student_gather<<<gsHits, BS, 0, stream>>>(
             chunk_d,
             m_render_buffers.d_ray_indices.data(),
             m_render_buffers.d_student_point_data.data(),

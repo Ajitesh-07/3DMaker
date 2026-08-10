@@ -27,7 +27,7 @@ struct EmbeddingTableOption {
     int num_features;
     const float* lr;      // host pointer, one lr per feature; copied to device in the ctor
     float eps = 1e-8f;
-    float priorS = 2.0f;  // warm-start S for GN_NORM (unused by ROW_ADAGRAD)
+    float priorS = 0.0f;  // warm-start S for GN_NORM (unused by ROW_ADAGRAD)
     OP_TYPE op_type = ROW_ADAGRAD;
 };
 

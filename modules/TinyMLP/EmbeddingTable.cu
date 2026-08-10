@@ -9,6 +9,13 @@ __global__ void fillSequential(int* d_buffer, int n) {
     d_buffer[idx] = idx;
 }
 
+__global__ void fillFloat(float* d_buffer, size_t n, float value) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    d_buffer[idx] = value;
+}
+
 template <int NUM_FEATURES>
 __global__ void reduceGradsByRun(
     const int*   __restrict__ d_runOffsets,
@@ -94,7 +101,10 @@ EmbeddingTable::EmbeddingTable(const EmbeddingTableOption& opt, int batchSize) {
     CUDA_CHECK(cudaMalloc(&d_rowMeanMoment, sizeof(float) * rows));
     CUDA_CHECK(cudaMalloc(&d_lr,            sizeof(float) * F));
     CUDA_CHECK(cudaMemset(d_masterWeights, 0, sizeof(float) * rows * F));
-    CUDA_CHECK(cudaMemset(d_rowMeanMoment, m_opt.priorS, sizeof(float) * rows));
+    constexpr int kFillThreads = 256;
+    const int fillBlocks = (int)((rows + kFillThreads - 1) / kFillThreads);
+    fillFloat<<<fillBlocks, kFillThreads>>>(d_rowMeanMoment, rows, m_opt.priorS);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpy(d_lr, opt.lr, sizeof(float) * F, cudaMemcpyHostToDevice));
     m_opt.lr = nullptr;
 
