@@ -280,7 +280,10 @@ void INerfTrainer::save(const std::string& path) {
 }
 
 void INerfTrainer::load(const std::string& path) {
-    buildModel();
+    // InstantNerf::load() reads the options from the file and runs init() itself, so start from a
+    // fresh object: buildModel() + load() would init twice and leak the first pair of MLPs.
+    delete m_nerf;
+    m_nerf = new InstantNerf();
     m_nerf->load(path);
 
     std::ifstream in(path, std::ios::binary | std::ios::ate);

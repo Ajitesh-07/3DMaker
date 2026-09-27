@@ -1351,10 +1351,14 @@ void InstantNerf::load(const std::string& filename, MemoryMode memMode, int targ
 
     NerfOptions loadedOpts;
     in.read(reinterpret_cast<char*>(&loadedOpts), sizeof(NerfOptions));
-    if(memMode == TRAINING) {
-        loadedOpts.batchSize = targetBatchSize;
-    } else {
-        loadedOpts.renderBatchSize = targetBatchSize;
+    // Override the saved batch size only when the caller asks for one; the default (-1) used to
+    // be written straight into batchSize and made init() try to allocate ~2^64 bytes.
+    if (targetBatchSize > 0) {
+        if (memMode == TRAINING) {
+            loadedOpts.batchSize = targetBatchSize;
+        } else {
+            loadedOpts.renderBatchSize = targetBatchSize;
+        }
     }
     init(loadedOpts, memMode);
     

@@ -795,14 +795,16 @@ void BakedNerf::renderImage(
 
         uint32_t padded_crrRays = (currentChunkRays + 15) & ~15;
 
-        measure(stream, m_profile_stats.renderDeferredInference, [&](){
-            m_deferredMLP->inference(
-                m_render_buffers.d_student_point_data.data(), 
-                m_render_buffers.d_student_rgb_chunk.data(),
-                padded_crrRays,
-                stream
-            );
-        });
+        // measure(stream, m_profile_stats.renderDeferredInference, [&](){
+        //     m_deferredMLP->inference(
+        //         m_render_buffers.d_student_point_data.data(), 
+        //         m_render_buffers.d_student_rgb_chunk.data(),
+        //         padded_crrRays,
+        //         stream
+        //     );
+        // });
+
+        m_render_buffers.d_student_rgb_chunk.fill(0);
 
         int gsRay = (currentChunkRays + BS - 1) / BS;
         measure(stream, m_profile_stats.renderGetResidual, [&](){

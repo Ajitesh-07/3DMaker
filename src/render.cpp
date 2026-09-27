@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
     InstantNerf nerf;
     
     std::cout << "Loading NeRF model: " << model_path << std::endl;
-    nerf.load(model_path);
+    nerf.load(model_path, INFERENCE);   // viewer never trains: skip gradient/Adam buffers
     nerf.setMemoryMode(INFERENCE);
     nerf.setBgColor(make_float3(1.0f, 1.0f, 1.0f));
     nerf.setProfiling(false);

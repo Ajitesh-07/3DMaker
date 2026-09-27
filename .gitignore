@@ -48,3 +48,6 @@ modules/TinyMLP/build/
 modules/NeRF/benchmarks/
 modules/NeRF/results/
 modules/NeRF/build/
+
+# TinyMLP vs tiny-cuda-nn comparison (clone locally, see compare_tcnn/CMakeLists.txt)
+compare_tcnn/tiny-cuda-nn/
