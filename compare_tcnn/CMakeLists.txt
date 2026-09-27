@@ -31,6 +31,8 @@ add_executable(bench_tcnn bench_tcnn.cu)
 set_target_properties(bench_tcnn PROPERTIES CUDA_ARCHITECTURES "${TCNN_CUDA_ARCHITECTURES}")
 # tiny-cuda-nn exports its includes/definitions/nvcc flags PUBLIC; only TinyMLP's dir is added.
 target_include_directories(bench_tcnn PRIVATE ../modules/TinyMLP)
-target_compile_options(bench_tcnn PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3 -Xcompiler=/Zc:preprocessor>)
+target_compile_options(bench_tcnn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+if(MSVC)
+    target_compile_options(bench_tcnn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
 target_link_libraries(bench_tcnn PRIVATE tiny-cuda-nn TinyMLP)

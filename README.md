@@ -1,374 +1,506 @@
+<div align="center">
+
 # 3DMaker
 
-**3DMaker** is an end-to-end Neural Radiance Field (NeRF) engine written **from scratch in C++ and
-CUDA** — no PyTorch, no TensorFlow, no tiny-cuda-nn. Point it at an `.mp4` or a folder of photos and
-it runs the full pipeline — structure-from-motion, neural training, and real-time rendering — to turn
-a casual capture into an explorable 3D scene.
+**Phone video → explorable 3D scene, with a NeRF engine written from scratch in C++/CUDA.**
 
-Architecturally it is an **Instant-NGP-class** system: a custom multi-resolution hash grid, a pair of
-fully-fused **tensor-core MLPs**, and a **hit-centric DDA raymarcher** over a hierarchical occupancy
-grid. The neural core (`TinyMLP`) is framework-free and fast enough to train scenes on a single
-consumer GPU in seconds.
+No PyTorch, no TensorFlow, no tiny-cuda-nn: the fused tensor-core MLPs, the hash grid, the ray marcher
+and the optimizer are all hand-written.
 
-> **Scope (honest):** real-world **unbounded / 360° captures are now first-class** — mip-NeRF-360
-> scene contraction in the hash encoding, metric occupancy cascades, distortion regularization, and
-> depth priors together produce very good quality on casual phone captures, not just turntable
-> objects. The active roadmap is **real-time rendering via a sparse-voxel bake** (`BakedNerf`, in
-> progress) and clean mesh→FBX export (`ROADMAP.md`, `docs/`).
+![CUDA](https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-76B900?logo=nvidia&logoColor=white)
+![C++](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux*-0078D6)
+![Held-out PSNR](https://img.shields.io/badge/playroom%20held--out%20PSNR-27.8%20dB-8A2BE2)
+![Train time](https://img.shields.io/badge/train-5%E2%80%938%20min%20on%20a%20laptop%20RTX%204060-orange)
 
-> **Headline:** an indoor scene trains in **under 4 minutes** using **under 2 GB of VRAM** on a
-> **laptop RTX 4060** — with zero deep-learning frameworks, the whole stack hand-written in CUDA/C++.
+![Held-out view: photo vs 3DMaker render](media/readme/playroom_heldout.jpg)
 
----
+<sub>Deep Blending "playroom": a camera the model <b>never trained on</b>. Left: real photo. Right: 3DMaker render.
+Stock settings, 8 min of training on a laptop RTX 4060.</sub>
 
-## 📑 Table of Contents
-
-- [Pipeline at a glance](#-pipeline-at-a-glance)
-- [Results](#-results)
-- [Quick start](#-quick-start)
-- [Repository layout](#-repository-layout)
-- [Technical achievements](#-technical-achievements)
-  - [TinyMLP — the math engine](#1-tinymlp--the-math-engine)
-  - [NeRF engine](#2-nerf-engine)
-  - [Preprocessing & tooling](#3-preprocessing--tooling)
-  - [Apps](#4-apps)
-- [Requirements](#-requirements)
-- [Building](#-building)
-- [Tests & benchmarks](#-tests--benchmarks)
-- [Status & roadmap](#-status--roadmap)
+</div>
 
 ---
 
-## 🔭 Pipeline at a glance
+## At a glance
 
-```
- video.mp4 / images/        scripts/colmap2nerf.py            modules/NeRF (INerfTrainer)
- ──────────────────►  FFmpeg ─► COLMAP SfM ─► transforms  ─►  hash grid + occupancy grid
-                      (frames)  (poses+points)  _train.json     + tensor-core MLPs (train)
-                                                                          │
-                                          ┌───────────────────────────────┤
-                                          ▼                               ▼
-                                   model.inerf  ──►  3DViewer.exe   nerf_360.mp4 + frames/
-                                  (weights + scene)   (interactive)   (showcase render)
-```
+All numbers below were measured on a **laptop RTX 4060 (8 GB, 115 W)** with this repo's stock settings.
+Reproduce them with [`scripts/e2e_check.py`](#measure-it-yourself).
 
-Every stage is driven by **`3DMaker.exe`** — you only supply the capture.
-
----
-
-## 📊 Results
-
-The point of building the engine from scratch isn't just that it works — it's that it's **lean enough
-to run on a laptop**. Reference numbers on a **consumer mobile RTX 4060 (8 GB, 115 W laptop GPU)**:
-
-| Metric | Result |
+| | Result |
 |---|---|
-| **Train time** | **< 4 minutes** for an indoor scene (full convergence) |
-| **Peak VRAM** | **< 2 GB** during training |
-| **Per-step latency** | ~10 ms/step baseline (falls as the occupancy grid prunes empty space) |
-| **Hash-grid throughput** | 100M+ multi-resolution evaluations/sec |
-| **Dependencies** | **none** — no PyTorch / TensorFlow / tiny-cuda-nn; pure CUDA + C++ |
-
-**Why those numbers are notable:**
-
-- **From scratch.** Every kernel — the fused tensor-core MLP, the hash-grid encode/backward, fused
-  Adam, the DDA raymarcher — is hand-written. There is **no deep-learning framework anywhere** in the
-  training or rendering path.
-- **Fits a laptop.** The **hit-centric compaction** pipeline (only active samples are materialized)
-  plus FP16 tensor-core math keeps peak VRAM **under 2 GB**, so it trains on an 8 GB mobile GPU with
-  room to spare — where framework-based NeRFs typically ask for 6–24 GB.
-- **Minutes, not hours.** Fully-fused single-launch MLPs, occupancy-grid empty-space skipping, and
-  Morton-ordered cache-coherent lookups bring a real indoor capture to convergence in **single-digit
-  minutes** on hardware most people already own.
-
-> Times scale with capture size, resolution, and `--steps`; the figures above are a representative
-> indoor scene at default settings. Reproduce with `3DMaker.exe train --data <scene> --validate`.
+| **Indoor quality**: Deep Blending *playroom*, 29 held-out views | **27.8 dB PSNR** stock, **28.1 dB** with `fit_room.py` (Instant-NGP: 19.5–21.7 dB; 3DGS-7K: 29.25 dB) |
+| **Training time** | **5 min** at 30k steps (−0.06 to −0.15 dB) · **8 min 14 s** at the default 50k (~9.5 ms/step) |
+| **End to end**: 225 raw photos → COLMAP → trained model | **~9 min** at 30k steps · **11 min 56 s** at 50k (225 / 225 images registered) |
+| **Peak GPU memory while training** | **~1.0 GB** (whole GPU, incl. CUDA context) |
+| **Hash-grid + MLP throughput** (inference, hidden 64) | **~300 M points/s** |
+| **vs NVIDIA tiny-cuda-nn**, same GPU, same harness | MLP inference **1.7× faster**, MLP backward **1.4× faster**, hash-grid training 0.75× ([details](compare_tcnn/README.md)) |
+| **Native viewer** | 4–12 FPS at 800×800 (full MLP ray marching per pixel) |
 
 ---
 
-## 🚀 Quick start
+## Contents
 
-### 1. Build
+- [Quick start: Windows](#quick-start-windows)
+- [Quick start: Linux](#quick-start-linux)
+- [Try it on the playroom dataset](#try-it-on-the-playroom-dataset)
+- [Train on your own video or photos](#train-on-your-own-video-or-photos)
+- [View a model with 3DViewer](#view-a-model-with-3dviewer)
+- [Measure it yourself](#measure-it-yourself)
+- [Results in detail](#results-in-detail)
+- [How it works](#how-it-works)
+- [Known limitations](#known-limitations)
+- [Repository layout](#repository-layout)
+- [Tests and benchmarks](#tests-and-benchmarks)
+- [Credits](#credits)
+
+---
+
+## Quick start: Windows
+
+### 1. Requirements
+
+| Tool | Version | Notes |
+|---|---|---|
+| **NVIDIA GPU** | Turing or newer (RTX 20-series+) | CUDA 13 dropped older GPUs; Volta/Pascal need CUDA 12.x. The build targets **sm_89 (RTX 40)** by default; see [step 3](#3-build) |
+| **Visual Studio** | 2022 or 2026 | Workload **"Desktop development with C++"** |
+| **CUDA Toolkit** | 12.x or 13.x (tested: **13.2**) | Install *after* Visual Studio so its VS integration is added |
+| **CMake** | ≥ 3.24 | |
+| **Git** | any | |
+| **Python** | ≥ 3.9 with `numpy` (+ `Pillow` for `e2e_check.py`) | Must be callable as `python` |
+| **FFmpeg** | any recent | On `PATH`. Needed for video input and `--video` |
+| **COLMAP** | 3.9+ **CUDA build** | On `PATH`, or unzipped into `third_party\colmap\` ([step 4](#4-install-colmap)) |
+
+Most of these install with `winget` from PowerShell. Visual Studio and COLMAP are separate downloads.
 
 ```powershell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+winget install Kitware.CMake Git.Git Python.Python.3.12 Gyan.FFmpeg Nvidia.CUDA
+python -m pip install numpy pillow
+```
+
+Visual Studio: https://visualstudio.microsoft.com/ (Community is fine; select *Desktop development with C++*).
+
+### 2. Clone
+
+```powershell
+git clone https://github.com/Ajitesh-07/3DMaker.git
+cd 3DMaker
+```
+
+### 3. Build
+
+```powershell
+cmake -S . -B build
 cmake --build build --config Release -j
 ```
 
-This produces two executables in `build/Release/`:
+This produces `build\Release\3DMaker.exe` (train) and `build\Release\3DViewer.exe` (view). The first configure
+downloads GLFW, FreeType and RmlUi, so it needs internet.
 
-| Executable | Source | Role |
-|---|---|---|
-| `3DMaker.exe`  | `src/main.cpp`  | CLI orchestrator: COLMAP → train → save → (optional) showcase video |
-| `3DViewer.exe` | `src/render.cpp`| Real-time interactive viewer |
+> **Not an RTX 40-series GPU?** Edit `set(CMAKE_CUDA_ARCHITECTURES "89")` in the root `CMakeLists.txt` before
+> building: `75` = RTX 20, `86` = RTX 30, `89` = RTX 40, `120` = RTX 50 (needs CUDA ≥ 12.8). Then delete `build\`
+> and rebuild.
 
-> The default build targets **sm_89 (Ada / RTX 40-series)**. For another GPU, edit
-> `CMAKE_CUDA_ARCHITECTURES` in the root `CMakeLists.txt` (e.g. `120` for Blackwell / RTX 50-series,
-> `86` for Ampere).
+### 4. Install COLMAP
 
-### 2. Train
-
-Pass a **video file** or a **directory containing an `images/` subfolder**. If a
-`transforms_train.json` doesn't already exist, 3DMaker runs the COLMAP pipeline automatically first.
+COLMAP solves the camera poses. It is **not** in the repo (`third_party/colmap` is gitignored). Download the
+latest **`*-windows-cuda.zip`** from https://github.com/colmap/colmap/releases, then either add its `bin` folder
+to `PATH`, or extract it so that this file exists:
 
 ```powershell
-.\build\Release\3DMaker.exe train --data data\my_capture.mp4 --validate --video
+Test-Path third_party\colmap\bin\colmap.exe   # should print True
 ```
 
-**Options** (all optional):
-
-| Flag | Meaning | Default |
-|---|---|---|
-| `--steps N`     | training-step cap | `50000` |
-| `--epochs N`    | outer-loop epoch cap (step-bounded) | `100` |
-| `--cascades N`  | occupancy cascades; `0` = estimate from dataset | `0` |
-| `--lambda F`    | distortion-loss weight (floater suppression) | `0.1` |
-| `--K N`         | sub-voxel samples per occupied voxel (anti-aliasing) | `1` |
-| `--max-lr F`    | cosine LR schedule start | `0.01` |
-| `--min-lr F`    | cosine LR schedule floor | `0.0001` |
-| `--validate`    | hold out every 8th image, report test PSNR | off |
-| `--video`       | render the 360° orbit `.mp4` after training | off |
-
-Outputs are written **next to the dataset**:
-
-```
-data/my_capture/
-├── transforms_train.json     # camera poses from COLMAP
-├── model.inerf               # trained weights + scene footer (center/up/scale/fov)
-├── frames/                   # rendered train-view PNGs (+ orbit frames if --video)
-└── nerf_360.mp4              # showcase orbit (only with --video)
-```
-
-During training you get a live progress bar:
-
-```
-[##########          ] 24500/50000 steps | epoch 1.82 | 9.4 ms/step | ETA 04:01 | PSNR 27.3
-```
-
-### 3. View
+### 5. Check the toolchain
 
 ```powershell
-.\build\Release\3DViewer.exe data\my_capture\transforms_train.json data\my_capture\model.inerf
+nvcc --version; cmake --version; python -c "import numpy; print('numpy ok')"; ffmpeg -version | Select-Object -First 1
 ```
 
-Blender-style controls: **left-drag** to orbit, **middle-drag** to pan, **scroll** to zoom. The viewer
-reads the camera FOV from `transforms_train.json` and restores the scene framing from the `.inerf`
-footer, so it opens looking at the subject.
+Then jump to [Try it on the playroom dataset](#try-it-on-the-playroom-dataset).
 
 ---
 
-## 🗂 Repository layout
+## Quick start: Linux
+
+> \***Not yet tested on Linux.** The code and CMake are written to be portable (MSVC-only flags are guarded,
+> and Python is called as `python3`), but nobody has built it on Linux yet. Please report what breaks.
+
+### 1. Requirements (Ubuntu 24.04)
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git python3 python3-numpy python3-pil ffmpeg colmap \
+    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev unzip curl
+```
+
+- **CUDA Toolkit 12.x or 13.x:** install from https://developer.nvidia.com/cuda-downloads and make sure `nvcc`
+  is on `PATH`.
+- **CMake ≥ 3.24** is required. Ubuntu 24.04 ships 3.28; on 22.04 use `pip install cmake` instead.
+- **COLMAP:** the distro package may be built **without CUDA**, which makes feature extraction and matching much
+  slower. For real captures, build COLMAP with CUDA (see COLMAP's install docs).
+
+### 2. Clone and build
+
+```bash
+git clone https://github.com/Ajitesh-07/3DMaker.git
+cd 3DMaker
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+# -> build/3DMaker and build/3DViewer
+```
+
+The same GPU-architecture note as Windows applies (root `CMakeLists.txt`, `CMAKE_CUDA_ARCHITECTURES`).
+
+---
+
+## Try it on the playroom dataset
+
+[Deep Blending](http://visual.cs.ucl.ac.uk/pubs/deepblending/) "playroom" is a real indoor room: 225 photos at
+1264×832. The download is the ~650 MB archive hosted by the 3D Gaussian Splatting authors. We keep **only the
+images** and let 3DMaker solve the camera poses itself, exactly as it would for your own capture.
+
+**Windows (PowerShell, from the repo root):**
+
+```powershell
+# download (~650 MB) and extract only the playroom images
+New-Item -ItemType Directory -Force data\_downloads, data\playroom | Out-Null
+curl.exe -L -o data\_downloads\tandt_db.zip https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
+tar -xf data\_downloads\tandt_db.zip -C data\_downloads db/playroom/images
+Move-Item data\_downloads\db\playroom\images data\playroom\images
+
+# COLMAP + training + held-out validation  (~12 min on a laptop RTX 4060)
+.\build\Release\3DMaker.exe train --data data\playroom --validate
+
+# explore the result
+.\build\Release\3DViewer.exe data\playroom\transforms_train.json data\playroom\model.inerf
+```
+
+**Linux:**
+
+```bash
+mkdir -p data/_downloads data/playroom
+curl -L -o data/_downloads/tandt_db.zip https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
+unzip -q data/_downloads/tandt_db.zip 'db/playroom/images/*' -d data/_downloads
+mv data/_downloads/db/playroom/images data/playroom/images
+
+./build/3DMaker train --data data/playroom --validate
+./build/3DViewer data/playroom/transforms_train.json data/playroom/model.inerf
+```
+
+You should see `225 / 225 frames` registered, training at roughly 9–10 ms/step on an RTX 4060, and
+`HELD-OUT VALIDATION PSNR` around **27.8 dB**. The same archive also contains `db/drjohnson` (indoor) and
+`tandt/train`, `tandt/truck` (outdoor). Swap the path to try them.
+
+**Faster, and better for rooms.** Playroom is a room, so fit it into the full-resolution box first, then train 30k
+steps. That gives 27.95 dB in about 5 minutes, better than the default above in 60% of the time (see
+[Which settings to use](#which-settings-to-use)). Reuse the poses from the first run:
+
+```powershell
+python scripts/fit_room.py data\playroom data\playroom_fit
+.\build\Release\3DMaker.exe train --data data\playroom_fit --steps 30000 --validate
+```
+
+On Linux: `python3 scripts/fit_room.py data/playroom data/playroom_fit`, then `./build/3DMaker train --data
+data/playroom_fit --steps 30000 --validate`.
+
+---
+
+## Train on your own video or photos
+
+```powershell
+# a video: frames are extracted to <name>\images at 8 fps, then COLMAP runs
+.\build\Release\3DMaker.exe train --data C:\captures\myroom.mp4 --validate
+
+# or a folder of photos laid out as  myroom\images\*.jpg
+.\build\Release\3DMaker.exe train --data C:\captures\myroom --validate
+```
+
+On Linux use `./build/3DMaker` with the same arguments.
+
+If the folder already has a `transforms_train.json`, COLMAP is skipped. Delete that file to re-solve the poses.
+
+**Capturing a room (inside-out)?** Re-fit the scene so the whole room sits in the full-resolution box before
+training. This is currently a separate step, until `colmap2nerf.py` does it automatically:
+
+```powershell
+python scripts/fit_room.py C:\captures\myroom C:\captures\myroom_fit      # writes a new folder; images are not copied
+.\build\Release\3DMaker.exe train --data C:\captures\myroom_fit --steps 30000 --validate
+```
+
+**Capture tips** (these matter more than any flag):
+- Lock exposure and white balance if your camera app allows it, and move slowly and smoothly.
+- Record **1080p, not 4K.** Frames are kept at full resolution, and 4K exhausts RAM quickly (see
+  [limitations](#known-limitations)). To shrink an existing video:
+  `ffmpeg -i in.mp4 -vf scale=-2:1080 -c:a copy out.mp4`
+- Keep clips short at first (1–2 min). COLMAP's matching cost grows with the square of the frame count. For a
+  longer video, extract fewer frames by running the preprocessing step yourself:
+  `python scripts/colmap2nerf.py C:\captures\myroom.mp4 --video_fps 4`, then run `train` on the folder.
+- Walk loops that revisit earlier spots, and avoid spinning in place (pure rotation gives COLMAP no parallax).
+- Run `python scripts/analyze_capture.py <folder>\transforms_train.json` to score how well the camera path covers
+  the scene.
+
+### Options
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--steps N` | `50000` | Training steps, ~9–11 ms each on an RTX 4060. **`--steps 30000` gives nearly the same quality in ~60% of the time** (playroom: −0.15 dB, 5 min instead of 8; see [results](#which-settings-to-use)) |
+| `--validate` | off | Hold out every 8th image and report its PSNR at the end |
+| `--video` | off | Also render a 120-frame orbit to `nerf_360.mp4` (needs FFmpeg) |
+| `--cascades N` | `0` = auto | Nested occupancy boxes for distant background; raise for big outdoor scenes |
+| `--lambda F` | `0.1` | Distortion-loss weight (removes floaters) |
+| `--K N` | `1` | Samples per occupied voxel. **If you raise K, lower λ a lot**: K=2 with λ=0.05 collapsed on playroom; use λ ≤ 0.03 |
+| `--max-lr F` / `--min-lr F` | `0.01` / `0.0001` | Cosine learning-rate schedule |
+
+Depth supervision from COLMAP's sparse points is on automatically whenever COLMAP produced `depth_train.bin`.
+
+### Outputs (next to your data)
+
+```
+myroom/
+├── images/                  input frames
+├── transforms_train.json    camera poses (+ transforms_test.json, depth_train.bin)
+├── model.inerf              trained model: weights + occupancy grid + scene footer
+├── frames/view_0..2.png     renders of the first three cameras
+└── nerf_360.mp4             only with --video
+```
+
+> Training overwrites `model.inerf` in that folder. Copy it first if you want to keep the old one.
+
+---
+
+## View a model with 3DViewer
+
+```powershell
+.\build\Release\3DViewer.exe <data>\transforms_train.json <data>\model.inerf
+```
+
+| Input | Action |
+|---|---|
+| Left-drag | Orbit |
+| Middle-drag | Pan |
+| Scroll | Zoom |
+
+The viewer opens at training camera 0 and ray-marches the neural fields for every pixel directly in CUDA, writing
+into an OpenGL buffer (zero-copy interop). Expect **4–12 FPS at 800×800** on an RTX 4060. It is a native
+inspection tool; a real-time **web** viewer is the next milestone (see [ROADMAP.md](ROADMAP.md)).
+
+---
+
+## Measure it yourself
+
+`scripts/e2e_check.py` runs the whole pipeline exactly as a user would, timestamps every stage, and compares
+renders against the real photos:
+
+```powershell
+python scripts/e2e_check.py data\playroom                      # stock settings, as in the tables below
+python scripts/e2e_check.py data\playroom --steps 20000 -- --K 1   # other 3DMaker flags go after --
+```
+
+It writes into the dataset folder:
+- `e2e_summary.json`: stage timings, registered images, held-out PSNR, per-view PSNR;
+- `e2e_compare.png`: photo | render | error heatmap;
+- `e2e_log.txt`: the full timestamped log.
+
+---
+
+## Results in detail
+
+### Indoor: Deep Blending *playroom* (225 photos, 29 held out)
+
+![Photo vs render vs error for three views](media/readme/playroom_error_grid.jpg)
+
+| Stage | Time |
+|---|---|
+| COLMAP features / matching / mapping / export | 8 s / 125 s / 83 s / 4 s |
+| NeRF training, 30k / 50k steps | 5 min 7 s / 8 min 14 s |
+| **Total, raw photos → model** | **~9 min / 11 min 56 s** |
+
+**Published results on playroom, for context.** The other methods used the dataset's own COLMAP poses on stronger
+GPUs; we solved our own poses on a laptop, so compare within ±0.5 dB:
+
+| Method | Playroom PSNR | Hardware / training time |
+|---|---|---|
+| Instant-NGP (Base / Big) | 19.48 / 21.67 | A6000, 6.5 / 8 min |
+| Plenoxels | 22.98 | A6000, 28 min |
+| **3DMaker, 30k steps** (stock / `fit_room.py`) | **27.74 / 27.95** | **laptop RTX 4060, 5 min** |
+| **3DMaker, 50k steps** (stock / `fit_room.py`) | **27.80 / 28.10** | **laptop RTX 4060, 8 min** |
+| 3D Gaussian Splatting, 7K iterations | 29.25 | A6000, 4.6 min |
+| Mip-NeRF 360 | 29.66 | 48 h |
+| 3D Gaussian Splatting, 30K iterations | 30.04 | A6000, 36 min |
+
+<sub>Published numbers: Kerbl et al., *3D Gaussian Splatting*, SIGGRAPH 2023, Table 8.</sub>
+
+**What limits it today:** plain walls. They have few COLMAP features, and the default scene normalization places
+the walls in the lower-resolution outer region (see [limitations](#known-limitations)). `fit_room.py` fixes the
+placement; the remaining smearing comes from the lack of texture.
+
+### Which settings to use
+
+Same 225 photos, same COLMAP poses, same laptop RTX 4060. Only the normalization and the step count change:
+
+| Normalization | 30k steps | 50k steps (default) |
+|---|---|---|
+| **Stock** (`colmap2nerf.py` as-is, 3 cascades) | 27.74 dB · 5 min 8 s | 27.80 dB · 8 min 14 s |
+| **Room fit** (`scripts/fit_room.py`, 2 cascades) | **27.95 dB · 5 min 5 s** | **28.10 dB** · 8 min 14 s |
+
+<sub>Held-out PSNR over 29 unseen views. Single runs, so differences under ~0.1–0.2 dB are within run-to-run
+noise.</sub>
+
+- **30k vs 50k:** 30k steps costs only 0.06–0.15 dB for 38% less training time. The learning rate anneals over
+  whatever step count you choose, so a 30k run fully settles. Use 30k when turnaround matters (previews, timed
+  on-site processing) and 50k for final-quality renders.
+- **When to run `fit_room.py`:** rooms, corridors and other **inside-out** captures, where you walk *inside* a
+  space and film the walls around you. It moved 98.7% of playroom's geometry into the full-resolution box (from
+  0%) and cleaned up the walls: +0.2 to +0.3 dB.
+- **When not to:** **object orbits**, where you circle one thing looking inward (a statue, a car, the train
+  below). The stock normalization is designed for that case and already correct. Rule of thumb: if
+  `colmap2nerf.py` reports a high `inward` score (≈ 0.9 on Train), skip it; for rooms it reports a lower score
+  (0.44 on playroom).
+- **Don't raise `--K`** for sharpness without also lowering `--lambda`: K=2 with λ=0.05 collapsed on playroom
+  (13 dB).
+
+### Hard outdoor scene: Tanks and Temples *Train* (301 photos)
+
+![Tanks and Temples Train: photo vs render](media/readme/tt_train_heldout.jpg)
+
+| Method | Train PSNR |
+|---|---|
+| 3D Gaussian Splatting, 7K iterations | 18.89 |
+| **3DMaker (this repo)** | **18.78** (9.4 min training, 18 min end to end) |
+| Mip-NeRF 360 | 19.52 |
+| Instant-NGP (Base / Big) | 20.17 / 20.46 |
+| 3D Gaussian Splatting, 30K iterations | 21.10 |
+
+The locomotive itself is sharp. The engine is weaker outdoors for two known, fixable reasons: there's **no sky or
+background model** (rays that leave the scene show the background colour, the white patches in the sky), and there
+are **no per-image appearance embeddings**, so auto-exposure drift averages into washed-out colour.
+
+### The MLP engine vs NVIDIA tiny-cuda-nn
+
+Both libraries were built into one executable and timed with identical code on the same GPU. Full report:
+[`compare_tcnn/`](compare_tcnn/README.md).
+
+| Workload (geometric mean over 18 configs) | TinyMLP vs tcnn |
+|---|---|
+| Plain MLP inference / backward / train | **1.69× / 1.37× / 1.08× faster** |
+| Hash grid + MLP inference | parity (0.99×; **1.11× faster** at 3DMaker's config) |
+| Hash grid + MLP training | 0.75× (tcnn's fp16 hash-gradient atomics; fix identified) |
+| Quality, same data and optimizer | equal (a controlled ablation shows TinyMLP's small edge comes from its biases) |
+
+---
+
+## How it works
+
+```
+ video.mp4 / images/ ──► FFmpeg ──► COLMAP SfM ──► transforms_train.json + depth_train.bin
+                          frames     poses, sparse     (scripts/colmap2nerf.py)
+                                     depth priors
+                                                            │
+                                                            ▼
+                     ┌──────────────── modules/NeRF (INerfTrainer) ────────────────┐
+                     │ occupancy bitgrid + mip pyramid + cascades ─► DDA marcher   │
+                     │ hit compaction ─► hash grid + density MLP ─► colour MLP     │
+                     │ volume rendering + distortion loss + depth-prior loss       │
+                     └──────────────────────────────┬──────────────────────────────┘
+                                                    ▼
+                               model.inerf ──► 3DViewer (CUDA → OpenGL, interactive)
+```
+
+**TinyMLP** (`modules/TinyMLP`): the framework-free maths engine. It knows nothing about NeRF.
+- **Fully-fused tensor-core MLPs:** the whole network runs in one kernel with activations resident in shared memory,
+  using WMMA fp16 math with fp32 accumulation and `cp.async` double-buffered weight loads.
+- **Multi-resolution hash grid:** a dense-vs-hashed level split, with hash-gradient scatter blocked per level for L2
+  locality (3.8× faster than the naive scatter).
+- **Mixed precision:** fp32 master weights, fp16 forward copies, and fused Adam over weights, biases and the hash
+  table, with NaN/Inf guards so one bad gradient can't poison the optimizer state.
+
+**NeRF engine** (`modules/NeRF`):
+- **Occupancy bitgrid (128³ × 4 mip levels)** with a coarse-to-fine **DDA marcher** that skips empty space, kept up
+  to date online with EMA density updates.
+- **Hit-centric compaction:** only occupied samples are materialized, which is why training needs ~1 GB of GPU
+  memory.
+- **Unbounded scenes:** mip-NeRF-360-style **scene contraction** for the hash encoding, plus **nested occupancy
+  cascades** for distant background.
+- **Regularization:** the **distortion loss** suppresses floaters, and **DS-NeRF-style depth priors** from COLMAP's
+  sparse points sharpen geometry.
+- **Training details:** random-background augmentation, a cosine learning-rate schedule, held-out validation, and
+  self-contained `.inerf` checkpoints that store the scene framing for the viewer.
+
+---
+
+## Known limitations
+
+These are measured and tracked; most have a known fix. See [ROADMAP.md](ROADMAP.md).
+
+- **Rooms are normalized like objects.** `colmap2nerf.py` centres on where the cameras look, so in a room the walls
+  land in the compressed outer region. `scripts/fit_room.py` fixes this as a manual step (+0.3 dB and cleaner walls
+  on playroom); making it automatic is on the roadmap.
+- **No sky/background model, no appearance embeddings.** This is why outdoor scenes lag (18.8 dB on T&T *Train*).
+- **COLMAP preprocessing doesn't scale yet.**
+  - Exhaustive matching grows with the square of the frame count (~2 min for 225 photos, hours for thousands).
+  - Frames aren't downscaled, and the dataset lives in pinned RAM (~4 bytes per pixel).
+  - Past ~518 frames at 1080p (~130 at 4K), a 32-bit pixel index overflows. Keep captures short and 1080p for now.
+- **K ≥ 2 can collapse training** unless λ is lowered well below 0.1/K.
+- **`--video` renders before the model is saved:** a crash during the orbit render loses the training run.
+- **The viewer is native and CUDA-only** (4–12 FPS). A web viewer is the next milestone.
+- **Linux builds are untested.**
+
+---
+
+## Repository layout
 
 ```
 src/
-  main.cpp              3DMaker.exe — training CLI / orchestrator (drives the INerfTrainer facade)
-  render.cpp            3DViewer.exe — real-time OpenGL + CUDA-interop viewer
-
-modules/TinyMLP/        Framework-free math engine (knows nothing about NeRF):
-  TinyMLP.{h,cu}            fused tensor-core MLP (color head)
-  TinyMLPHashGrid.{h,cu}    multi-resolution hash grid + fused MLP (density head)
-  networkFusion*.cu         fused WMMA forward / backward kernels
-  optimizerKernel.cu        fused Adam (weights, biases, hash grid)
-
-modules/NeRF/           Scene representation, rendering & training:
-  NerfTrainer.{h,cu}        INerfTrainer — the public facade (init/train/validate/save/load/render)
-  InstantNerf.cu            occupancy grid, hit-centric train/render loops, .inerf I/O
-  processRays.cu            DDA raymarcher + hit compaction over the occupancy bitgrid
-  compositing.cu            volume rendering + distortion loss
-  DataLoader.cu             COLMAP transforms parsing + pinned-memory ray streaming
-  RenderKernels.cu          camera ray generation, tonemapping
-
+  main.cpp              3DMaker: COLMAP (if needed) → train → validate → save → optional orbit video
+  render.cpp            3DViewer: interactive CUDA → OpenGL viewer
+modules/TinyMLP/        fused tensor-core MLP + hash grid + fused Adam (framework-free; own tests/benchmarks)
+modules/NeRF/           scene representation, ray marching, training/rendering loops, .inerf I/O
+  NerfTrainer.{h,cu}      INerfTrainer: the public facade used by both apps
+  InstantNerf.{h,cu}      occupancy grid, hit-centric train/render loops, save/load
+  processRays.cu          DDA marcher + hit compaction
+  compositing.cu          volume rendering, distortion + depth losses
+  DataLoader.cu           transforms/depth parsing, pinned-memory ray sampling
+  BakedNerf*.cu           (in progress) sparse-voxel bake for real-time rendering
 scripts/
-  colmap2nerf.py         video/images → COLMAP SfM → transforms_train.json (smart object centering)
-  analyze_capture.py     capture-quality gate (camera-path coverage)
-
-third_party/colmap/     bundled COLMAP (Windows); 'colmap' on PATH is the fallback
-docs/, ROADMAP.md       design notes & forward plan
+  colmap2nerf.py          video/images → COLMAP → transforms_train.json + depth priors
+  colmap_depth.py         sparse depth-prior extraction
+  fit_room.py             re-fit a room capture into the full-resolution box (manual step for now)
+  analyze_capture.py      capture-coverage quality gate
+  e2e_check.py            end-to-end timing + quality check
+compare_tcnn/           TinyMLP vs tiny-cuda-nn benchmark, results and report
+media/readme/           figures used in this README
 ```
 
-The split is deliberate: **`TinyMLP` is a generic, reusable fused-MLP + hash-grid library** with its
-own benchmarks; **`NeRFModule` orchestrates it** into a renderer.
-
 ---
 
-## 🏆 Technical achievements
-
-### 1. `TinyMLP` — the math engine
-
-A from-scratch, framework-free implementation of fused tensor-core MLPs and a multi-resolution hash
-grid — the part that replaces PyTorch/tiny-cuda-nn entirely.
-
-- **Fully-fused tensor-core MLP.** The whole network runs in **one kernel launch**: hidden
-  activations stay resident in **shared memory** across every layer (`networkFusion.cu`), so there is
-  no round-trip to global memory between layers. Matrix multiplies use hardware **Tensor Cores via
-  `nvcuda::wmma`** in native FP16 with **FP32 accumulators**.
-- **Asynchronous weight prefetch.** Uses `cp.async` (LDGSTS) 128-bit loads with **2-deep pipelining**
-  to stream the next layer's weights from global → shared memory while the math units work the current
-  tile, hiding memory latency behind compute.
-- **Mixed precision done right.** Keeps **FP32 master weights** for stable optimizer updates plus
-  **FP16 forward copies** for tensor-core throughput — the standard mixed-precision recipe, hand-rolled.
-- **Fused Adam optimizer.** Weight, bias **and hash-grid** Adam updates are fused, with bias
-  correction and loss-scaling, plus **NaN/Inf guards** that prevent a single bad gradient from latching
-  the moments permanently (`optimizerKernel.cu`).
-- **Multi-resolution hash grid (`TinyMLPHashGrid`).** Hash encoding + MLP fused into a single
-  forward/backward, with a dense-vs-hashed level split and Adam directly over the FP32 master table.
-  Configurable table size, level count, growth factor `b`, base resolution, and features-per-level.
-- **Micro-optimized kernels.** `PAD=8` shared-memory layout to kill bank conflicts; `uint32_t`
-  indexing so `nvcc` synthesizes bitwise `SHR`/`AND` instead of integer div/mod; `__launch_bounds__`
-  for occupancy; warp topology folded to match the hidden dimension for full SM utilization.
-- **Training / inference modes.** Inference path skips activation storage to cut VRAM; weights
-  load/save for checkpointing.
-- **Reported throughput:** **100M+ multi-resolution hash-grid evaluations/sec** on a consumer GPU.
-
-*Configurable envelope:* hidden dim ∈ `{16, 32, 64, 128}`, up to 10 layers (auto-padded to powers of
-two); hash grid `featuresPerLevel = 2`, input `vectorDim ∈ {3, 4}`; output activation none/sigmoid.
-
-### 2. NeRF engine
-
-The scene representation, raymarcher, and training/rendering loops built on top of `TinyMLP`.
-
-- **Hit-centric compaction pipeline.** Instead of allocating worst-case samples per ray, the engine
-  **dynamically packs only the active (occupied) samples** in memory before evaluating the MLPs —
-  dramatically reducing VRAM versus naïve per-ray allocators and keeping the tensor cores saturated.
-- **Hierarchical occupancy grid + DDA marcher.** A `128³` occupancy **bitgrid** with **mipmap
-  max-pooling** (4 levels) lets a custom Digital Differential Analyzer raymarcher **skip empty space**
-  coarse-to-fine and jump straight to surfaces. The grid is maintained online with **EMA density
-  updates** and early/late update schedules.
-- **Spatial cascades.** Nested occupancy grids over powers-of-two AABBs (the Instant-NGP
-  `aabb_scale` recipe) to extend reach beyond the unit cube; cascade count auto-estimated from scene
-  radius. Outer cascades march at proportionally coarser steps, so background costs stay bounded.
-- **Scene contraction (mip-NeRF-360).** Positions are warped through the ±2 contraction before the
-  hash lookup, so unbounded backgrounds get finite encoding capacity — the key to real-world 360°
-  captures rather than bounded turntable boxes.
-- **Depth supervision (DS-NeRF-style).** Dense-ray depth priors from the COLMAP sparse cloud
-  (`scripts/colmap_depth.py`) with a `lambda-depth` weight — faster convergence and better geometry
-  on real captures (dev harness; CLI exposure pending).
-- **Morton-ordered samples.** Active samples are Z-order sorted so hash-grid lookups hit coherent
-  cache lines.
-- **Two MLP heads.** A hash-grid **density** network (`TinyMLPHashGrid`) and a **color** network
-  (`TinyMLP`) fed degree-3 **spherical-harmonic** directional encoding for view-dependent shading.
-- **Volume rendering with distortion regularization.** Front-to-back alpha compositing plus a
-  **mip-NeRF-360-style distortion loss** (`--lambda`) that collapses floaters and "fog."
-- **Anti-aliasing knob.** `--K` sub-voxel samples per occupied voxel (a Zip-NeRF-style multisample
-  primitive).
-- **Anneal-and-hold LR schedule.** Cosine decay `max-lr → min-lr` over training, then held at the
-  floor — restoring intended late-training stability.
-- **Held-out validation.** `--validate` reserves every 8th image and reports true test-set PSNR.
-- **Self-contained checkpoints (`.inerf`).** Saves all weights **plus a scene footer** (center, up,
-  scale, camera FOV) so the viewer reproduces the exact framing after a bare load — no JSON needed at
-  view time.
-- **Clean public facade (`INerfTrainer`).** `init / loadDataset / train / validate / save / load /
-  renderOrbit / renderTrainView`, with a live progress bar (steps, epoch %, **EMA ms/step**, ETA,
-  PSNR). Both `3DMaker.exe` and the dev harness `train_hit.exe` are thin wrappers over it.
-- **TRAINING / INFERENCE memory modes** trade activation storage for VRAM at render time.
-
-### 3. Preprocessing & tooling
-
-- **`colmap2nerf.py` — one-command SfM.** Extracts frames (FFmpeg), runs the full COLMAP pipeline
-  (feature extraction → exhaustive matching → SfM mapping) with a **single shared intrinsic**
-  (`single_camera=1`, correct for handheld phone video), and emits `transforms_train.json`.
-- **Smart object centering.** Rather than centering on the camera centroid (which breaks
-  front-facing captures), it parses the COLMAP **`points3D`** cloud, filters background by view-track
-  length, and centers the neural bounding box on the **physical subject** via least-squares ray
-  convergence — then rotates *up* → `+Z` and scales the scene to the unit cube. Result: maximum
-  resolution on the object and no background fog.
-- **`analyze_capture.py` — capture-quality gate.** Scores a capture's camera-path coverage (azimuth
-  arc, latitude crossing the equator) to flag captures that physically can't reconstruct well *before*
-  you spend GPU time.
-
-### 4. Apps
-
-- **`3DMaker.exe` (orchestrator).** Ingests a video/folder, runs COLMAP if needed, trains, renders
-  sample train views, optionally renders a 360° orbit and encodes it to `.mp4` (FFmpeg), and saves the
-  `.inerf` model — all from one command.
-- **`3DViewer.exe` (visualizer).** A native **GLFW + OpenGL** viewer with **zero-copy CUDA–GL
-  interop**: the network renders pixels straight into the GPU display buffer (PBO) — no CPU round-trip
-  — for interactive orbiting/panning. Reconstructs the FOV and opening pose from the dataset and the
-  `.inerf` footer.
-
----
-
-## 📦 Requirements
-
-| Dependency | Notes |
-|---|---|
-| **NVIDIA GPU** | Volta+ (SM 7.0+) for Tensor Cores; default build targets Ada (sm_89) |
-| **CUDA Toolkit** | built/tested with **13.2**; 12.x should work (CCCL needs the conforming MSVC preprocessor — handled in CMake) |
-| **C++20 compiler** | MSVC v143 / VS 2022+ (primary), or `g++-11`+ on Linux |
-| **CMake** | ≥ 3.24 |
-| **Python 3** + numpy | for `colmap2nerf.py` / `analyze_capture.py` |
-| **COLMAP** | bundled under `third_party/colmap/` on Windows; install separately and put on PATH for Linux |
-| **FFmpeg** | must be on PATH (video frame extraction + showcase `.mp4` encode) |
-| GLFW / FreeType / RmlUi | fetched automatically by CMake (`FetchContent`) — no manual install |
-
----
-
-## 🛠 Building
-
-### Windows (primary)
+## Tests and benchmarks
 
 ```powershell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j
-# → build\Release\3DMaker.exe and build\Release\3DViewer.exe
-```
-
-### Linux
-
-```bash
-git clone <repo-url> 3DMaker && cd 3DMaker
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-```
-
-> Install COLMAP and FFmpeg via your package manager (`apt install colmap ffmpeg`) and ensure they're
-> on PATH. Adjust `CMAKE_CUDA_ARCHITECTURES` in the root `CMakeLists.txt` for your GPU.
-
----
-
-## 🧪 Tests & benchmarks
-
-Both modules ship standalone test/benchmark targets, gated behind a CMake option.
-
-**TinyMLP** (hash-grid & matmul throughput, forward/backward correctness):
-
-```bash
-cmake -S modules/TinyMLP -B modules/TinyMLP/build -DCMAKE_BUILD_TYPE=Release -DTINYMLP_BUILD_TESTS=ON
+# TinyMLP kernel tests and benchmarks
+cmake -S modules/TinyMLP -B modules/TinyMLP/build -DTINYMLP_BUILD_TESTS=ON
 cmake --build modules/TinyMLP/build --config Release -j
-# e.g. test_forward, test_backward, test_mlp, test_optimizer, test_modes, demo
-```
 
-**NeRF** (training harness + round-trip tests):
-
-```bash
-cmake -S modules/NeRF -B modules/NeRF/build -DCMAKE_BUILD_TYPE=Release -DNERF_BUILD_TESTS=ON
+# NeRF harnesses (train_hit.exe exposes extra flags such as --lambda-depth)
+cmake -S modules/NeRF -B modules/NeRF/build -DNERF_BUILD_TESTS=ON
 cmake --build modules/NeRF/build --config Release -j
-# train_hit  — direct dataset training harness:  train_hit.exe <dataset_path> [lambdaDist]
-# test_scene_footer — .inerf save/load round-trip
+
+# TinyMLP vs tiny-cuda-nn (clones tcnn locally; ~30 min build + run)
+#   see compare_tcnn/README.md
 ```
 
 ---
 
-## 🧭 Status & roadmap
+## Credits
 
-3DMaker today is a **real-world unbounded** NeRF: scene contraction + metric occupancy cascades +
-distortion loss + depth priors on top of the hash-grid engine, with a COLMAP front-end, smart subject
-centering, and a capture-quality gate. Real 360° phone captures train to good quality in minutes on a
-laptop.
-
-**Active track — real-time rendering (`BakedNerf`, in progress):** the trained NeRF is distilled into
-a two-tier sparse voxel structure (13 B/voxel: fp16 σ + uint8 diffuse + fp16 view-features) rendered
-with MERF/SNeRG-style deferred shading — early results are **200–800× faster than raymarching the
-MLPs** (~3–20 ms vs ~1.4 s per 800² frame), targeting interactive viewing on 4 GB-VRAM laptops. The
-appearance-distillation stage is being built (`docs/baking_phase2_joint_training.md`).
-
-The forward plan is documented in:
-
-- **`ROADMAP.md`** — code review, the (since-implemented) unbounded-scene plan, the 3DGS question,
-  and the **clean mesh → FBX** end goal (SDF surface reconstruction). See the status update at the top.
-- **`docs/realworld_quality_roadmap.md`** — quality/efficiency techniques for real-world captures
-  (depth supervision, per-image appearance, Zip-NeRF anti-aliasing, pose refinement), framed as "we've
-  independently built ~half of nerfacto."
-
-Inspired by **Instant-NGP** (Müller et al., 2022) and the broader mip-NeRF-360 / Nerfstudio line.
-```
+- **Methods this builds on:** Instant-NGP (Müller et al. 2022), Mip-NeRF 360 (Barron et al. 2022), DS-NeRF
+  (Deng et al. 2022), NerfAcc and Nerfstudio.
+- **Tools:**
+  - [COLMAP](https://colmap.github.io/) for structure-from-motion
+  - [FFmpeg](https://ffmpeg.org/)
+  - [GLFW](https://www.glfw.org/), [FreeType](https://freetype.org/) and [RmlUi](https://github.com/mikke89/RmlUi) for the viewer
+  - [nlohmann/json](https://github.com/nlohmann/json) and [stb](https://github.com/nothings/stb)
+- **Datasets:** Deep Blending (Hedman et al., SIGGRAPH Asia 2018) and Tanks and Temples (Knapitsch et al.,
+  SIGGRAPH 2017), via the archive published by the 3D Gaussian Splatting authors (Inria).
+- **Benchmark reference:** [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) (NVIDIA), used only in
+  `compare_tcnn/`.

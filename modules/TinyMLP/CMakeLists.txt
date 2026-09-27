@@ -45,7 +45,6 @@ target_compile_options(TinyMLP PRIVATE
         --use_fast_math          # fused mul-add, approx intrinsics, FTZ
         --extra-device-vectorization
         --restrict               # assume __restrict__ on all pointers
-        -Xcompiler /Zc:preprocessor   # conforming MSVC preprocessor, required by CCCL (CUB)
     >
     # Debug: keep line info for Nsight profiling
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:
@@ -62,6 +61,11 @@ target_compile_options(TinyMLP PRIVATE
         $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O3>
     >
 )
+
+# Conforming MSVC preprocessor, required by CCCL (CUB) in CUDA 13. MSVC-only: g++ rejects the flag.
+if(MSVC)
+    target_compile_options(TinyMLP PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
 
 target_link_libraries(TinyMLP PUBLIC cublas)
 

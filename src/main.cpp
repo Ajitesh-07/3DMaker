@@ -110,7 +110,12 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        std::string cmd = "python \"" + script_path.string() + "\" \"" + python_arg + "\"";
+#ifdef _WIN32
+        const char* python = "python";
+#else
+        const char* python = "python3";   // most Linux distros ship no bare `python`
+#endif
+        std::string cmd = std::string(python) + " \"" + script_path.string() + "\" \"" + python_arg + "\"";
         std::cout << "Executing: " << cmd << std::endl;
 
         int ret = std::system(cmd.c_str());
