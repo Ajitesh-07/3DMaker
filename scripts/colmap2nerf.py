@@ -8,6 +8,7 @@ import struct
 import numpy as np
 
 from colmap_depth import extract_sparse_depth, write_depth_bin
+from fit_room import fit_room, read_depth_bin
 
 def qvec2rotmat(qw, qx, qy, qz):
     return [
@@ -39,6 +40,9 @@ def main():
     parser.add_argument("--depth_max_radius", type=float, default=0.0,
                         help="Cull depth priors farther than this (normalized units) from the scene "
                              "center; 0 = auto (outermost cascade box = 1.5 * 2^(num_cascades-1))")
+    parser.add_argument("--fit_room", "--fit-room", action="store_true",
+                        help="Room (inside-out) capture: after COLMAP, fit the room into the full-resolution "
+                             "box, exactly as scripts/fit_room.py does (needs depth priors)")
 
     args = parser.parse_args()
     
@@ -192,6 +196,12 @@ def main():
                 "file_path": f"images/{image_name}",
                 "transform_matrix": c2w
             })
+
+    # images.txt lists cameras in COLMAP image-id order, which is NOT always file-name order (it
+    # depends on how the database was built). The held-out split is every 8th frame, and the
+    # standard protocol (3DGS, Mip-NeRF 360) is every 8th image sorted by name, so sort here. The
+    # depth sidecar is written in this same order.
+    frames.sort(key=lambda fr: fr["file_path"])
 
     # Compute Average UP vector (Y-axis of cameras)
     up = [0.0, 0.0, 0.0]
@@ -367,6 +377,21 @@ def main():
     }
 
     # Train references the depth sidecar; test is held out (no supervision) so it omits it.
+    # --fit_room: same fit as scripts/fit_room.py, applied in place on the files just produced so
+    # the result is identical to running fit_room.py afterwards, without the second folder.
+    if args.fit_room:
+        if depth_file_name:
+            depth_path = os.path.join(dataset_path, depth_file_name)
+            hdr, offs, rec, w, h = read_depth_bin(depth_path)
+            print("--- 5b. Fitting room into the box (--fit_room) ---")
+            fit_center, fit_scale = fit_room(transforms, offs, rec, w, h)
+            transforms["refit"] = {"source": "colmap2nerf --fit_room",
+                                   "center": fit_center.tolist(), "scale": float(fit_scale)}
+            with open(depth_path, "wb") as f:
+                f.write(hdr + rec.tobytes())
+        else:
+            print("Warning: --fit_room needs depth priors, which were not produced; skipping the room fit.")
+
     train_transforms = dict(transforms)
     if depth_file_name:
         train_transforms["depth_file"] = depth_file_name

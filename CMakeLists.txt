@@ -58,8 +58,10 @@ file(GLOB RMLUI_BACKEND_SOURCES
 
 set(TINYMLP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NERF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(modules/NeRF)
 add_subdirectory(modules/TinyMLP)
+add_subdirectory(modules/GaussianSplatting)
 
 add_executable(${PROJECT_NAME} src/main.cpp ${RMLUI_BACKEND_SOURCES})
 

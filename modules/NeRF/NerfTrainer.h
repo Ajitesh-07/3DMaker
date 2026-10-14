@@ -30,6 +30,8 @@ struct NerfConfig {
     int   numCascades         = 0;
     float minDensityThreshold = 0.01f;
     int   sampleK             = 1;
+    int   hashLog2            = 19;     // hash table entries per level = 2^hashLog2 (14..24)
+    int   hashMaxRes          = 2048;   // finest-level resolution over the whole grid (256..16384)
     int   batchSize           = 256 * 1024;
     int   renderBatchSize     = 256 * 1024;
     float depthFraction       = 12.5f / 100.0f;
@@ -73,6 +75,8 @@ public:
     Image renderOrbit(float azimuthDeg, float elevationDeg, float radius,
                       float fovDeg = 50.0f, int width = 800, int height = 800);
     Image renderTrainView(int index, int width = 0, int height = 0);
+    // Render an arbitrary camera (row-major 4x4 camera-to-world, transforms.json convention).
+    Image renderPose(const float c2w[16], float cameraAngleX, int width, int height);
     int   numTrainViews() const;
 
 private:

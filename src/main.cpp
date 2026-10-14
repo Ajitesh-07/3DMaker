@@ -8,7 +8,11 @@
 #include <unordered_set>
 #include <algorithm>
 
+#include <fstream>
+#include <stdexcept>
+
 #include <NeRF/NerfTrainer.h>
+#include "../third_party/json.hpp"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../third_party/stb_image_write.h"
@@ -40,8 +44,68 @@ static void saveImagePNG(const Image& img, const fs::path& path) {
     stbi_write_png(path.string().c_str(), img.width, img.height, 3, bytes.data(), img.width * 3);
 }
 
+// 3DMaker.exe render --model <model.inerf> --cameras <path.json> --out <dir> [--width W --height H --fps N]
+// Renders every frame of a transforms-style camera JSON (camera_angle_x + frames[].transform_matrix,
+// e.g. from scripts/flythrough_path.py) to <dir>/frame_%04d.png, then encodes <dir>.mp4 with ffmpeg.
+static int runRender(const std::vector<std::string>& args) {
+    std::string model, cameras, out;
+    int width = 0, height = 0, fps = 30;
+    for (size_t i = 2; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if      (a == "--model"   && i + 1 < args.size()) model   = args[++i];
+        else if (a == "--cameras" && i + 1 < args.size()) cameras = args[++i];
+        else if (a == "--out"     && i + 1 < args.size()) out     = args[++i];
+        else if (a == "--width"   && i + 1 < args.size()) width   = std::stoi(args[++i]);
+        else if (a == "--height"  && i + 1 < args.size()) height  = std::stoi(args[++i]);
+        else if (a == "--fps"     && i + 1 < args.size()) fps     = std::stoi(args[++i]);
+        else std::cerr << "Warning: ignoring unknown argument '" << a << "'" << std::endl;
+    }
+    if (model.empty() || cameras.empty() || out.empty()) {
+        std::cerr << "Usage: 3DMaker.exe render --model <model.inerf> --cameras <path.json> --out <dir> "
+                     "[--width W --height H --fps N]" << std::endl;
+        return 1;
+    }
+
+    std::ifstream jf(cameras);
+    if (!jf) { std::cerr << "Error: cannot open " << cameras << std::endl; return 1; }
+    nlohmann::json j = nlohmann::json::parse(jf);
+    float angleX = j.at("camera_angle_x").get<float>();
+    if (width  <= 0) width  = j.value("w", 1280);
+    if (height <= 0) height = j.value("h", 720);
+    const auto& frames = j.at("frames");
+
+    INerfTrainer trainer;
+    trainer.load(model);
+
+    fs::path dir(out);
+    fs::create_directories(dir);
+    std::cout << "Rendering " << frames.size() << " frames at " << width << "x" << height
+              << " -> " << dir.string() << std::endl;
+    for (size_t f = 0; f < frames.size(); ++f) {
+        float c2w[16];
+        const auto& M = frames[f].at("transform_matrix");
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) c2w[r * 4 + c] = M[r][c].get<float>();
+        Image img = trainer.renderPose(c2w, angleX, width, height);
+        char name[32];
+        snprintf(name, sizeof(name), "frame_%04d.png", (int)f);
+        saveImagePNG(img, dir / name);
+        if (f % 30 == 0) std::cout << "  frame " << f << "/" << frames.size() << std::endl;
+    }
+
+    fs::path mp4 = dir.parent_path() / (dir.filename().string() + ".mp4");
+    std::string cmd = "ffmpeg -y -loglevel error -framerate " + std::to_string(fps) + " -i \"" +
+                      (dir / "frame_%04d.png").string() + "\" -c:v libx264 -crf 18 -pix_fmt yuv420p \"" +
+                      mp4.string() + "\"";
+    if (std::system(cmd.c_str()) != 0) { std::cerr << "Error: ffmpeg failed" << std::endl; return 1; }
+    std::cout << "Saved " << mp4.string() << std::endl;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::vector<std::string> args(argv, argv + argc);
+
+    if (args.size() >= 2 && args[1] == "render") return runRender(args);
 
     if (args.size() < 4 || args[1] != "train" || args[2] != "--data") {
         std::cout << "Usage: 3DMaker.exe train --data <path_to_dataset> [options]\n" << std::endl;
@@ -56,14 +120,19 @@ int main(int argc, char** argv) {
         std::cout << "  --min-lr F     cosine LR schedule floor             (default 0.0001)" << std::endl;
         std::cout << "  --validate     hold out every 8th image, report test PSNR" << std::endl;
         std::cout << "  --video        render the 360 orbit mp4 after training" << std::endl;
+        std::cout << "  --fit-room     room capture: fit the room into the box after COLMAP" << std::endl;
+        std::cout << "  --hash-log2 N  hash table entries per level = 2^N    (default 19, range 14-24)" << std::endl;
+        std::cout << "  --hash-max-res N  finest hash-grid resolution        (default 2048, range 256-16384)" << std::endl;
         std::cout << "\nExample:" << std::endl;
         std::cout << "  3DMaker.exe train --data captures/chair --steps 50000 --cascades 4 --lambda 0.15 --K 2 --validate" << std::endl;
+        std::cout << "\nRender a camera path with a trained model:" << std::endl;
+        std::cout << "  3DMaker.exe render --model <model.inerf> --cameras <path.json> --out <dir> [--width W --height H --fps N]" << std::endl;
         return 1;
     }
 
-    int   p_steps = 50000, p_epochs = 100, p_cascades = 0, p_K = 1;
+    int   p_steps = 50000, p_epochs = 100, p_cascades = 0, p_K = 1, p_hashLog2 = 19, p_hashMaxRes = 2048;
     float p_lambda = 0.1f, p_maxLR = 1e-2f, p_minLR = 1e-4f;
-    bool  p_validate = false, p_video = false;
+    bool  p_validate = false, p_video = false, p_fitRoom = false;
     for (size_t i = 4; i < args.size(); ++i) {
         const std::string& a = args[i];
         if      (a == "--steps"    && i + 1 < args.size()) p_steps    = std::stoi(args[++i]);
@@ -73,8 +142,11 @@ int main(int argc, char** argv) {
         else if (a == "--K"        && i + 1 < args.size()) p_K        = std::stoi(args[++i]);
         else if (a == "--max-lr"   && i + 1 < args.size()) p_maxLR    = std::stof(args[++i]);
         else if (a == "--min-lr"   && i + 1 < args.size()) p_minLR    = std::stof(args[++i]);
+        else if (a == "--hash-log2"    && i + 1 < args.size()) p_hashLog2   = std::stoi(args[++i]);
+        else if (a == "--hash-max-res" && i + 1 < args.size()) p_hashMaxRes = std::stoi(args[++i]);
         else if (a == "--validate") p_validate = true;
         else if (a == "--video")    p_video    = true;
+        else if (a == "--fit-room") p_fitRoom  = true;
         else std::cerr << "Warning: ignoring unknown argument '" << a << "'" << std::endl;
     }
 
@@ -116,6 +188,7 @@ int main(int argc, char** argv) {
         const char* python = "python3";   // most Linux distros ship no bare `python`
 #endif
         std::string cmd = std::string(python) + " \"" + script_path.string() + "\" \"" + python_arg + "\"";
+        if (p_fitRoom) cmd += " --fit_room";
         std::cout << "Executing: " << cmd << std::endl;
 
         int ret = std::system(cmd.c_str());
@@ -125,6 +198,9 @@ int main(int argc, char** argv) {
         }
     } else {
         std::cout << "Found existing transforms_train.json. Skipping COLMAP pipeline." << std::endl;
+        if (p_fitRoom)
+            std::cerr << "Warning: --fit-room only applies when COLMAP runs; for an existing dataset use "
+                         "scripts/fit_room.py" << std::endl;
     }
 
     std::cout << "\n============================================\n";
@@ -137,6 +213,8 @@ int main(int argc, char** argv) {
     cfg.numCascades    = p_cascades;    
     cfg.maxLR          = p_maxLR;
     cfg.minLR          = p_minLR;
+    cfg.hashLog2       = p_hashLog2;
+    cfg.hashMaxRes     = p_hashMaxRes;
     cfg.shouldValidate = p_validate;
 
     std::cout << "[3DMaker] dataset=" << dataset_path
@@ -146,7 +224,12 @@ int main(int argc, char** argv) {
               << " maxLR=" << cfg.maxLR << " minLR=" << cfg.minLR << std::endl;
 
     INerfTrainer trainer;
-    trainer.init(cfg);
+    try {
+        trainer.init(cfg);
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     trainer.loadDataset(dataset_path);
     trainer.train(p_steps, p_epochs);
 

@@ -4,9 +4,11 @@
 #include <chrono>
 #include <cmath>
 #include <climits>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -62,11 +64,23 @@ void INerfTrainer::init(const NerfConfig& config) {
     opts.colorHiddenDim   = 32;
     opts.colorNumLayers   = 3;
 
-    opts.hashTableSize    = 1 << 19;
+    // T must be a power of two (the hash masks with T-1); l*T*F index math is int, so cap at 2^24.
+    if (config.hashLog2 < 14 || config.hashLog2 > 24)
+        throw std::invalid_argument("hashLog2 must be in [14, 24], got " + std::to_string(config.hashLog2));
+    if (config.hashMaxRes < 256 || config.hashMaxRes > 16384)
+        throw std::invalid_argument("hashMaxRes must be in [256, 16384], got " + std::to_string(config.hashMaxRes));
+    opts.hashTableSize    = 1 << config.hashLog2;
     opts.numLevels        = 16;
-    opts.growthFactor     = 1.3819f;
     opts.baseResolution   = 16;
     opts.featuresPerLevel = 2;
+    // Per-level growth b so level L-1 lands on hashMaxRes. 1.3819 is the historic rounded value of
+    // 128^(1/15); it is kept for the default so default runs stay identical to past results.
+    opts.growthFactor = (config.hashMaxRes == 2048)
+        ? 1.3819f
+        : powf((float)config.hashMaxRes / opts.baseResolution, 1.0f / (opts.numLevels - 1));
+    // Positions are contracted into [-2,2] before the grid, so the +-1.5 core gets half the cells.
+    printf("[HashGrid] %d levels, T=2^%d, finest %d (%d across the +-1.5 core), b=%.4f\n",
+           opts.numLevels, config.hashLog2, config.hashMaxRes, config.hashMaxRes / 2, opts.growthFactor);
 
     opts.renderBatchSize = config.renderBatchSize;
     opts.batchSize       = config.batchSize;
@@ -83,7 +97,7 @@ void INerfTrainer::init(const NerfConfig& config) {
     opts.decayValue          = 0.95f;
     opts.densityBias         = 0.0f;
     opts.legacyRenderFlag    = false;
-    opts.isProfiling         = false;
+    opts.isProfiling         = std::getenv("NERF_PROFILE") != nullptr;   // per-stage cudaEvent timers
 
     m_holdout_every = config.shouldValidate ? 8 : 0;
 
@@ -256,11 +270,16 @@ void INerfTrainer::train(int maxSteps, int maxEpochs) {
     }
     beginTraining(maxSteps);
     int tick = std::max(1, maxSteps / 100);
+    // NERF_PROFILE: drop the first 1000 steps (warm-up, dense early occupancy updates) so the
+    // printed breakdown is the steady state.
+    bool profileWarm = !m_masterConfig.isProfiling;
     while (!isTrainingDone()) {
         TrainStats s = trainSteps(tick);
         renderTrainingBar(s);
+        if (!profileWarm && m_globalStep >= 1000) { m_nerf->resetStats(); profileWarm = true; }
     }
     printf("\n");
+    if (m_masterConfig.isProfiling) m_nerf->printStats();
 }
 
 static const char kSceneMagic[4] = {'S', 'C', 'N', '1'};
@@ -375,6 +394,11 @@ Image INerfTrainer::renderTrainView(int index, int width, int height) {
     float c2w[16];
     m_dataloader->getFramePose(index, c2w);
     float focal = 0.5f * width / tanf(0.5f * m_dataloader->getCameraAngleX());
+    return renderC2W(c2w, focal, width, height);
+}
+
+Image INerfTrainer::renderPose(const float c2w[16], float cameraAngleX, int width, int height) {
+    float focal = 0.5f * width / tanf(0.5f * cameraAngleX);
     return renderC2W(c2w, focal, width, height);
 }
 
